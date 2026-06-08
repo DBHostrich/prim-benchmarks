@@ -125,8 +125,15 @@ The repository also includes `run_*.py` scripts to run strong and weak scaling e
 
 ### Prerequisites
 
-Running PrIM requires installing the [UPMEM SDK](https://sdk.upmem.com). 
-PrIM benchmarks and microbenchmarks are designed to run on a server with real UPMEM modules, but they also run on the functional simulator include in the UPMEM SDK.
+### Prerequisites
+Running PrIM requires installing the UPMEM SDK. The official SDK website (https://sdk.upmem.com) is deprecated, so install from the CMU-SAFARI mirror instead:
+
+```sh
+git clone https://github.com/CMU-SAFARI/UPMEM
+source "$HOME/upmem-sdk/upmem_env.sh"
+```
+
+PrIM benchmarks and microbenchmarks are designed to run on a server with real UPMEM modules, but they also run on the functional simulator included in the UPMEM SDK.
 
 ### Getting Started
 
