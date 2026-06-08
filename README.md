@@ -125,7 +125,6 @@ The repository also includes `run_*.py` scripts to run strong and weak scaling e
 
 ### Prerequisites
 
-### Prerequisites
 Running PrIM requires installing the UPMEM SDK. The official SDK website (https://sdk.upmem.com) is deprecated, so install from the CMU-SAFARI mirror instead:
 
 ```sh
