@@ -50,6 +50,10 @@ int main(int argc, char** argv) {
     DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
     DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &numDPUs));
     PRINT_INFO(p.verbosity >= 1, "Allocated %d DPU(s)", numDPUs);
+    struct SpmvHostTrace hostTrace;
+    if(!spmvHostTraceInit(&hostTrace, dpu_set, numDPUs, NR_TASKLETS)) {
+        return EXIT_FAILURE;
+    }
 
     // Initialize SpMV data structures
     PRINT_INFO(p.verbosity >= 1, "Reading matrix %s", p.fileName);
@@ -118,9 +122,14 @@ int main(int argc, char** argv) {
             // Send data to DPU
             PRINT_INFO(p.verbosity >= 2, "        Copying data to DPU");
             startTimer(&timer);
-            copyToDPU(dpu, (uint8_t*)dpuRowPtrs_h, dpuRowPtrs_m, (dpuNumRows + 1)*sizeof(uint32_t));
-            copyToDPU(dpu, (uint8_t*)dpuNonzeros_h, dpuNonzeros_m, dpuNumNonzeros*sizeof(struct Nonzero));
-            copyToDPU(dpu, (uint8_t*)inVector, dpuInVector_m, numCols*sizeof(float));
+            copyToDPUTraced(&hostTrace, dpuIdx, "row_ptrs", dpu,
+                            (uint8_t*)dpuRowPtrs_h, dpuRowPtrs_m,
+                            (dpuNumRows + 1)*sizeof(uint32_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "nonzeros", dpu,
+                            (uint8_t*)dpuNonzeros_h, dpuNonzeros_m,
+                            dpuNumNonzeros*sizeof(struct Nonzero));
+            copyToDPUTraced(&hostTrace, dpuIdx, "input_vector", dpu,
+                            (uint8_t*)inVector, dpuInVector_m, numCols*sizeof(float));
             stopTimer(&timer);
             loadTime += getElapsedTime(timer);
 
@@ -129,7 +138,9 @@ int main(int argc, char** argv) {
         // Send parameters to DPU
         PRINT_INFO(p.verbosity >= 2, "        Copying parameters to DPU");
         startTimer(&timer);
-        copyToDPU(dpu, (uint8_t*)&dpuParams[dpuIdx], dpuParams_m, sizeof(struct DPUParams));
+        copyToDPUTraced(&hostTrace, dpuIdx, "params", dpu,
+                        (uint8_t*)&dpuParams[dpuIdx], dpuParams_m,
+                        sizeof(struct DPUParams));
         stopTimer(&timer);
         loadTime += getElapsedTime(timer);
 
@@ -144,7 +155,17 @@ int main(int argc, char** argv) {
     #if ENERGY
     DPU_ASSERT(dpu_probe_start(&probe));
     #endif
+    uint64_t launchStartNs = 0;
+    uint64_t launchEndNs = 0;
+    if(spmvHostTraceEnabled(&hostTrace)) {
+        launchStartNs = spmvHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+    if(spmvHostTraceEnabled(&hostTrace)) {
+        launchEndNs = spmvHostTraceNowNs();
+        spmvHostTraceRecord(&hostTrace, "dpu_launch", "sync", "", false, 0,
+                            0, 0, 0, launchStartNs, launchEndNs);
+    }
     #if ENERGY
     DPU_ASSERT(dpu_probe_stop(&probe));
     double energy;
@@ -163,7 +184,10 @@ int main(int argc, char** argv) {
         unsigned int dpuNumRows = dpuParams[dpuIdx].dpuNumRows;
         if(dpuNumRows > 0) {
             uint32_t dpuStartRowIdx = dpuIdx*numRowsPerDPU;
-            copyFromDPU(dpu, dpuParams[dpuIdx].dpuOutVector_m, (uint8_t*)(outVector + dpuStartRowIdx), dpuNumRows*sizeof(float));
+            copyFromDPUTraced(&hostTrace, dpuIdx, "output_vector", dpu,
+                              dpuParams[dpuIdx].dpuOutVector_m,
+                              (uint8_t*)(outVector + dpuStartRowIdx),
+                              dpuNumRows*sizeof(float));
         }
         ++dpuIdx;
     }
@@ -212,6 +236,12 @@ int main(int argc, char** argv) {
     free(inVector);
     free(outVector);
     free(outVectorReference);
+
+    if(!spmvHostTraceWrite(&hostTrace)) {
+        spmvHostTraceDestroy(&hostTrace);
+        return EXIT_FAILURE;
+    }
+    spmvHostTraceDestroy(&hostTrace);
 
     return 0;
 }
