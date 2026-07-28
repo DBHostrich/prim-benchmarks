@@ -46,13 +46,35 @@ int main(int argc, char** argv) {
     // Allocate DPUs and load binary
     struct dpu_set_t dpu_set, dpu;
     uint32_t numDPUs;
+    bool traceRequested = spmvHostTraceRequested();
+    uint64_t allocStartNs = 0;
+    uint64_t allocEndNs = 0;
+    uint64_t loadStartNs = 0;
+    uint64_t loadEndNs = 0;
+    if(traceRequested) {
+        allocStartNs = spmvHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    if(traceRequested) {
+        allocEndNs = spmvHostTraceNowNs();
+        loadStartNs = spmvHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
+    if(traceRequested) {
+        loadEndNs = spmvHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &numDPUs));
     PRINT_INFO(p.verbosity >= 1, "Allocated %d DPU(s)", numDPUs);
     struct SpmvHostTrace hostTrace;
     if(!spmvHostTraceInit(&hostTrace, dpu_set, numDPUs, NR_TASKLETS)) {
+        DPU_ASSERT(dpu_free(dpu_set));
         return EXIT_FAILURE;
+    }
+    if(spmvHostTraceEnabled(&hostTrace)) {
+        spmvHostTraceRecord(&hostTrace, "dpu_alloc", "", "", false, 0,
+                            0, 0, 0, allocStartNs, allocEndNs);
+        spmvHostTraceRecord(&hostTrace, "dpu_load", "", "", false, 0,
+                            0, 0, 0, loadStartNs, loadEndNs);
     }
 
     // Initialize SpMV data structures
@@ -236,6 +258,18 @@ int main(int argc, char** argv) {
     free(inVector);
     free(outVector);
     free(outVectorReference);
+
+    uint64_t freeStartNs = 0;
+    uint64_t freeEndNs = 0;
+    if(spmvHostTraceEnabled(&hostTrace)) {
+        freeStartNs = spmvHostTraceNowNs();
+    }
+    DPU_ASSERT(dpu_free(dpu_set));
+    if(spmvHostTraceEnabled(&hostTrace)) {
+        freeEndNs = spmvHostTraceNowNs();
+        spmvHostTraceRecord(&hostTrace, "dpu_free", "", "", false, 0,
+                            0, 0, 0, freeStartNs, freeEndNs);
+    }
 
     if(!spmvHostTraceWrite(&hostTrace)) {
         spmvHostTraceDestroy(&hostTrace);

@@ -56,6 +56,11 @@ static void writeCsvString(FILE* fp, const char* value) {
     fputc('"', fp);
 }
 
+bool spmvHostTraceRequested(void) {
+    const char* outputPath = getenv("SPMV_TRACE_CSV");
+    return outputPath != NULL && outputPath[0] != '\0';
+}
+
 bool spmvHostTraceInit(
     struct SpmvHostTrace* trace,
     struct dpu_set_t dpuSet,
@@ -72,7 +77,7 @@ bool spmvHostTraceInit(
     uint32_t globalDpuId = 0;
 
     memset(trace, 0, sizeof(*trace));
-    if(outputPath == NULL || outputPath[0] == '\0') {
+    if(!spmvHostTraceRequested()) {
         return true;
     }
 
@@ -80,7 +85,7 @@ bool spmvHostTraceInit(
     trace->runId = (runId == NULL || runId[0] == '\0') ? "spmv" : runId;
     trace->configuredDpus = configuredDpus;
     trace->numTasklets = numTasklets;
-    trace->capacity = (size_t)configuredDpus * 5u + 1u;
+    trace->capacity = (size_t)configuredDpus * 5u + 4u;
     if(!parseRepeatId(repeatId, &trace->repeatId)) {
         return false;
     }

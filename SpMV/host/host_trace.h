@@ -43,6 +43,7 @@ bool spmvHostTraceInit(
     uint32_t numTasklets
 );
 
+bool spmvHostTraceRequested(void);
 bool spmvHostTraceEnabled(const struct SpmvHostTrace* trace);
 uint64_t spmvHostTraceNowNs(void);
 

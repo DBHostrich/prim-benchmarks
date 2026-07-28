@@ -13,7 +13,7 @@ from pathlib import Path
 
 EXPECTED = {
     256: {
-        "events": 1273,
+        "events": 1276,
         "copy_to": 1018,
         "copy_from": 254,
         "h2d_bytes": 37_800_320,
@@ -28,7 +28,7 @@ EXPECTED = {
         },
     },
     512: {
-        "events": 2509,
+        "events": 2512,
         "copy_to": 2009,
         "copy_from": 499,
         "h2d_bytes": 66_153_944,
@@ -88,15 +88,47 @@ def validate(path: Path) -> dict[str, int | str]:
                 f"event {row['event_id']} measured_ns != end-start")
 
     ops = Counter(row["op"] for row in rows)
+    require(ops["dpu_alloc"] == 1, f"alloc={ops['dpu_alloc']}, expected 1")
+    require(ops["dpu_load"] == 1, f"load={ops['dpu_load']}, expected 1")
     require(ops["dpu_copy_to"] == expected["copy_to"],
             f"copy_to={ops['dpu_copy_to']}, expected {expected['copy_to']}")
     require(ops["dpu_copy_from"] == expected["copy_from"],
             f"copy_from={ops['dpu_copy_from']}, expected {expected['copy_from']}")
     require(ops["dpu_launch"] == 1, f"launch={ops['dpu_launch']}, expected 1")
+    require(ops["dpu_free"] == 1, f"free={ops['dpu_free']}, expected 1")
+    require(rows[0]["op"] == "dpu_alloc", f"first op={rows[0]['op']}, expected dpu_alloc")
+    require(rows[1]["op"] == "dpu_load", f"second op={rows[1]['op']}, expected dpu_load")
+    require(rows[-1]["op"] == "dpu_free", f"last op={rows[-1]['op']}, expected dpu_free")
 
-    subops = Counter(row["subop"] for row in rows)
+    subops = Counter(
+        row["subop"]
+        for row in rows
+        if row["op"] in {"dpu_copy_to", "dpu_copy_from", "dpu_launch"}
+    )
     require(subops == Counter(expected["subops"]),
             f"subop counts={dict(subops)}, expected {expected['subops']}")
+
+    lifecycle_rows = [
+        row for row in rows if row["op"] in {"dpu_alloc", "dpu_load", "dpu_free"}
+    ]
+    lifecycle_empty_fields = (
+        "global_dpu_id",
+        "rank_ordinal",
+        "dpu_id_in_rank",
+        "target_space",
+        "target_symbol",
+        "offset_bytes",
+        "logical_bytes",
+        "transfer_bytes",
+    )
+    require(
+        all(row[field] == "" for row in lifecycle_rows for field in lifecycle_empty_fields),
+        "lifecycle event contains DPU topology, target, or byte fields",
+    )
+    require(
+        all(int(row["measured_ns"]) > 0 for row in lifecycle_rows),
+        "lifecycle event has a non-positive duration",
+    )
 
     h2d = sum(int(row["transfer_bytes"]) for row in rows if row["op"] == "dpu_copy_to")
     d2h = sum(int(row["transfer_bytes"]) for row in rows if row["op"] == "dpu_copy_from")
@@ -121,6 +153,12 @@ def validate(path: Path) -> dict[str, int | str]:
         "events": len(rows),
         "h2d_bytes": h2d,
         "d2h_bytes": d2h,
+        "alloc_measured_ns": sum(
+            int(row["measured_ns"]) for row in rows if row["op"] == "dpu_alloc"
+        ),
+        "load_measured_ns": sum(
+            int(row["measured_ns"]) for row in rows if row["op"] == "dpu_load"
+        ),
         "h2d_measured_ns": sum(
             int(row["measured_ns"]) for row in rows if row["op"] == "dpu_copy_to"
         ),
@@ -129,6 +167,9 @@ def validate(path: Path) -> dict[str, int | str]:
         ),
         "launch_measured_ns": sum(
             int(row["measured_ns"]) for row in rows if row["op"] == "dpu_launch"
+        ),
+        "free_measured_ns": sum(
+            int(row["measured_ns"]) for row in rows if row["op"] == "dpu_free"
         ),
     }
 
@@ -158,7 +199,14 @@ def main() -> int:
     if failed:
         return 1
     if summaries:
-        for key in ("h2d_measured_ns", "launch_measured_ns", "d2h_measured_ns"):
+        for key in (
+            "alloc_measured_ns",
+            "load_measured_ns",
+            "h2d_measured_ns",
+            "launch_measured_ns",
+            "d2h_measured_ns",
+            "free_measured_ns",
+        ):
             values = [int(summary[key]) for summary in summaries]
             print(f"{key}_median={statistics.median(values):.0f}")
     return 0
