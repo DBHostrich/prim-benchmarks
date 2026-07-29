@@ -4,6 +4,7 @@
 
 #include "../support/common.h"
 #include "../support/utils.h"
+#include "host_trace.h"
 
 #define DPU_CAPACITY (64 << 20) // A DPU's capacity is 64 MiB
 
@@ -33,5 +34,56 @@ static void copyFromDPU(struct dpu_set_t dpu, uint32_t mramIdx, uint8_t* hostPtr
     DPU_ASSERT(dpu_copy_from(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, ROUND_UP_TO_MULTIPLE_OF_8(size)));
 }
 
-#endif
+static void copyToDPUTraced(
+    struct BfsHostTrace* trace,
+    uint32_t globalDpuId,
+    const char* subop,
+    int32_t bfsLevel,
+    struct dpu_set_t dpu,
+    uint8_t* hostPtr,
+    uint32_t mramIdx,
+    uint32_t logicalSize
+) {
+    uint32_t transferSize = ROUND_UP_TO_MULTIPLE_OF_8(logicalSize);
+    uint64_t startNs;
+    uint64_t endNs;
 
+    if(!bfsHostTraceEnabled(trace)) {
+        copyToDPU(dpu, hostPtr, mramIdx, logicalSize);
+        return;
+    }
+    startNs = bfsHostTraceNowNs();
+    DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
+    endNs = bfsHostTraceNowNs();
+    bfsHostTraceRecord(trace, "dpu_copy_to", subop, bfsLevel, "TO_DPU", true,
+                       globalDpuId, logicalSize, transferSize, mramIdx,
+                       startNs, endNs);
+}
+
+static void copyFromDPUTraced(
+    struct BfsHostTrace* trace,
+    uint32_t globalDpuId,
+    const char* subop,
+    int32_t bfsLevel,
+    struct dpu_set_t dpu,
+    uint32_t mramIdx,
+    uint8_t* hostPtr,
+    uint32_t logicalSize
+) {
+    uint32_t transferSize = ROUND_UP_TO_MULTIPLE_OF_8(logicalSize);
+    uint64_t startNs;
+    uint64_t endNs;
+
+    if(!bfsHostTraceEnabled(trace)) {
+        copyFromDPU(dpu, mramIdx, hostPtr, logicalSize);
+        return;
+    }
+    startNs = bfsHostTraceNowNs();
+    DPU_ASSERT(dpu_copy_from(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
+    endNs = bfsHostTraceNowNs();
+    bfsHostTraceRecord(trace, "dpu_copy_from", subop, bfsLevel, "FROM_DPU", true,
+                       globalDpuId, logicalSize, transferSize, mramIdx,
+                       startNs, endNs);
+}
+
+#endif

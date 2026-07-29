@@ -5,8 +5,8 @@
 #define ROUND_UP_TO_MULTIPLE_OF_8(x)    ((((x) + 7)/8)*8)
 #define ROUND_UP_TO_MULTIPLE_OF_64(x)   ((((x) + 63)/64)*64)
 
-#define setBit(val, idx) (val) |= (1 << (idx))
-#define isSet(val, idx)  ((val) & (1 << (idx)))
+#define setBit(val, idx) (val) |= (1ULL << (idx))
+#define isSet(val, idx)  ((val) & (1ULL << (idx)))
 
 struct DPUParams {
     uint32_t dpuNumNodes; /* The number of nodes assigned to this DPU */
@@ -23,4 +23,3 @@ struct DPUParams {
 };
 
 #endif
-

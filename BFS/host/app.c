@@ -47,10 +47,36 @@ int main(int argc, char** argv) {
     // Allocate DPUs and load binary
     struct dpu_set_t dpu_set, dpu;
     uint32_t numDPUs;
+    bool traceRequested = bfsHostTraceRequested();
+    uint64_t allocStartNs = 0;
+    uint64_t allocEndNs = 0;
+    uint64_t loadStartNs = 0;
+    uint64_t loadEndNs = 0;
+    if(traceRequested) {
+        allocStartNs = bfsHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    if(traceRequested) {
+        allocEndNs = bfsHostTraceNowNs();
+        loadStartNs = bfsHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
+    if(traceRequested) {
+        loadEndNs = bfsHostTraceNowNs();
+    }
     DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &numDPUs));
     PRINT_INFO(p.verbosity >= 1, "Allocated %d DPU(s)", numDPUs);
+    struct BfsHostTrace hostTrace;
+    if(!bfsHostTraceInit(&hostTrace, dpu_set, numDPUs, NR_TASKLETS)) {
+        DPU_ASSERT(dpu_free(dpu_set));
+        return EXIT_FAILURE;
+    }
+    if(bfsHostTraceEnabled(&hostTrace)) {
+        bfsHostTraceRecord(&hostTrace, "dpu_alloc", "", -1, "", false, 0,
+                           0, 0, 0, allocStartNs, allocEndNs);
+        bfsHostTraceRecord(&hostTrace, "dpu_load", "", -1, "", false, 0,
+                           0, 0, 0, loadStartNs, loadEndNs);
+    }
 
     // Initialize BFS data structures
     PRINT_INFO(p.verbosity >= 1, "Reading graph %s", p.fileName);
@@ -128,11 +154,21 @@ int main(int argc, char** argv) {
             // Send data to DPU
             PRINT_INFO(p.verbosity >= 2, "        Copying data to DPU");
             startTimer(&timer);
-            copyToDPU(dpu, (uint8_t*)dpuNodePtrs_h, dpuNodePtrs_m, (dpuNumNodes + 1)*sizeof(uint32_t));
-            copyToDPU(dpu, (uint8_t*)dpuNeighborIdxs_h, dpuNeighborIdxs_m, dpuNumNeighbors*sizeof(uint32_t));
-            copyToDPU(dpu, (uint8_t*)dpuNodeLevel_h, dpuNodeLevel_m, dpuNumNodes*sizeof(uint32_t));
-            copyToDPU(dpu, (uint8_t*)visited, dpuVisited_m, numNodes/64*sizeof(uint64_t));
-            copyToDPU(dpu, (uint8_t*)nextFrontier, dpuNextFrontier_m, numNodes/64*sizeof(uint64_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "node_ptrs", -1, dpu,
+                            (uint8_t*)dpuNodePtrs_h, dpuNodePtrs_m,
+                            (dpuNumNodes + 1)*sizeof(uint32_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "neighbor_idxs", -1, dpu,
+                            (uint8_t*)dpuNeighborIdxs_h, dpuNeighborIdxs_m,
+                            dpuNumNeighbors*sizeof(uint32_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "node_level_init", -1, dpu,
+                            (uint8_t*)dpuNodeLevel_h, dpuNodeLevel_m,
+                            dpuNumNodes*sizeof(uint32_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "visited_init", -1, dpu,
+                            (uint8_t*)visited, dpuVisited_m,
+                            numNodes/64*sizeof(uint64_t));
+            copyToDPUTraced(&hostTrace, dpuIdx, "frontier_init", -1, dpu,
+                            (uint8_t*)nextFrontier, dpuNextFrontier_m,
+                            numNodes/64*sizeof(uint64_t));
             // NOTE: No need to copy current frontier because it is written before being read
             stopTimer(&timer);
             loadTime += getElapsedTime(timer);
@@ -142,7 +178,9 @@ int main(int argc, char** argv) {
         // Send parameters to DPU
         PRINT_INFO(p.verbosity >= 2, "        Copying parameters to DPU");
         startTimer(&timer);
-        copyToDPU(dpu, (uint8_t*)&dpuParams[dpuIdx], dpuParams_m[dpuIdx], sizeof(struct DPUParams));
+        copyToDPUTraced(&hostTrace, dpuIdx, "params_init", -1, dpu,
+                        (uint8_t*)&dpuParams[dpuIdx], dpuParams_m[dpuIdx],
+                        sizeof(struct DPUParams));
         stopTimer(&timer);
         loadTime += getElapsedTime(timer);
 
@@ -163,7 +201,18 @@ int main(int argc, char** argv) {
         // Run all DPUs
         PRINT_INFO(p.verbosity >= 1, "    Booting DPUs");
         startTimer(&timer);
+        uint64_t launchStartNs = 0;
+        uint64_t launchEndNs = 0;
+        if(bfsHostTraceEnabled(&hostTrace)) {
+            launchStartNs = bfsHostTraceNowNs();
+        }
         DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+        if(bfsHostTraceEnabled(&hostTrace)) {
+            launchEndNs = bfsHostTraceNowNs();
+            bfsHostTraceRecord(&hostTrace, "dpu_launch", "bfs_level", level,
+                               "", false, 0, 0, 0, 0,
+                               launchStartNs, launchEndNs);
+        }
         stopTimer(&timer);
         dpuTime += getElapsedTime(timer);
         PRINT_INFO(p.verbosity >= 2, "    Level DPU Time: %f ms", getElapsedTime(timer)*1e3);
@@ -183,9 +232,17 @@ int main(int argc, char** argv) {
             uint32_t dpuNumNodes = dpuParams[dpuIdx].dpuNumNodes;
             if(dpuNumNodes > 0) {
                 if(dpuIdx == 0) {
-                    copyFromDPU(dpu, dpuParams[dpuIdx].dpuNextFrontier_m, (uint8_t*)currentFrontier, numNodes/64*sizeof(uint64_t));
+                    copyFromDPUTraced(&hostTrace, dpuIdx, "frontier_result",
+                                      level, dpu,
+                                      dpuParams[dpuIdx].dpuNextFrontier_m,
+                                      (uint8_t*)currentFrontier,
+                                      numNodes/64*sizeof(uint64_t));
                 } else {
-                    copyFromDPU(dpu, dpuParams[dpuIdx].dpuNextFrontier_m, (uint8_t*)nextFrontier, numNodes/64*sizeof(uint64_t));
+                    copyFromDPUTraced(&hostTrace, dpuIdx, "frontier_result",
+                                      level, dpu,
+                                      dpuParams[dpuIdx].dpuNextFrontier_m,
+                                      (uint8_t*)nextFrontier,
+                                      numNodes/64*sizeof(uint64_t));
                     for(uint32_t i = 0; i < numNodes/64; ++i) {
                         currentFrontier[i] |= nextFrontier[i];
                     }
@@ -209,10 +266,17 @@ int main(int argc, char** argv) {
                 uint32_t dpuNumNodes = dpuParams[dpuIdx].dpuNumNodes;
                 if(dpuNumNodes > 0) {
                     // Copy current frontier to all DPUs (place in next frontier and DPU will update visited and copy to current frontier)
-                    copyToDPU(dpu, (uint8_t*)currentFrontier, dpuParams[dpuIdx].dpuNextFrontier_m, numNodes/64*sizeof(uint64_t));
+                    copyToDPUTraced(&hostTrace, dpuIdx, "frontier_broadcast",
+                                    level, dpu, (uint8_t*)currentFrontier,
+                                    dpuParams[dpuIdx].dpuNextFrontier_m,
+                                    numNodes/64*sizeof(uint64_t));
                     // Copy new level to DPU
                     dpuParams[dpuIdx].level = level;
-                    copyToDPU(dpu, (uint8_t*)&dpuParams[dpuIdx], dpuParams_m[dpuIdx], sizeof(struct DPUParams));
+                    copyToDPUTraced(&hostTrace, dpuIdx, "params_level",
+                                    level, dpu,
+                                    (uint8_t*)&dpuParams[dpuIdx],
+                                    dpuParams_m[dpuIdx],
+                                    sizeof(struct DPUParams));
                     ++dpuIdx;
                 }
             }
@@ -236,7 +300,10 @@ int main(int argc, char** argv) {
         uint32_t dpuNumNodes = dpuParams[dpuIdx].dpuNumNodes;
         if(dpuNumNodes > 0) {
             uint32_t dpuStartNodeIdx = dpuIdx*numNodesPerDPU;
-            copyFromDPU(dpu, dpuParams[dpuIdx].dpuNodeLevel_m, (uint8_t*)(nodeLevel + dpuStartNodeIdx), dpuNumNodes*sizeof(float));
+            copyFromDPUTraced(&hostTrace, dpuIdx, "node_level_result", -1,
+                              dpu, dpuParams[dpuIdx].dpuNodeLevel_m,
+                              (uint8_t*)(nodeLevel + dpuStartNodeIdx),
+                              dpuNumNodes*sizeof(uint32_t));
         }
         ++dpuIdx;
     }
@@ -320,7 +387,24 @@ int main(int argc, char** argv) {
     free(nextFrontier);
     free(nodeLevelReference);
 
+    uint64_t freeStartNs = 0;
+    uint64_t freeEndNs = 0;
+    if(bfsHostTraceEnabled(&hostTrace)) {
+        freeStartNs = bfsHostTraceNowNs();
+    }
+    DPU_ASSERT(dpu_free(dpu_set));
+    if(bfsHostTraceEnabled(&hostTrace)) {
+        freeEndNs = bfsHostTraceNowNs();
+        bfsHostTraceRecord(&hostTrace, "dpu_free", "", -1, "", false, 0,
+                           0, 0, 0, freeStartNs, freeEndNs);
+    }
+
+    if(!bfsHostTraceWrite(&hostTrace)) {
+        bfsHostTraceDestroy(&hostTrace);
+        return EXIT_FAILURE;
+    }
+    bfsHostTraceDestroy(&hostTrace);
+
     return 0;
 
 }
-
