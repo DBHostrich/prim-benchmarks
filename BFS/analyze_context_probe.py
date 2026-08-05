@@ -77,7 +77,9 @@ def quantile(values: list[float], q: float) -> float:
 def distribution(values: Iterable[float]) -> dict[str, float | int]:
     data = list(values)
     median = statistics.median(data)
-    mean = statistics.fmean(data)
+    # statistics.fmean was added in Python 3.8.  Some UPMEM hosts still use
+    # Python 3.7, where statistics.mean provides the same semantics here.
+    mean = statistics.mean(data)
     stdev = statistics.stdev(data) if len(data) > 1 else 0.0
     return {
         "n": len(data),
