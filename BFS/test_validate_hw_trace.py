@@ -10,13 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import validate_hw_trace
-from measurement_label import (
-    api_type,
+from transport_key import (
     call_context,
     logical_distribution_class,
-    measurement_label,
     offset_feature,
+    phase_class,
     same_source_across_group,
+    sdk_api_kind,
+    transport_key,
 )
 
 
@@ -28,16 +29,21 @@ FIELDNAMES = [
     "actual_ranks",
     "num_tasklets",
     "op",
-    "subop",
-    "bfs_level",
     "direction",
-    "api_type",
+    "sdk_api_kind",
     "logical_distribution_class",
-    "same_source_across_group",
-    "global_dpu_id",
+    "target_space",
+    "transfer_bytes_per_dpu",
+    "active_dpus",
+    "active_ranks",
+    "active_dpus_per_rank",
     "rank_ordinal",
     "dpu_id_in_rank",
-    "target_space",
+    "same_source_across_group",
+    "phase_class",
+    "subop",
+    "bfs_level",
+    "global_dpu_id",
     "target_symbol",
     "offset_bytes",
     "offset_feature",
@@ -49,7 +55,7 @@ FIELDNAMES = [
     "pretrace_warmup_runs",
     "host_numa_node",
     "call_context",
-    "measurement_label",
+    "transport_key",
     "host_start_ns",
     "host_end_ns",
     "measured_ns",
@@ -116,20 +122,27 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "actual_ranks": str(actual_ranks),
                     "num_tasklets": "1",
                     "op": op,
-                    "subop": subop,
-                    "bfs_level": bfs_level,
                     "direction": direction,
-                    "api_type": api_type(op),
+                    "sdk_api_kind": sdk_api_kind(op),
                     "logical_distribution_class": logical_distribution_class(
                         op, subop
                     ),
+                    "target_space": "MRAM" if has_dpu else "",
+                    "transfer_bytes_per_dpu": (
+                        str(transfer_bytes) if has_dpu else ""
+                    ),
+                    "active_dpus": "1" if has_dpu else "",
+                    "active_ranks": "1" if has_dpu else "",
+                    "active_dpus_per_rank": "1" if has_dpu else "",
+                    "rank_ordinal": str(dpu_id // 64) if has_dpu else "",
+                    "dpu_id_in_rank": str(dpu_id % 64) if has_dpu else "",
                     "same_source_across_group": same_source_across_group(
                         op, subop
                     ),
+                    "phase_class": phase_class(op, subop),
+                    "subop": subop,
+                    "bfs_level": bfs_level,
                     "global_dpu_id": str(dpu_id) if has_dpu else "",
-                    "rank_ordinal": str(dpu_id // 64) if has_dpu else "",
-                    "dpu_id_in_rank": str(dpu_id % 64) if has_dpu else "",
-                    "target_space": "MRAM" if has_dpu else "",
                     "target_symbol": (
                         "DPU_MRAM_HEAP_POINTER_NAME" if has_dpu else ""
                     ),
@@ -151,14 +164,14 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "pretrace_warmup_runs": "5",
                     "host_numa_node": "0",
                     "call_context": "",
-                    "measurement_label": "",
+                    "transport_key": "",
                     "host_start_ns": str(timestamp),
                     "host_end_ns": str(timestamp + 100),
                     "measured_ns": "100",
                 }
             row["offset_feature"] = offset_feature(row)
             row["call_context"] = call_context(row)
-            row["measurement_label"] = measurement_label(row)
+            row["transport_key"] = transport_key(row)
             rows.append(row)
             timestamp += 200
             event_id += 1
@@ -295,19 +308,19 @@ class BfsTraceValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "semantic tuple"):
                 validate_hw_trace.validate(path)
 
-    def test_rejects_wrong_measurement_label(self) -> None:
+    def test_rejects_wrong_transport_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             self.write_trace(path, 256)
             with path.open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
             copy_row = next(row for row in rows if row["op"] == "dpu_copy_to")
-            copy_row["measurement_label"] += ";corrupt=1"
+            copy_row["transport_key"] += ";corrupt=1"
             with path.open("w", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=FIELDNAMES)
                 writer.writeheader()
                 writer.writerows(rows)
-            with self.assertRaisesRegex(ValueError, "invalid measurement_label"):
+            with self.assertRaisesRegex(ValueError, "invalid transport_key"):
                 validate_hw_trace.validate(path)
 
     def test_distribution_and_same_source_semantics(self) -> None:
@@ -342,6 +355,43 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(
                 by_subop["node_level_result"]["logical_distribution_class"],
                 "PARTITIONED_GATHER",
+            )
+            self.assertEqual(by_subop["visited_init"]["phase_class"], "INIT")
+            self.assertEqual(by_subop["frontier_init"]["phase_class"], "INIT")
+            self.assertEqual(
+                by_subop["frontier_broadcast"]["phase_class"], "ITERATIVE"
+            )
+            self.assertEqual(
+                by_subop["node_level_result"]["phase_class"], "FINALIZE"
+            )
+
+    def test_transport_key_has_exact_ordered_physical_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 256)
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            row = next(
+                item
+                for item in rows
+                if item["subop"] == "frontier_broadcast"
+                and item["global_dpu_id"] == "17"
+            )
+            self.assertEqual(row["sdk_api_kind"], "SINGLE_COPY")
+            self.assertEqual(row["transfer_bytes_per_dpu"], "24576")
+            self.assertEqual(row["active_dpus"], "1")
+            self.assertEqual(row["active_ranks"], "1")
+            self.assertEqual(row["active_dpus_per_rank"], "1")
+            self.assertEqual(row["phase_class"], "ITERATIVE")
+            self.assertEqual(
+                row["transport_key"],
+                "v2;op=dpu_copy_to;direction=TO_DPU;"
+                "sdk_api_kind=SINGLE_COPY;"
+                "logical_distribution_class=SHARED_REPLICATION;"
+                "target_space=MRAM;transfer_bytes_per_dpu=24576;"
+                "active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
+                "rank_ordinal=0;dpu_id_in_rank=17;"
+                "same_source_across_group=1;phase_class=ITERATIVE",
             )
 
 

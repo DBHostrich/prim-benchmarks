@@ -4,11 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RESULT_ROOT="${RESULT_ROOT:-$WORKSPACE_DIR/bfs_hw_trace_$(date +%Y%m%d_%H%M%S)}"
+LATEST_RESULT_POINTER="${LATEST_RESULT_POINTER:-$WORKSPACE_DIR/latest_bfs_trace_result_path.txt}"
 NUMA_NODE="${NUMA_NODE:-0}"
 N_WARMUP="${N_WARMUP:-5}"
 N_REPS="${N_REPS:-30}"
-LABEL_MIN_SAMPLES="${LABEL_MIN_SAMPLES:-20}"
-LABEL_SPREAD_THRESHOLD_PCT="${LABEL_SPREAD_THRESHOLD_PCT:-25}"
+TRANSPORT_KEY_MIN_SAMPLES="${TRANSPORT_KEY_MIN_SAMPLES:-20}"
+TRANSPORT_KEY_MIN_TRACES="${TRANSPORT_KEY_MIN_TRACES:-20}"
+TRANSPORT_KEY_SPREAD_THRESHOLD_PCT="${TRANSPORT_KEY_SPREAD_THRESHOLD_PCT:-25}"
+TRANSPORT_KEY_CV_THRESHOLD_PCT="${TRANSPORT_KEY_CV_THRESHOLD_PCT:-25}"
+CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
@@ -69,9 +73,13 @@ for nr_dpus in $DPUS_LIST; do
         make NR_DPUS="$nr_dpus" NR_TASKLETS="$tasklets" all \
             > "$result_dir/build.log" 2>&1
         sha256sum bin/host_code bin/dpu_code > "$result_dir/binaries.sha256"
-        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nGRAPH=%s\n' \
+        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
             "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
-            "$N_WARMUP" "$N_REPS" "$GRAPH_PATH" \
+            "$N_WARMUP" "$N_REPS" "$TRANSPORT_KEY_MIN_SAMPLES" \
+            "$TRANSPORT_KEY_MIN_TRACES" \
+            "$TRANSPORT_KEY_SPREAD_THRESHOLD_PCT" \
+            "$TRANSPORT_KEY_CV_THRESHOLD_PCT" "$CREATE_ARCHIVE" \
+            "$GRAPH_PATH" \
             > "$result_dir/config.txt"
 
         unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID \
@@ -107,27 +115,40 @@ for nr_dpus in $DPUS_LIST; do
 
         python3 "$SCRIPT_DIR/validate_hw_trace.py" "$result_dir"/trace_*.csv \
             > "$result_dir/validation.log"
-        python3 "$SCRIPT_DIR/analyze_measurement_labels.py" \
-            --min-samples "$LABEL_MIN_SAMPLES" \
-            --spread-threshold-pct "$LABEL_SPREAD_THRESHOLD_PCT" \
-            --output "$result_dir/measurement_label_summary.csv" \
+        python3 "$SCRIPT_DIR/analyze_transport_keys.py" \
+            --min-samples "$TRANSPORT_KEY_MIN_SAMPLES" \
+            --min-traces "$TRANSPORT_KEY_MIN_TRACES" \
+            --spread-threshold-pct "$TRANSPORT_KEY_SPREAD_THRESHOLD_PCT" \
+            --cv-threshold-pct "$TRANSPORT_KEY_CV_THRESHOLD_PCT" \
+            --output "$result_dir/transport_key_summary.csv" \
             "$result_dir"/trace_*.csv \
-            > "$result_dir/measurement_label_analysis.log"
+            > "$result_dir/transport_key_analysis.log"
         echo "==> PASS $config"
     done
 done
 
 mapfile -t all_traces < <(find "$RESULT_ROOT" -mindepth 2 -maxdepth 2 \
     -type f -name 'trace_*.csv' | sort)
-python3 "$SCRIPT_DIR/analyze_measurement_labels.py" \
-    --min-samples "$LABEL_MIN_SAMPLES" \
-    --spread-threshold-pct "$LABEL_SPREAD_THRESHOLD_PCT" \
-    --output "$RESULT_ROOT/measurement_label_summary_all.csv" \
+python3 "$SCRIPT_DIR/analyze_transport_keys.py" \
+    --min-samples "$TRANSPORT_KEY_MIN_SAMPLES" \
+    --min-traces "$TRANSPORT_KEY_MIN_TRACES" \
+    --spread-threshold-pct "$TRANSPORT_KEY_SPREAD_THRESHOLD_PCT" \
+    --cv-threshold-pct "$TRANSPORT_KEY_CV_THRESHOLD_PCT" \
+    --output "$RESULT_ROOT/transport_key_summary_all.csv" \
     "${all_traces[@]}" \
-    > "$RESULT_ROOT/measurement_label_analysis_all.log"
+    > "$RESULT_ROOT/transport_key_analysis_all.log"
 
-archive="${RESULT_ROOT}.tar.gz"
-tar -czf "$archive" -C "$(dirname "$RESULT_ROOT")" "$(basename "$RESULT_ROOT")"
-printf '%s\n' "$RESULT_ROOT" | tee "$WORKSPACE_DIR/latest_bfs_trace_result_path.txt"
+archive=""
+if [[ "$CREATE_ARCHIVE" == "1" ]]; then
+    archive="${RESULT_ROOT}.tar.gz"
+    tar -czf "$archive" -C "$(dirname "$RESULT_ROOT")" \
+        "$(basename "$RESULT_ROOT")"
+fi
+mkdir -p "$(dirname "$LATEST_RESULT_POINTER")"
+printf '%s\n' "$RESULT_ROOT" | tee "$LATEST_RESULT_POINTER"
 echo "Trace results: $RESULT_ROOT"
-echo "Archive:       $archive"
+if [[ -n "$archive" ]]; then
+    echo "Archive:       $archive"
+else
+    echo "Archive:       disabled"
+fi

@@ -64,15 +64,17 @@ static size_t opSlot(const char* op) {
     return 6;
 }
 
-static const char* apiType(const struct BfsHostTraceEvent* event) {
+static bool isTransferEvent(const struct BfsHostTraceEvent* event) {
+    return strcmp(event->op, "dpu_copy_to") == 0
+        || strcmp(event->op, "dpu_copy_from") == 0;
+}
+
+static const char* sdkApiKind(const struct BfsHostTraceEvent* event) {
     if(strcmp(event->op, "dpu_copy_to") == 0
        || strcmp(event->op, "dpu_copy_from") == 0) {
-        return "single_copy";
+        return "SINGLE_COPY";
     }
-    if(strcmp(event->op, "dpu_launch") == 0) {
-        return "collection_sync";
-    }
-    return "collection";
+    return "";
 }
 
 static const char* logicalDistributionClass(
@@ -87,12 +89,13 @@ static const char* logicalDistributionClass(
         return "PARTITIONED_SCATTER";
     }
     if(strcmp(event->op, "dpu_copy_from") == 0) {
+        /* Frontier bitmaps overlap logically and are OR-reduced by the host. */
         if(strcmp(event->subop, "frontier_result") == 0) {
             return "REDUCTION_GATHER";
         }
         return "PARTITIONED_GATHER";
     }
-    return "none";
+    return "";
 }
 
 static const char* sameSourceAcrossGroup(
@@ -109,7 +112,30 @@ static const char* sameSourceAcrossGroup(
     if(strcmp(event->op, "dpu_copy_from") == 0) {
         return "0";
     }
-    return "none";
+    return "";
+}
+
+static const char* phaseClass(const struct BfsHostTraceEvent* event) {
+    if(!isTransferEvent(event)) {
+        return "";
+    }
+    if(strcmp(event->subop, "node_ptrs") == 0
+       || strcmp(event->subop, "neighbor_idxs") == 0
+       || strcmp(event->subop, "node_level_init") == 0
+       || strcmp(event->subop, "visited_init") == 0
+       || strcmp(event->subop, "frontier_init") == 0
+       || strcmp(event->subop, "params_init") == 0) {
+        return "INIT";
+    }
+    if(strcmp(event->subop, "frontier_result") == 0
+       || strcmp(event->subop, "frontier_broadcast") == 0
+       || strcmp(event->subop, "params_level") == 0) {
+        return "ITERATIVE";
+    }
+    if(strcmp(event->subop, "node_level_result") == 0) {
+        return "FINALIZE";
+    }
+    return "UNKNOWN";
 }
 
 static void formatOffsetFeature(
@@ -155,37 +181,34 @@ static void formatCallContext(
     }
 }
 
-static bool formatMeasurementLabel(
+static bool formatTransportKey(
     const struct BfsHostTrace* trace,
     const struct BfsHostTraceEvent* event,
-    const char* eventApiType,
+    const char* eventSdkApiKind,
     const char* distributionClass,
     const char* sameSource,
-    const char* offsetFeature,
-    const char* callContext,
+    const char* eventPhaseClass,
     char* output,
     size_t outputSize
 ) {
     int result;
-    char rank[32];
-    char dpu[32];
-    const char* direction = event->direction[0] == '\0' ? "none" : event->direction;
-    const char* targetSpace = event->hasDpu ? "MRAM" : "none";
-
-    if(event->hasDpu) {
-        snprintf(rank, sizeof(rank), "%u", trace->rankOrdinals[event->globalDpuId]);
-        snprintf(dpu, sizeof(dpu), "%u", trace->dpuIdsInRank[event->globalDpuId]);
-    } else {
-        snprintf(rank, sizeof(rank), "all");
-        snprintf(dpu, sizeof(dpu), "all");
+    if(!event->hasDpu || !isTransferEvent(event)) {
+        output[0] = '\0';
+        return true;
     }
+
+    /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v2;op=%s;dir=%s;api=%s;dist=%s;space=%s;bytes=%" PRIu64
-        ";rank=%s;dpu=%s;same_source=%s;addr=%s;call=%s;numa=%s",
-        event->op, direction, eventApiType, distributionClass, targetSpace,
-        event->hasDpu ? event->transferBytes : 0,
-        rank, dpu, sameSource, offsetFeature, callContext, trace->hostNumaNode
+        "v2;op=%s;direction=%s;sdk_api_kind=%s;"
+        "logical_distribution_class=%s;target_space=MRAM;"
+        "transfer_bytes_per_dpu=%" PRIu64
+        ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
+        "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
+        "phase_class=%s",
+        event->op, event->direction, eventSdkApiKind, distributionClass,
+        event->transferBytes, trace->rankOrdinals[event->globalDpuId],
+        trace->dpuIdsInRank[event->globalDpuId], sameSource, eventPhaseClass
     );
     return result >= 0 && (size_t)result < outputSize;
 }
@@ -411,29 +434,32 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
     }
 
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
-          "op,subop,bfs_level,direction,api_type,logical_distribution_class,"
-          "same_source_across_group,global_dpu_id,rank_ordinal,dpu_id_in_rank,"
-          "target_space,target_symbol,offset_bytes,offset_feature,logical_bytes,transfer_bytes,"
+          "op,direction,sdk_api_kind,logical_distribution_class,target_space,"
+          "transfer_bytes_per_dpu,active_dpus,active_ranks,active_dpus_per_rank,"
+          "rank_ordinal,dpu_id_in_rank,same_source_across_group,phase_class,"
+          "subop,bfs_level,global_dpu_id,target_symbol,offset_bytes,offset_feature,"
+          "logical_bytes,transfer_bytes,"
           "op_call_index,dpu_op_call_index,process_state,pretrace_warmup_runs,"
-          "host_numa_node,call_context,measurement_label,"
+          "host_numa_node,call_context,transport_key,"
           "host_start_ns,host_end_ns,measured_ns\n", fp);
 
     for(i = 0; i < trace->numEvents; ++i) {
         const struct BfsHostTraceEvent* event = &trace->events[i];
-        const char* eventApiType = apiType(event);
+        const char* eventSdkApiKind = sdkApiKind(event);
         const char* distributionClass = logicalDistributionClass(event);
         const char* sameSource = sameSourceAcrossGroup(event);
+        const char* eventPhaseClass = phaseClass(event);
         char offsetFeature[160];
         char callContext[256];
-        char measurementLabel[1024];
+        char transportKey[1024];
 
         formatOffsetFeature(event, offsetFeature, sizeof(offsetFeature));
         formatCallContext(trace, event, callContext, sizeof(callContext));
-        if(!formatMeasurementLabel(trace, event, eventApiType,
-                                   distributionClass, sameSource,
-                                   offsetFeature, callContext, measurementLabel,
-                                   sizeof(measurementLabel))) {
-            fprintf(stderr, "BFS measurement label is too long for event %" PRIu64 "\n",
+        if(!formatTransportKey(trace, event, eventSdkApiKind,
+                              distributionClass, sameSource, eventPhaseClass,
+                              transportKey,
+                              sizeof(transportKey))) {
+            fprintf(stderr, "BFS transport key is too long for event %" PRIu64 "\n",
                     event->eventId);
             fclose(fp);
             return false;
@@ -445,35 +471,38 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
                 trace->actualRanks, trace->numTasklets);
         writeCsvString(fp, event->op);
         fputc(',', fp);
+        writeCsvString(fp, event->direction);
+        fputc(',', fp);
+        writeCsvString(fp, eventSdkApiKind);
+        fputc(',', fp);
+        writeCsvString(fp, distributionClass);
+        fputc(',', fp);
+        if(event->hasDpu) {
+            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,",
+                    event->transferBytes,
+                    trace->rankOrdinals[event->globalDpuId],
+                    trace->dpuIdsInRank[event->globalDpuId]);
+            writeCsvString(fp, sameSource);
+        } else {
+            fputs(",,,,,,,", fp);
+        }
+        fputc(',', fp);
+        writeCsvString(fp, eventPhaseClass);
+        fputc(',', fp);
         writeCsvString(fp, event->subop);
         fputc(',', fp);
         if(event->bfsLevel >= 0) {
             fprintf(fp, "%" PRId32, event->bfsLevel);
         }
         fputc(',', fp);
-        writeCsvString(fp, event->direction);
-        fputc(',', fp);
-        writeCsvString(fp, eventApiType);
-        fputc(',', fp);
-        writeCsvString(fp, distributionClass);
-        fputc(',', fp);
-        writeCsvString(fp, sameSource);
-        fputc(',', fp);
         if(event->hasDpu) {
-            fprintf(fp, "%u,%u,%u", event->globalDpuId,
-                    trace->rankOrdinals[event->globalDpuId],
-                    trace->dpuIdsInRank[event->globalDpuId]);
-        } else {
-            fputs(",,", fp);
-        }
-        if(event->hasDpu) {
-            fputs(",MRAM,DPU_MRAM_HEAP_POINTER_NAME,", fp);
+            fprintf(fp, "%u,DPU_MRAM_HEAP_POINTER_NAME,", event->globalDpuId);
             fprintf(fp, "%" PRIu64 ",", event->offsetBytes);
             writeCsvString(fp, offsetFeature);
             fprintf(fp, ",%" PRIu64 ",%" PRIu64,
                     event->logicalBytes, event->transferBytes);
         } else {
-            fputs(",,,,none,,", fp);
+            fputs(",,,none,,", fp);
         }
         fprintf(fp, ",%" PRIu64 ",", event->opCallIndex);
         if(event->hasDpuOpCallIndex) {
@@ -486,7 +515,7 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         fputc(',', fp);
         writeCsvString(fp, callContext);
         fputc(',', fp);
-        writeCsvString(fp, measurementLabel);
+        writeCsvString(fp, transportKey);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 event->startNs, event->endNs, event->endNs - event->startNs);
     }

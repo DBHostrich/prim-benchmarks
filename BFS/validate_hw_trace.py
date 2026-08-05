@@ -10,13 +10,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from measurement_label import (
-    api_type,
+from transport_key import (
     call_context,
     logical_distribution_class,
-    measurement_label,
     offset_feature,
+    phase_class,
     same_source_across_group,
+    sdk_api_kind,
+    transport_key,
 )
 
 
@@ -248,8 +249,9 @@ def validate(path: Path) -> dict[str, object]:
             )
 
         require(
-            row["api_type"] == api_type(row["op"]),
-            f"event {row['event_id']} has invalid api_type={row['api_type']}",
+            row["sdk_api_kind"] == sdk_api_kind(row["op"]),
+            f"event {row['event_id']} has invalid "
+            f"sdk_api_kind={row['sdk_api_kind']}",
         )
         require(
             row["logical_distribution_class"]
@@ -262,6 +264,10 @@ def validate(path: Path) -> dict[str, object]:
             f"event {row['event_id']} has invalid same_source_across_group",
         )
         require(
+            row["phase_class"] == phase_class(row["op"], row["subop"]),
+            f"event {row['event_id']} has invalid phase_class",
+        )
+        require(
             row["offset_feature"] == offset_feature(row),
             f"event {row['event_id']} has invalid offset_feature",
         )
@@ -270,8 +276,8 @@ def validate(path: Path) -> dict[str, object]:
             f"event {row['event_id']} has invalid call_context",
         )
         require(
-            row["measurement_label"] == measurement_label(row),
-            f"event {row['event_id']} has invalid measurement_label",
+            row["transport_key"] == transport_key(row),
+            f"event {row['event_id']} has invalid transport_key",
         )
 
     ops = Counter(row["op"] for row in rows)
@@ -322,14 +328,23 @@ def validate(path: Path) -> dict[str, object]:
         if row["op"] in {"dpu_alloc", "dpu_load", "dpu_launch", "dpu_free"}
     ]
     collection_empty_fields = (
+        "sdk_api_kind",
+        "logical_distribution_class",
+        "target_space",
+        "transfer_bytes_per_dpu",
+        "active_dpus",
+        "active_ranks",
+        "active_dpus_per_rank",
         "global_dpu_id",
         "rank_ordinal",
         "dpu_id_in_rank",
-        "target_space",
+        "same_source_across_group",
+        "phase_class",
         "target_symbol",
         "offset_bytes",
         "logical_bytes",
         "transfer_bytes",
+        "transport_key",
     )
     require(
         all(
@@ -365,6 +380,29 @@ def validate(path: Path) -> dict[str, object]:
         "copy event target_space differs from MRAM",
     )
     require(
+        all(row["sdk_api_kind"] == "SINGLE_COPY" for row in copy_rows),
+        "copy event sdk_api_kind differs from SINGLE_COPY",
+    )
+    require(
+        all(row["active_dpus"] == "1" for row in copy_rows),
+        "copy event active_dpus differs from 1",
+    )
+    require(
+        all(row["active_ranks"] == "1" for row in copy_rows),
+        "copy event active_ranks differs from 1",
+    )
+    require(
+        all(row["active_dpus_per_rank"] == "1" for row in copy_rows),
+        "copy event active_dpus_per_rank differs from 1",
+    )
+    require(
+        all(
+            row["phase_class"] in {"INIT", "ITERATIVE", "FINALIZE"}
+            for row in copy_rows
+        ),
+        "copy event phase_class is outside the supported BFS phases",
+    )
+    require(
         all(
             row["target_symbol"] == "DPU_MRAM_HEAP_POINTER_NAME"
             for row in copy_rows
@@ -382,6 +420,10 @@ def validate(path: Path) -> dict[str, object]:
     for row in copy_rows:
         logical = int(row["logical_bytes"])
         transfer = int(row["transfer_bytes"])
+        require(
+            int(row["transfer_bytes_per_dpu"]) == transfer,
+            f"event {row['event_id']} has inconsistent transfer_bytes_per_dpu",
+        )
         require(transfer % 8 == 0, f"event {row['event_id']} is not 8-byte aligned")
         require(
             logical <= transfer < logical + 8,
