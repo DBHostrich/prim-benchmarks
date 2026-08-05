@@ -10,6 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import validate_hw_trace
+from measurement_label import (
+    api_type,
+    call_context,
+    logical_distribution_class,
+    measurement_label,
+    offset_feature,
+    same_source_across_group,
+)
 
 
 FIELDNAMES = [
@@ -23,14 +31,25 @@ FIELDNAMES = [
     "subop",
     "bfs_level",
     "direction",
+    "api_type",
+    "logical_distribution_class",
+    "same_source_across_group",
     "global_dpu_id",
     "rank_ordinal",
     "dpu_id_in_rank",
     "target_space",
     "target_symbol",
     "offset_bytes",
+    "offset_feature",
     "logical_bytes",
     "transfer_bytes",
+    "op_call_index",
+    "dpu_op_call_index",
+    "process_state",
+    "pretrace_warmup_runs",
+    "host_numa_node",
+    "call_context",
+    "measurement_label",
     "host_start_ns",
     "host_end_ns",
     "measured_ns",
@@ -64,6 +83,8 @@ class BfsTraceValidatorTest(unittest.TestCase):
         timestamp = 1_000_000
         event_id = 0
         actual_ranks = nr_dpus // 64
+        op_call_counts: dict[str, int] = {}
+        dpu_op_call_counts: dict[tuple[str, int], int] = {}
 
         def append(
             op: str,
@@ -80,8 +101,14 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 if logical_bytes is not None
                 else None
             )
-            rows.append(
-                {
+            op_call_index = op_call_counts.get(op, 0)
+            op_call_counts[op] = op_call_index + 1
+            dpu_op_call_index = None
+            if has_dpu and op in {"dpu_copy_to", "dpu_copy_from"}:
+                key = (op, dpu_id)
+                dpu_op_call_index = dpu_op_call_counts.get(key, 0)
+                dpu_op_call_counts[key] = dpu_op_call_index + 1
+            row = {
                     "run_id": f"BFS_{nr_dpus}dpu_1tl",
                     "repeat_id": "1",
                     "event_id": str(event_id),
@@ -92,6 +119,13 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "subop": subop,
                     "bfs_level": bfs_level,
                     "direction": direction,
+                    "api_type": api_type(op),
+                    "logical_distribution_class": logical_distribution_class(
+                        op, subop
+                    ),
+                    "same_source_across_group": same_source_across_group(
+                        op, subop
+                    ),
                     "global_dpu_id": str(dpu_id) if has_dpu else "",
                     "rank_ordinal": str(dpu_id // 64) if has_dpu else "",
                     "dpu_id_in_rank": str(dpu_id % 64) if has_dpu else "",
@@ -100,17 +134,32 @@ class BfsTraceValidatorTest(unittest.TestCase):
                         "DPU_MRAM_HEAP_POINTER_NAME" if has_dpu else ""
                     ),
                     "offset_bytes": "0" if has_dpu else "",
+                    "offset_feature": "",
                     "logical_bytes": (
                         str(logical_bytes) if logical_bytes is not None else ""
                     ),
                     "transfer_bytes": (
                         str(transfer_bytes) if transfer_bytes is not None else ""
                     ),
+                    "op_call_index": str(op_call_index),
+                    "dpu_op_call_index": (
+                        str(dpu_op_call_index)
+                        if dpu_op_call_index is not None
+                        else ""
+                    ),
+                    "process_state": "fresh_process",
+                    "pretrace_warmup_runs": "5",
+                    "host_numa_node": "0",
+                    "call_context": "",
+                    "measurement_label": "",
                     "host_start_ns": str(timestamp),
                     "host_end_ns": str(timestamp + 100),
                     "measured_ns": "100",
                 }
-            )
+            row["offset_feature"] = offset_feature(row)
+            row["call_context"] = call_context(row)
+            row["measurement_label"] = measurement_label(row)
+            rows.append(row)
             timestamp += 200
             event_id += 1
 
@@ -245,6 +294,55 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 writer.writerows(rows)
             with self.assertRaisesRegex(ValueError, "semantic tuple"):
                 validate_hw_trace.validate(path)
+
+    def test_rejects_wrong_measurement_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 256)
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            copy_row = next(row for row in rows if row["op"] == "dpu_copy_to")
+            copy_row["measurement_label"] += ";corrupt=1"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "invalid measurement_label"):
+                validate_hw_trace.validate(path)
+
+    def test_distribution_and_same_source_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 256)
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+
+            by_subop = {}
+            for row in rows:
+                by_subop.setdefault(row["subop"], row)
+            self.assertEqual(
+                by_subop["frontier_broadcast"]["logical_distribution_class"],
+                "SHARED_REPLICATION",
+            )
+            self.assertEqual(
+                by_subop["frontier_broadcast"]["same_source_across_group"],
+                "1",
+            )
+            self.assertEqual(
+                by_subop["neighbor_idxs"]["logical_distribution_class"],
+                "PARTITIONED_SCATTER",
+            )
+            self.assertEqual(
+                by_subop["neighbor_idxs"]["same_source_across_group"], "0"
+            )
+            self.assertEqual(
+                by_subop["frontier_result"]["logical_distribution_class"],
+                "REDUCTION_GATHER",
+            )
+            self.assertEqual(
+                by_subop["node_level_result"]["logical_distribution_class"],
+                "PARTITIONED_GATHER",
+            )
 
 
 if __name__ == "__main__":

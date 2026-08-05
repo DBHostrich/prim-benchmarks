@@ -4,28 +4,190 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-static bool parseRepeatId(const char* value, uint64_t* repeatId) {
+static bool parseUnsignedEnv(const char* name, const char* value, uint64_t* parsedValue) {
     char* end = NULL;
     unsigned long long parsed;
 
     if(value == NULL || value[0] == '\0') {
-        *repeatId = 0;
+        *parsedValue = 0;
         return true;
     }
 
     errno = 0;
     parsed = strtoull(value, &end, 10);
     if(errno != 0 || end == value || *end != '\0') {
-        fprintf(stderr, "Invalid BFS_TRACE_REPEAT_ID: %s\n", value);
+        fprintf(stderr, "Invalid %s: %s\n", name, value);
         return false;
     }
-    *repeatId = (uint64_t)parsed;
+    *parsedValue = (uint64_t)parsed;
     return true;
+}
+
+static bool isLabelAtom(const char* value) {
+    const unsigned char* p = (const unsigned char*)value;
+    if(value == NULL || value[0] == '\0') {
+        return false;
+    }
+    for(; *p != '\0'; ++p) {
+        if(!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t opSlot(const char* op) {
+    if(strcmp(op, "dpu_alloc") == 0) {
+        return 0;
+    }
+    if(strcmp(op, "dpu_load") == 0) {
+        return 1;
+    }
+    if(strcmp(op, "dpu_copy_to") == 0) {
+        return 2;
+    }
+    if(strcmp(op, "dpu_copy_from") == 0) {
+        return 3;
+    }
+    if(strcmp(op, "dpu_launch") == 0) {
+        return 4;
+    }
+    if(strcmp(op, "dpu_free") == 0) {
+        return 5;
+    }
+    return 6;
+}
+
+static const char* apiType(const struct BfsHostTraceEvent* event) {
+    if(strcmp(event->op, "dpu_copy_to") == 0
+       || strcmp(event->op, "dpu_copy_from") == 0) {
+        return "single_copy";
+    }
+    if(strcmp(event->op, "dpu_launch") == 0) {
+        return "collection_sync";
+    }
+    return "collection";
+}
+
+static const char* logicalDistributionClass(
+    const struct BfsHostTraceEvent* event
+) {
+    if(strcmp(event->op, "dpu_copy_to") == 0) {
+        if(strcmp(event->subop, "visited_init") == 0
+           || strcmp(event->subop, "frontier_init") == 0
+           || strcmp(event->subop, "frontier_broadcast") == 0) {
+            return "SHARED_REPLICATION";
+        }
+        return "PARTITIONED_SCATTER";
+    }
+    if(strcmp(event->op, "dpu_copy_from") == 0) {
+        if(strcmp(event->subop, "frontier_result") == 0) {
+            return "REDUCTION_GATHER";
+        }
+        return "PARTITIONED_GATHER";
+    }
+    return "none";
+}
+
+static const char* sameSourceAcrossGroup(
+    const struct BfsHostTraceEvent* event
+) {
+    if(strcmp(event->op, "dpu_copy_to") == 0) {
+        if(strcmp(event->subop, "visited_init") == 0
+           || strcmp(event->subop, "frontier_init") == 0
+           || strcmp(event->subop, "frontier_broadcast") == 0) {
+            return "1";
+        }
+        return "0";
+    }
+    if(strcmp(event->op, "dpu_copy_from") == 0) {
+        return "0";
+    }
+    return "none";
+}
+
+static void formatOffsetFeature(
+    const struct BfsHostTraceEvent* event,
+    char* output,
+    size_t outputSize
+) {
+    uint64_t page;
+    uint64_t pages;
+
+    if(!event->hasDpu) {
+        snprintf(output, outputSize, "none");
+        return;
+    }
+    page = event->offsetBytes / UINT64_C(4096);
+    pages = event->transferBytes == 0 ? 0
+        : ((event->offsetBytes % UINT64_C(4096)) + event->transferBytes
+           + UINT64_C(4095)) / UINT64_C(4096);
+    snprintf(output, outputSize,
+             "off=%" PRIu64 ":a8=%u:a64=%u:p4k=%" PRIu64 ":pages=%" PRIu64,
+             event->offsetBytes, event->offsetBytes % 8 == 0,
+             event->offsetBytes % 64 == 0, page, pages);
+}
+
+static void formatCallContext(
+    const struct BfsHostTrace* trace,
+    const struct BfsHostTraceEvent* event,
+    char* output,
+    size_t outputSize
+) {
+    if(event->hasDpuOpCallIndex) {
+        snprintf(output, outputSize,
+                 "opidx=%" PRIu64 ":dpuopidx=%" PRIu64
+                 ":process=%s:prewarm=%" PRIu64,
+                 event->opCallIndex, event->dpuOpCallIndex,
+                 trace->processState, trace->pretraceWarmupRuns);
+    } else {
+        snprintf(output, outputSize,
+                 "opidx=%" PRIu64 ":dpuopidx=none"
+                 ":process=%s:prewarm=%" PRIu64,
+                 event->opCallIndex, trace->processState,
+                 trace->pretraceWarmupRuns);
+    }
+}
+
+static bool formatMeasurementLabel(
+    const struct BfsHostTrace* trace,
+    const struct BfsHostTraceEvent* event,
+    const char* eventApiType,
+    const char* distributionClass,
+    const char* sameSource,
+    const char* offsetFeature,
+    const char* callContext,
+    char* output,
+    size_t outputSize
+) {
+    int result;
+    char rank[32];
+    char dpu[32];
+    const char* direction = event->direction[0] == '\0' ? "none" : event->direction;
+    const char* targetSpace = event->hasDpu ? "MRAM" : "none";
+
+    if(event->hasDpu) {
+        snprintf(rank, sizeof(rank), "%u", trace->rankOrdinals[event->globalDpuId]);
+        snprintf(dpu, sizeof(dpu), "%u", trace->dpuIdsInRank[event->globalDpuId]);
+    } else {
+        snprintf(rank, sizeof(rank), "all");
+        snprintf(dpu, sizeof(dpu), "all");
+    }
+    result = snprintf(
+        output, outputSize,
+        "v2;op=%s;dir=%s;api=%s;dist=%s;space=%s;bytes=%" PRIu64
+        ";rank=%s;dpu=%s;same_source=%s;addr=%s;call=%s;numa=%s",
+        event->op, direction, eventApiType, distributionClass, targetSpace,
+        event->hasDpu ? event->transferBytes : 0,
+        rank, dpu, sameSource, offsetFeature, callContext, trace->hostNumaNode
+    );
+    return result >= 0 && (size_t)result < outputSize;
 }
 
 static void writeCsvString(FILE* fp, const char* value) {
@@ -91,6 +253,9 @@ bool bfsHostTraceInit(
     const char* outputPath = getenv("BFS_TRACE_CSV");
     const char* runId = getenv("BFS_TRACE_RUN_ID");
     const char* repeatId = getenv("BFS_TRACE_REPEAT_ID");
+    const char* hostNumaNode = getenv("BFS_TRACE_HOST_NUMA_NODE");
+    const char* processState = getenv("BFS_TRACE_PROCESS_STATE");
+    const char* pretraceWarmupRuns = getenv("BFS_TRACE_PREWARM_RUNS");
     struct dpu_set_t rank;
     struct dpu_set_t dpu;
     uint32_t rankOrdinal;
@@ -106,8 +271,18 @@ bool bfsHostTraceInit(
     trace->runId = (runId == NULL || runId[0] == '\0') ? "bfs" : runId;
     trace->configuredDpus = configuredDpus;
     trace->numTasklets = numTasklets;
+    trace->hostNumaNode = (hostNumaNode == NULL || hostNumaNode[0] == '\0')
+        ? "unknown" : hostNumaNode;
+    trace->processState = (processState == NULL || processState[0] == '\0')
+        ? "fresh_process" : processState;
     trace->capacity = (size_t)configuredDpus * 16u + 64u;
-    if(!parseRepeatId(repeatId, &trace->repeatId)) {
+    if(!parseUnsignedEnv("BFS_TRACE_REPEAT_ID", repeatId, &trace->repeatId)
+       || !parseUnsignedEnv("BFS_TRACE_PREWARM_RUNS", pretraceWarmupRuns,
+                            &trace->pretraceWarmupRuns)) {
+        return false;
+    }
+    if(!isLabelAtom(trace->hostNumaNode) || !isLabelAtom(trace->processState)) {
+        fprintf(stderr, "BFS trace NUMA/process label contains unsupported characters\n");
         return false;
     }
     if(dpu_get_nr_ranks(dpuSet, &trace->actualRanks) != DPU_OK) {
@@ -117,8 +292,14 @@ bool bfsHostTraceInit(
 
     trace->rankOrdinals = calloc(configuredDpus, sizeof(*trace->rankOrdinals));
     trace->dpuIdsInRank = calloc(configuredDpus, sizeof(*trace->dpuIdsInRank));
+    trace->dpuCopyToCallCounts = calloc(configuredDpus,
+                                        sizeof(*trace->dpuCopyToCallCounts));
+    trace->dpuCopyFromCallCounts = calloc(configuredDpus,
+                                          sizeof(*trace->dpuCopyFromCallCounts));
     trace->events = calloc(trace->capacity, sizeof(*trace->events));
-    if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL || trace->events == NULL) {
+    if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
+       || trace->dpuCopyToCallCounts == NULL
+       || trace->dpuCopyFromCallCounts == NULL || trace->events == NULL) {
         fprintf(stderr, "Could not allocate the BFS host trace buffers\n");
         bfsHostTraceDestroy(trace);
         return false;
@@ -202,6 +383,14 @@ void bfsHostTraceRecord(
     event->logicalBytes = logicalBytes;
     event->transferBytes = transferBytes;
     event->offsetBytes = offsetBytes;
+    event->opCallIndex = trace->opCallCounts[opSlot(op)]++;
+    if(hasDpu && strcmp(op, "dpu_copy_to") == 0) {
+        event->hasDpuOpCallIndex = true;
+        event->dpuOpCallIndex = trace->dpuCopyToCallCounts[globalDpuId]++;
+    } else if(hasDpu && strcmp(op, "dpu_copy_from") == 0) {
+        event->hasDpuOpCallIndex = true;
+        event->dpuOpCallIndex = trace->dpuCopyFromCallCounts[globalDpuId]++;
+    }
     event->startNs = startNs;
     event->endNs = endNs;
     ++trace->numEvents;
@@ -222,12 +411,33 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
     }
 
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
-          "op,subop,bfs_level,direction,global_dpu_id,rank_ordinal,dpu_id_in_rank,"
-          "target_space,target_symbol,offset_bytes,logical_bytes,transfer_bytes,"
+          "op,subop,bfs_level,direction,api_type,logical_distribution_class,"
+          "same_source_across_group,global_dpu_id,rank_ordinal,dpu_id_in_rank,"
+          "target_space,target_symbol,offset_bytes,offset_feature,logical_bytes,transfer_bytes,"
+          "op_call_index,dpu_op_call_index,process_state,pretrace_warmup_runs,"
+          "host_numa_node,call_context,measurement_label,"
           "host_start_ns,host_end_ns,measured_ns\n", fp);
 
     for(i = 0; i < trace->numEvents; ++i) {
         const struct BfsHostTraceEvent* event = &trace->events[i];
+        const char* eventApiType = apiType(event);
+        const char* distributionClass = logicalDistributionClass(event);
+        const char* sameSource = sameSourceAcrossGroup(event);
+        char offsetFeature[160];
+        char callContext[256];
+        char measurementLabel[1024];
+
+        formatOffsetFeature(event, offsetFeature, sizeof(offsetFeature));
+        formatCallContext(trace, event, callContext, sizeof(callContext));
+        if(!formatMeasurementLabel(trace, event, eventApiType,
+                                   distributionClass, sameSource,
+                                   offsetFeature, callContext, measurementLabel,
+                                   sizeof(measurementLabel))) {
+            fprintf(stderr, "BFS measurement label is too long for event %" PRIu64 "\n",
+                    event->eventId);
+            fclose(fp);
+            return false;
+        }
 
         writeCsvString(fp, trace->runId);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,",
@@ -243,6 +453,12 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         fputc(',', fp);
         writeCsvString(fp, event->direction);
         fputc(',', fp);
+        writeCsvString(fp, eventApiType);
+        fputc(',', fp);
+        writeCsvString(fp, distributionClass);
+        fputc(',', fp);
+        writeCsvString(fp, sameSource);
+        fputc(',', fp);
         if(event->hasDpu) {
             fprintf(fp, "%u,%u,%u", event->globalDpuId,
                     trace->rankOrdinals[event->globalDpuId],
@@ -252,11 +468,25 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         }
         if(event->hasDpu) {
             fputs(",MRAM,DPU_MRAM_HEAP_POINTER_NAME,", fp);
-            fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%" PRIu64,
-                    event->offsetBytes, event->logicalBytes, event->transferBytes);
+            fprintf(fp, "%" PRIu64 ",", event->offsetBytes);
+            writeCsvString(fp, offsetFeature);
+            fprintf(fp, ",%" PRIu64 ",%" PRIu64,
+                    event->logicalBytes, event->transferBytes);
         } else {
-            fputs(",,,,,", fp);
+            fputs(",,,,none,,", fp);
         }
+        fprintf(fp, ",%" PRIu64 ",", event->opCallIndex);
+        if(event->hasDpuOpCallIndex) {
+            fprintf(fp, "%" PRIu64, event->dpuOpCallIndex);
+        }
+        fputc(',', fp);
+        writeCsvString(fp, trace->processState);
+        fprintf(fp, ",%" PRIu64 ",", trace->pretraceWarmupRuns);
+        writeCsvString(fp, trace->hostNumaNode);
+        fputc(',', fp);
+        writeCsvString(fp, callContext);
+        fputc(',', fp);
+        writeCsvString(fp, measurementLabel);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 event->startNs, event->endNs, event->endNs - event->startNs);
     }
@@ -275,6 +505,8 @@ void bfsHostTraceDestroy(struct BfsHostTrace* trace) {
     }
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
+    free(trace->dpuCopyToCallCounts);
+    free(trace->dpuCopyFromCallCounts);
     free(trace->events);
     memset(trace, 0, sizeof(*trace));
 }

@@ -7,6 +7,8 @@ RESULT_ROOT="${RESULT_ROOT:-$WORKSPACE_DIR/bfs_hw_trace_$(date +%Y%m%d_%H%M%S)}"
 NUMA_NODE="${NUMA_NODE:-0}"
 N_WARMUP="${N_WARMUP:-5}"
 N_REPS="${N_REPS:-30}"
+LABEL_MIN_SAMPLES="${LABEL_MIN_SAMPLES:-20}"
+LABEL_SPREAD_THRESHOLD_PCT="${LABEL_SPREAD_THRESHOLD_PCT:-25}"
 DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
@@ -25,6 +27,7 @@ fi
 uname -a > "$RESULT_ROOT/uname.txt"
 lscpu > "$RESULT_ROOT/lscpu.txt"
 numactl --hardware > "$RESULT_ROOT/numa.txt" 2>&1 || true
+numactl --show > "$RESULT_ROOT/numactl_show.txt" 2>&1 || true
 git -C "$WORKSPACE_DIR/prim-benchmarks" rev-parse HEAD > "$RESULT_ROOT/prim_git_commit.txt"
 git -C "$WORKSPACE_DIR/prim-benchmarks" status --short > "$RESULT_ROOT/prim_git_status.txt"
 sha256sum "$GRAPH_PATH" > "$RESULT_ROOT/graph.sha256"
@@ -40,6 +43,12 @@ run_bfs() {
         ./bin/host_code -v "$verbosity" -f "$GRAPH_PATH"
     fi
 }
+
+if command -v numactl >/dev/null 2>&1; then
+    TRACE_HOST_NUMA_NODE="$NUMA_NODE"
+else
+    TRACE_HOST_NUMA_NODE="unbound"
+fi
 
 require_correct_result() {
     local log_path="$1"
@@ -60,11 +69,14 @@ for nr_dpus in $DPUS_LIST; do
         make NR_DPUS="$nr_dpus" NR_TASKLETS="$tasklets" all \
             > "$result_dir/build.log" 2>&1
         sha256sum bin/host_code bin/dpu_code > "$result_dir/binaries.sha256"
-        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nGRAPH=%s\n' \
-            "$nr_dpus" "$tasklets" "$NUMA_NODE" "$GRAPH_PATH" \
+        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nGRAPH=%s\n' \
+            "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
+            "$N_WARMUP" "$N_REPS" "$GRAPH_PATH" \
             > "$result_dir/config.txt"
 
-        unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID || true
+        unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID \
+            BFS_TRACE_HOST_NUMA_NODE BFS_TRACE_PROCESS_STATE \
+            BFS_TRACE_PREWARM_RUNS || true
         echo "==> Warming up $config ($N_WARMUP runs, tracing disabled)"
         for rep in $(seq 1 "$N_WARMUP"); do
             verbosity=0
@@ -82,17 +94,37 @@ for nr_dpus in $DPUS_LIST; do
             export BFS_TRACE_CSV="$result_dir/trace_${rep_id}.csv"
             export BFS_TRACE_RUN_ID="$config"
             export BFS_TRACE_REPEAT_ID="$rep"
+            export BFS_TRACE_HOST_NUMA_NODE="$TRACE_HOST_NUMA_NODE"
+            export BFS_TRACE_PROCESS_STATE="fresh_process"
+            export BFS_TRACE_PREWARM_RUNS="$N_WARMUP"
             run_log="$result_dir/run_${rep_id}.log"
             run_bfs 0 > "$run_log" 2>&1
             require_correct_result "$run_log"
         done
-        unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID || true
+        unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID \
+            BFS_TRACE_HOST_NUMA_NODE BFS_TRACE_PROCESS_STATE \
+            BFS_TRACE_PREWARM_RUNS || true
 
         python3 "$SCRIPT_DIR/validate_hw_trace.py" "$result_dir"/trace_*.csv \
             > "$result_dir/validation.log"
+        python3 "$SCRIPT_DIR/analyze_measurement_labels.py" \
+            --min-samples "$LABEL_MIN_SAMPLES" \
+            --spread-threshold-pct "$LABEL_SPREAD_THRESHOLD_PCT" \
+            --output "$result_dir/measurement_label_summary.csv" \
+            "$result_dir"/trace_*.csv \
+            > "$result_dir/measurement_label_analysis.log"
         echo "==> PASS $config"
     done
 done
+
+mapfile -t all_traces < <(find "$RESULT_ROOT" -mindepth 2 -maxdepth 2 \
+    -type f -name 'trace_*.csv' | sort)
+python3 "$SCRIPT_DIR/analyze_measurement_labels.py" \
+    --min-samples "$LABEL_MIN_SAMPLES" \
+    --spread-threshold-pct "$LABEL_SPREAD_THRESHOLD_PCT" \
+    --output "$RESULT_ROOT/measurement_label_summary_all.csv" \
+    "${all_traces[@]}" \
+    > "$RESULT_ROOT/measurement_label_analysis_all.log"
 
 archive="${RESULT_ROOT}.tar.gz"
 tar -czf "$archive" -C "$(dirname "$RESULT_ROOT")" "$(basename "$RESULT_ROOT")"

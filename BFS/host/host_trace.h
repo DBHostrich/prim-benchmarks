@@ -18,9 +18,14 @@ struct BfsHostTraceEvent {
     uint64_t logicalBytes;
     uint64_t transferBytes;
     uint64_t offsetBytes;
+    uint64_t opCallIndex;
+    bool hasDpuOpCallIndex;
+    uint64_t dpuOpCallIndex;
     uint64_t startNs;
     uint64_t endNs;
 };
+
+#define BFS_HOST_TRACE_OP_SLOTS 7
 
 struct BfsHostTrace {
     bool enabled;
@@ -30,8 +35,14 @@ struct BfsHostTrace {
     uint32_t configuredDpus;
     uint32_t actualRanks;
     uint32_t numTasklets;
+    const char* hostNumaNode;
+    const char* processState;
+    uint64_t pretraceWarmupRuns;
     uint32_t* rankOrdinals;
     uint32_t* dpuIdsInRank;
+    uint64_t* dpuCopyToCallCounts;
+    uint64_t* dpuCopyFromCallCounts;
+    uint64_t opCallCounts[BFS_HOST_TRACE_OP_SLOTS];
     struct BfsHostTraceEvent* events;
     size_t numEvents;
     size_t capacity;

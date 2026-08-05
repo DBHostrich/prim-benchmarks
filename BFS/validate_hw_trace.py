@@ -10,6 +10,15 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from measurement_label import (
+    api_type,
+    call_context,
+    logical_distribution_class,
+    measurement_label,
+    offset_feature,
+    same_source_across_group,
+)
+
 
 EXPECTED_LEVELS = 10
 EXPECTED = {
@@ -200,6 +209,70 @@ def validate(path: Path) -> dict[str, object]:
             f"event {row['event_id']} measured_ns != end-start",
         )
         require(elapsed > 0, f"event {row['event_id']} has a non-positive duration")
+
+    process_states = {row["process_state"] for row in rows}
+    warmup_counts = {row["pretrace_warmup_runs"] for row in rows}
+    host_numa_nodes = {row["host_numa_node"] for row in rows}
+    require(len(process_states) == 1 and "" not in process_states,
+            f"invalid process_state values: {process_states}")
+    require(len(warmup_counts) == 1 and "" not in warmup_counts,
+            f"invalid pretrace_warmup_runs values: {warmup_counts}")
+    require(len(host_numa_nodes) == 1 and "" not in host_numa_nodes,
+            f"invalid host_numa_node values: {host_numa_nodes}")
+
+    op_call_counts = Counter()
+    dpu_op_call_counts = Counter()
+    for row in rows:
+        expected_op_index = op_call_counts[row["op"]]
+        require(
+            int(row["op_call_index"]) == expected_op_index,
+            f"event {row['event_id']} has op_call_index={row['op_call_index']}, "
+            f"expected {expected_op_index}",
+        )
+        op_call_counts[row["op"]] += 1
+
+        has_dpu_call_index = row["op"] in {"dpu_copy_to", "dpu_copy_from"}
+        if has_dpu_call_index:
+            key = (row["op"], row["global_dpu_id"])
+            expected_dpu_index = dpu_op_call_counts[key]
+            require(
+                int(row["dpu_op_call_index"]) == expected_dpu_index,
+                f"event {row['event_id']} has dpu_op_call_index="
+                f"{row['dpu_op_call_index']}, expected {expected_dpu_index}",
+            )
+            dpu_op_call_counts[key] += 1
+        else:
+            require(
+                row["dpu_op_call_index"] == "",
+                f"event {row['event_id']} has unexpected dpu_op_call_index",
+            )
+
+        require(
+            row["api_type"] == api_type(row["op"]),
+            f"event {row['event_id']} has invalid api_type={row['api_type']}",
+        )
+        require(
+            row["logical_distribution_class"]
+            == logical_distribution_class(row["op"], row["subop"]),
+            f"event {row['event_id']} has invalid logical_distribution_class",
+        )
+        require(
+            row["same_source_across_group"]
+            == same_source_across_group(row["op"], row["subop"]),
+            f"event {row['event_id']} has invalid same_source_across_group",
+        )
+        require(
+            row["offset_feature"] == offset_feature(row),
+            f"event {row['event_id']} has invalid offset_feature",
+        )
+        require(
+            row["call_context"] == call_context(row),
+            f"event {row['event_id']} has invalid call_context",
+        )
+        require(
+            row["measurement_label"] == measurement_label(row),
+            f"event {row['event_id']} has invalid measurement_label",
+        )
 
     ops = Counter(row["op"] for row in rows)
     require(ops["dpu_alloc"] == 1, f"alloc={ops['dpu_alloc']}, expected 1")
