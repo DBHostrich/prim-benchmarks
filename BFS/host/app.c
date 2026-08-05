@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "context_probe.h"
 #include "mram-management.h"
 #include "../support/common.h"
 #include "../support/graph.h"
@@ -48,10 +49,15 @@ int main(int argc, char** argv) {
     struct dpu_set_t dpu_set, dpu;
     uint32_t numDPUs;
     bool traceRequested = bfsHostTraceRequested();
+    bool contextProbeRequested = bfsContextProbeRequested();
     uint64_t allocStartNs = 0;
     uint64_t allocEndNs = 0;
     uint64_t loadStartNs = 0;
     uint64_t loadEndNs = 0;
+    if(traceRequested && contextProbeRequested) {
+        PRINT_ERROR("BFS_TRACE_CSV and BFS_CONTEXT_PROBE_CSV are mutually exclusive");
+        return EXIT_FAILURE;
+    }
     if(traceRequested) {
         allocStartNs = bfsHostTraceNowNs();
     }
@@ -188,6 +194,21 @@ int main(int argc, char** argv) {
 
     }
     PRINT_INFO(p.verbosity >= 1, "    CPU-DPU Time: %f ms", loadTime*1e3);
+
+    if(contextProbeRequested) {
+        bool probeOk = bfsRunContextProbe(
+            dpu_set, numDPUs, dpuParams, numNodes
+        );
+        freeCOOGraph(cooGraph);
+        freeCSRGraph(csrGraph);
+        free(nodeLevel);
+        free(visited);
+        free(currentFrontier);
+        free(nextFrontier);
+        DPU_ASSERT(dpu_free(dpu_set));
+        bfsHostTraceDestroy(&hostTrace);
+        return probeOk ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
 
     // Iterate until next frontier is empty
     uint32_t nextFrontierEmpty = 0;
