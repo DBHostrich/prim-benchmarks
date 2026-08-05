@@ -2,6 +2,7 @@
 
 #include "host_trace.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -9,23 +10,110 @@
 #include <string.h>
 #include <time.h>
 
-static bool parseRepeatId(const char* value, uint64_t* repeatId) {
+static bool parseUnsignedEnv(
+    const char* name,
+    const char* value,
+    uint64_t* parsedValue
+) {
     char* end = NULL;
     unsigned long long parsed;
 
     if(value == NULL || value[0] == '\0') {
-        *repeatId = 0;
+        *parsedValue = 0;
         return true;
     }
 
     errno = 0;
     parsed = strtoull(value, &end, 10);
     if(errno != 0 || end == value || *end != '\0') {
-        fprintf(stderr, "Invalid RED_TRACE_REPEAT_ID: %s\n", value);
+        fprintf(stderr, "Invalid %s: %s\n", name, value);
         return false;
     }
-    *repeatId = (uint64_t)parsed;
+    *parsedValue = (uint64_t)parsed;
     return true;
+}
+
+static bool isLabelAtom(const char* value) {
+    const unsigned char* p = (const unsigned char*)value;
+    if(value == NULL || value[0] == '\0') {
+        return false;
+    }
+    for(; *p != '\0'; ++p) {
+        if(!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char* sdkApiKind(const struct RedHostTraceEvent* event) {
+    return event->hasTransfer ? "PUSH_XFER" : "";
+}
+
+static const char* logicalDistributionClass(
+    const struct RedHostTraceEvent* event
+) {
+    if(!event->hasTransfer) {
+        return "";
+    }
+    if(strcmp(event->subop, "input_arguments") == 0
+       || strcmp(event->subop, "input_data") == 0) {
+        return "PARTITIONED_SCATTER";
+    }
+    if(strcmp(event->subop, "results") == 0) {
+        return "REDUCTION_GATHER";
+    }
+    return "UNKNOWN";
+}
+
+static const char* sameSourceAcrossGroup(
+    const struct RedHostTraceEvent* event
+) {
+    return event->hasTransfer ? "0" : "";
+}
+
+static const char* phaseClass(const struct RedHostTraceEvent* event) {
+    if(!event->hasTransfer) {
+        return "";
+    }
+    /* The warmup bit is context. All RED transfers occur in the main loop. */
+    if(strcmp(event->subop, "input_arguments") == 0
+       || strcmp(event->subop, "input_data") == 0
+       || strcmp(event->subop, "results") == 0) {
+        return "ITERATIVE";
+    }
+    return "UNKNOWN";
+}
+
+static bool formatTransportKey(
+    const struct RedHostTrace* trace,
+    const struct RedHostTraceEvent* event,
+    const char* eventSdkApiKind,
+    const char* distributionClass,
+    const char* sameSource,
+    const char* eventPhaseClass,
+    char* output,
+    size_t outputSize
+) {
+    int result;
+    if(!event->hasTransfer) {
+        output[0] = '\0';
+        return true;
+    }
+    result = snprintf(
+        output, outputSize,
+        "v2;op=%s;direction=%s;sdk_api_kind=%s;"
+        "logical_distribution_class=%s;target_space=%s;"
+        "transfer_bytes_per_dpu=%" PRIu64 ";active_dpus=%u;"
+        "active_ranks=%u;active_dpus_per_rank=%s;"
+        "rank_ordinal=ALL;dpu_id_in_rank=ALL;"
+        "same_source_across_group=%s;phase_class=%s",
+        event->op, event->direction, eventSdkApiKind, distributionClass,
+        event->targetSpace, event->sizePerDpuBytes, event->activeDpus,
+        trace->actualRanks, trace->activeDpusPerRank, sameSource,
+        eventPhaseClass
+    );
+    return result >= 0 && (size_t)result < outputSize;
 }
 
 static void writeCsvString(FILE* fp, const char* value) {
@@ -117,11 +205,16 @@ bool redHostTraceInit(
     const char* dpusOutputPath = getenv("RED_TRACE_DPUS_CSV");
     const char* runId = getenv("RED_TRACE_RUN_ID");
     const char* repeatId = getenv("RED_TRACE_REPEAT_ID");
+    const char* hostNumaNode = getenv("RED_TRACE_HOST_NUMA_NODE");
+    const char* processState = getenv("RED_TRACE_PROCESS_STATE");
+    const char* pretraceWarmupRuns = getenv("RED_TRACE_PREWARM_RUNS");
     struct dpu_set_t rank;
     struct dpu_set_t dpu;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
+    uint32_t* rankCounts = NULL;
+    size_t rankShapeOffset = 0;
 
     memset(trace, 0, sizeof(*trace));
     if(!redHostTraceRequested()) {
@@ -139,13 +232,27 @@ bool redHostTraceInit(
     trace->numTasklets = numTasklets;
     trace->totalInputElements = totalInputElements;
     trace->totalInputBytes = totalInputBytes;
+    trace->hostNumaNode = (hostNumaNode == NULL || hostNumaNode[0] == '\0')
+        ? "unknown" : hostNumaNode;
+    trace->processState = (processState == NULL || processState[0] == '\0')
+        ? "fresh_process" : processState;
     trace->eventCapacity = 32u;
     trace->dpuRowCapacity = (size_t)configuredDpus * 12u;
-    if(!parseRepeatId(repeatId, &trace->repeatId)) {
+    if(!parseUnsignedEnv("RED_TRACE_REPEAT_ID", repeatId, &trace->repeatId)
+       || !parseUnsignedEnv("RED_TRACE_PREWARM_RUNS", pretraceWarmupRuns,
+                            &trace->pretraceWarmupRuns)) {
+        return false;
+    }
+    if(!isLabelAtom(trace->hostNumaNode) || !isLabelAtom(trace->processState)) {
+        fprintf(stderr, "RED trace NUMA/process label contains unsupported characters\n");
         return false;
     }
     if(dpu_get_nr_ranks(dpuSet, &trace->actualRanks) != DPU_OK) {
         fprintf(stderr, "Could not query the allocated rank count\n");
+        return false;
+    }
+    if(configuredDpus == 0 || trace->actualRanks == 0) {
+        fprintf(stderr, "RED tracing requires at least one DPU and one rank\n");
         return false;
     }
 
@@ -153,31 +260,64 @@ bool redHostTraceInit(
     trace->dpuIdsInRank = calloc(configuredDpus, sizeof(*trace->dpuIdsInRank));
     trace->events = calloc(trace->eventCapacity, sizeof(*trace->events));
     trace->dpuRows = calloc(trace->dpuRowCapacity, sizeof(*trace->dpuRows));
+    rankCounts = calloc(trace->actualRanks, sizeof(*rankCounts));
+    trace->activeDpusPerRank = calloc(
+        (size_t)trace->actualRanks * 11u + 1u,
+        sizeof(*trace->activeDpusPerRank)
+    );
     if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
-       || trace->events == NULL || trace->dpuRows == NULL) {
+       || trace->events == NULL || trace->dpuRows == NULL
+       || rankCounts == NULL || trace->activeDpusPerRank == NULL) {
         fprintf(stderr, "Could not allocate the RED host trace buffers\n");
+        free(rankCounts);
         redHostTraceDestroy(trace);
         return false;
     }
 
     DPU_RANK_FOREACH(dpuSet, rank, rankOrdinal) {
+        if(rankOrdinal >= trace->actualRanks) {
+            fprintf(stderr, "Allocated RED rank ordinal exceeds rank count\n");
+            free(rankCounts);
+            redHostTraceDestroy(trace);
+            return false;
+        }
         DPU_FOREACH(rank, dpu, dpuIdInRank) {
             if(globalDpuId >= configuredDpus) {
                 fprintf(stderr, "Allocated DPU topology exceeds configured DPU count\n");
+                free(rankCounts);
                 redHostTraceDestroy(trace);
                 return false;
             }
             trace->rankOrdinals[globalDpuId] = rankOrdinal;
             trace->dpuIdsInRank[globalDpuId] = dpuIdInRank;
+            ++rankCounts[rankOrdinal];
             ++globalDpuId;
         }
     }
     if(globalDpuId != configuredDpus) {
         fprintf(stderr, "Allocated DPU topology contains %u DPUs, expected %u\n",
                 globalDpuId, configuredDpus);
+        free(rankCounts);
         redHostTraceDestroy(trace);
         return false;
     }
+    for(rankOrdinal = 0; rankOrdinal < trace->actualRanks; ++rankOrdinal) {
+        int written = snprintf(
+            trace->activeDpusPerRank + rankShapeOffset,
+            (size_t)trace->actualRanks * 11u + 1u - rankShapeOffset,
+            "%s%u", rankOrdinal == 0 ? "" : "|", rankCounts[rankOrdinal]
+        );
+        if(written < 0
+           || (size_t)written
+                >= (size_t)trace->actualRanks * 11u + 1u - rankShapeOffset) {
+            fprintf(stderr, "Could not format RED active DPUs per rank\n");
+            free(rankCounts);
+            redHostTraceDestroy(trace);
+            return false;
+        }
+        rankShapeOffset += (size_t)written;
+    }
+    free(rankCounts);
 
     trace->enabled = true;
     return true;
@@ -340,13 +480,32 @@ static bool writeEvents(const struct RedHostTrace* trace) {
         return false;
     }
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
-          "total_input_elements,total_input_bytes,iteration,warmup,"
-          "op,subop,direction,active_dpus,size_per_dpu_bytes,"
-          "total_logical_bytes,total_transfer_bytes,target_space,target_symbol,"
-          "offset_bytes,host_start_ns,host_end_ns,measured_ns\n", fp);
+          "total_input_elements,total_input_bytes,op,direction,sdk_api_kind,"
+          "logical_distribution_class,target_space,transfer_bytes_per_dpu,"
+          "active_dpus,active_ranks,active_dpus_per_rank,rank_ordinal,"
+          "dpu_id_in_rank,same_source_across_group,phase_class,subop,"
+          "iteration,warmup,size_per_dpu_bytes,total_logical_bytes,"
+          "total_transfer_bytes,target_symbol,offset_bytes,process_state,"
+          "pretrace_warmup_runs,host_numa_node,transport_key,"
+          "host_start_ns,host_end_ns,measured_ns\n", fp);
 
     for(i = 0; i < trace->numEvents; ++i) {
         const struct RedHostTraceEvent* event = &trace->events[i];
+        const char* eventSdkApiKind = sdkApiKind(event);
+        const char* distributionClass = logicalDistributionClass(event);
+        const char* sameSource = sameSourceAcrossGroup(event);
+        const char* eventPhaseClass = phaseClass(event);
+        char transportKey[1024];
+
+        if(!formatTransportKey(trace, event, eventSdkApiKind,
+                               distributionClass, sameSource,
+                               eventPhaseClass, transportKey,
+                               sizeof(transportKey))) {
+            fprintf(stderr, "RED transport key is too long for event %" PRIu64 "\n",
+                    event->eventId);
+            fclose(fp);
+            return false;
+        }
 
         writeCsvString(fp, trace->runId);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%" PRIu64
@@ -354,6 +513,30 @@ static bool writeEvents(const struct RedHostTrace* trace) {
                 trace->repeatId, event->eventId, trace->configuredDpus,
                 trace->actualRanks, trace->numTasklets,
                 trace->totalInputElements, trace->totalInputBytes);
+        writeCsvString(fp, event->op);
+        fputc(',', fp);
+        writeCsvString(fp, event->direction);
+        fputc(',', fp);
+        writeCsvString(fp, eventSdkApiKind);
+        fputc(',', fp);
+        writeCsvString(fp, distributionClass);
+        fputc(',', fp);
+        if(event->hasTransfer) {
+            writeCsvString(fp, event->targetSpace);
+            fprintf(fp, ",%" PRIu64 ",%u,%u,",
+                    event->sizePerDpuBytes, event->activeDpus,
+                    trace->actualRanks);
+            writeCsvString(fp, trace->activeDpusPerRank);
+            fputs(",ALL,ALL,", fp);
+            writeCsvString(fp, sameSource);
+            fputc(',', fp);
+            writeCsvString(fp, eventPhaseClass);
+        } else {
+            fprintf(fp, ",,%u,,,,,,", event->activeDpus);
+        }
+        fputc(',', fp);
+        writeCsvString(fp, event->subop);
+        fputc(',', fp);
         if(event->iteration >= 0) {
             fprintf(fp, "%" PRId32, event->iteration);
         }
@@ -362,23 +545,21 @@ static bool writeEvents(const struct RedHostTrace* trace) {
             fprintf(fp, "%" PRId32, event->warmup);
         }
         fputc(',', fp);
-        writeCsvString(fp, event->op);
-        fputc(',', fp);
-        writeCsvString(fp, event->subop);
-        fputc(',', fp);
-        writeCsvString(fp, event->direction);
-        fprintf(fp, ",%u,", event->activeDpus);
         if(event->hasTransfer) {
             fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
                     event->sizePerDpuBytes, event->totalLogicalBytes,
                     event->totalTransferBytes);
-            writeCsvString(fp, event->targetSpace);
-            fputc(',', fp);
             writeCsvString(fp, event->targetSymbol);
             fprintf(fp, ",%" PRIu64, event->offsetBytes);
         } else {
-            fputs(",,,,,", fp);
+            fputs(",,,,", fp);
         }
+        fputc(',', fp);
+        writeCsvString(fp, trace->processState);
+        fprintf(fp, ",%" PRIu64 ",", trace->pretraceWarmupRuns);
+        writeCsvString(fp, trace->hostNumaNode);
+        fputc(',', fp);
+        writeCsvString(fp, transportKey);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 event->startNs, event->endNs, event->endNs - event->startNs);
     }
@@ -450,6 +631,7 @@ void redHostTraceDestroy(struct RedHostTrace* trace) {
     }
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
+    free(trace->activeDpusPerRank);
     free(trace->events);
     free(trace->dpuRows);
     memset(trace, 0, sizeof(*trace));

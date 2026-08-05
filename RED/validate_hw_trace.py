@@ -10,6 +10,14 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from transport_key import (
+    logical_distribution_class,
+    phase_class,
+    same_source_across_group,
+    sdk_api_kind,
+    transport_key,
+)
+
 
 TOTAL_INPUT_ELEMENTS = 6_553_600
 TOTAL_INPUT_BYTES = 52_428_800
@@ -26,18 +34,31 @@ EVENT_FIELDS = {
     "num_tasklets",
     "total_input_elements",
     "total_input_bytes",
+    "op",
+    "direction",
+    "sdk_api_kind",
+    "logical_distribution_class",
+    "target_space",
+    "transfer_bytes_per_dpu",
+    "active_dpus",
+    "active_ranks",
+    "active_dpus_per_rank",
+    "rank_ordinal",
+    "dpu_id_in_rank",
+    "same_source_across_group",
+    "phase_class",
+    "subop",
     "iteration",
     "warmup",
-    "op",
-    "subop",
-    "direction",
-    "active_dpus",
     "size_per_dpu_bytes",
     "total_logical_bytes",
     "total_transfer_bytes",
-    "target_space",
     "target_symbol",
     "offset_bytes",
+    "process_state",
+    "pretrace_warmup_runs",
+    "host_numa_node",
+    "transport_key",
     "host_start_ns",
     "host_end_ns",
     "measured_ns",
@@ -168,6 +189,10 @@ def validate(event_path: Path, dpu_path: Path | None = None) -> dict[str, object
     tasklets = one_int(events, "num_tasklets")
     run_id = one_text(events, "run_id")
     repeat_id = one_int(events, "repeat_id")
+    process_state = one_text(events, "process_state")
+    pretrace_warmup_runs = one_int(events, "pretrace_warmup_runs")
+    host_numa_node = one_text(events, "host_numa_node")
+    rank_shape = "|".join("64" for _ in range(ranks))
 
     require(nr_dpus in SUPPORTED_DPUS, f"unsupported configured_dpus={nr_dpus}")
     require(
@@ -185,6 +210,16 @@ def validate(event_path: Path, dpu_path: Path | None = None) -> dict[str, object
     require(
         one_int(events, "total_input_bytes") == TOTAL_INPUT_BYTES,
         f"total_input_bytes differs from {TOTAL_INPUT_BYTES}",
+    )
+    require(
+        bool(process_state), "process_state metadata is empty"
+    )
+    require(
+        pretrace_warmup_runs >= 0,
+        "pretrace_warmup_runs metadata is negative",
+    )
+    require(
+        bool(host_numa_node), "host_numa_node metadata is empty"
     )
 
     wanted_sequence = expected_sequence()
@@ -230,18 +265,50 @@ def validate(event_path: Path, dpu_path: Path | None = None) -> dict[str, object
             int(row["active_dpus"]) == nr_dpus,
             f"event {event_id} active_dpus differs from {nr_dpus}",
         )
+        require(
+            row["sdk_api_kind"] == sdk_api_kind(row["op"]),
+            f"event {event_id} has invalid sdk_api_kind",
+        )
+        require(
+            row["logical_distribution_class"]
+            == logical_distribution_class(row["op"], row["subop"]),
+            f"event {event_id} has invalid logical_distribution_class",
+        )
+        require(
+            row["same_source_across_group"]
+            == same_source_across_group(row["op"], row["subop"]),
+            f"event {event_id} has invalid same_source_across_group",
+        )
+        require(
+            row["phase_class"] == phase_class(row["op"], row["subop"]),
+            f"event {event_id} has invalid phase_class",
+        )
+        require(
+            row["transport_key"] == transport_key(row),
+            f"event {event_id} has invalid transport_key",
+        )
 
     transfer_rows = [row for row in events if row["op"] == "dpu_transfer"]
     collection_rows = [
         row for row in events if row["op"] in {"dpu_alloc", "dpu_load", "dpu_launch", "dpu_free"}
     ]
     empty_transfer_fields = (
+        "sdk_api_kind",
+        "logical_distribution_class",
+        "target_space",
+        "transfer_bytes_per_dpu",
+        "active_ranks",
+        "active_dpus_per_rank",
+        "rank_ordinal",
+        "dpu_id_in_rank",
+        "same_source_across_group",
+        "phase_class",
         "size_per_dpu_bytes",
         "total_logical_bytes",
         "total_transfer_bytes",
-        "target_space",
         "target_symbol",
         "offset_bytes",
+        "transport_key",
     )
     require(
         all(
@@ -273,6 +340,44 @@ def validate(event_path: Path, dpu_path: Path | None = None) -> dict[str, object
             f"event {event_id} target_symbol={row['target_symbol']}, expected {target_symbol}",
         )
         require(row["offset_bytes"] == "0", f"event {event_id} offset differs from zero")
+        require(
+            row["sdk_api_kind"] == "PUSH_XFER",
+            f"event {event_id} sdk_api_kind differs from PUSH_XFER",
+        )
+        require(
+            row["logical_distribution_class"]
+            == (
+                "REDUCTION_GATHER"
+                if row["subop"] == "results"
+                else "PARTITIONED_SCATTER"
+            ),
+            f"event {event_id} distribution class is inconsistent",
+        )
+        require(
+            int(row["transfer_bytes_per_dpu"]) == bytes_per_dpu,
+            f"event {event_id} transfer_bytes_per_dpu differs from {bytes_per_dpu}",
+        )
+        require(
+            int(row["active_ranks"]) == ranks,
+            f"event {event_id} active_ranks differs from {ranks}",
+        )
+        require(
+            row["active_dpus_per_rank"] == rank_shape,
+            f"event {event_id} active_dpus_per_rank differs from {rank_shape}",
+        )
+        require(
+            row["rank_ordinal"] == "ALL"
+            and row["dpu_id_in_rank"] == "ALL",
+            f"event {event_id} collection topology marker differs from ALL",
+        )
+        require(
+            row["same_source_across_group"] == "0",
+            f"event {event_id} same_source_across_group differs from zero",
+        )
+        require(
+            row["phase_class"] == "ITERATIVE",
+            f"event {event_id} phase_class is inconsistent",
+        )
         require(
             int(row["size_per_dpu_bytes"]) == bytes_per_dpu,
             f"event {event_id} size_per_dpu_bytes differs from {bytes_per_dpu}",

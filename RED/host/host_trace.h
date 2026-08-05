@@ -49,8 +49,12 @@ struct RedHostTrace {
     uint32_t numTasklets;
     uint64_t totalInputElements;
     uint64_t totalInputBytes;
+    const char* hostNumaNode;
+    const char* processState;
+    uint64_t pretraceWarmupRuns;
     uint32_t* rankOrdinals;
     uint32_t* dpuIdsInRank;
+    char* activeDpusPerRank;
     struct RedHostTraceEvent* events;
     size_t numEvents;
     size_t eventCapacity;
