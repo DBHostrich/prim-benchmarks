@@ -13,6 +13,7 @@ from transport_key import (
     transport_key,
     transport_key_with_full_context,
     transport_key_with_mux_domain_min,
+    transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
     transport_key_without_mux_pair_context,
     transport_key_without_physical_rank,
@@ -212,6 +213,23 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             transport_key_with_mux_domain_min(other_pair),
         )
         self.assertEqual(mux_domain_class("COLLECTION"), "COLLECTION")
+
+    def test_rank_invariant_mux_key_shares_rank_local_position(self) -> None:
+        first_rank = self.sample_row(1, 100)
+        second_rank = dict(first_rank)
+        second_rank["rank_ordinal"] = "1"
+        second_rank["global_dpu_id"] = "64"
+        second_rank["sdk_physical_rank_id"] = "12289"
+        second_rank["physical_dpu_identity"] = "rank:12289/slice:0/member:0"
+
+        self.assertNotEqual(
+            transport_key_with_mux_domain_min(first_rank),
+            transport_key_with_mux_domain_min(second_rank),
+        )
+        self.assertEqual(
+            transport_key_with_mux_domain_rank_invariant(first_rank),
+            transport_key_with_mux_domain_rank_invariant(second_rank),
+        )
 
     def test_reports_minimal_mux_key_phase_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

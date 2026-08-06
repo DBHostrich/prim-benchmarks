@@ -25,6 +25,9 @@ PHASE_TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + ("phase_class",)
 MUX_RELATION_MIN_FIELDS = BASE_TRANSPORT_KEY_FIELDS + (
     "previous_sdk_topology_relation",
 )
+RANK_INVARIANT_BASE_FIELDS = tuple(
+    field for field in BASE_TRANSPORT_KEY_FIELDS if field != "rank_ordinal"
+)
 HISTORY_MIN_FIELDS = (
     "sdk_slice_id",
     "sdk_member_id",
@@ -227,6 +230,22 @@ def transport_key_with_mux_domain_min(row: Mapping[str, str]) -> str:
     )
     domain = mux_domain_class(row["previous_sdk_topology_relation"])
     return f"mux_domain_min;{base};previous_sdk_mux_domain_class={domain}"
+
+
+def transport_key_with_mux_domain_rank_invariant(
+    row: Mapping[str, str],
+) -> str:
+    """MUX-domain key that shares one table across allocation-local ranks."""
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    base = ";".join(
+        f"{name}={row[name]}" for name in RANK_INVARIANT_BASE_FIELDS
+    )
+    domain = mux_domain_class(row["previous_sdk_topology_relation"])
+    return (
+        "mux_domain_rank_invariant;"
+        f"{base};previous_sdk_mux_domain_class={domain}"
+    )
 
 
 def sdk_topology_relation(

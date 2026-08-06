@@ -23,6 +23,8 @@ class TransportKeyEvaluationTest(unittest.TestCase):
             "run_id": "synthetic",
             "repeat_id": str(repeat_id),
             "event_id": "0",
+            "configured_dpus": "256",
+            "num_tasklets": "1",
             "op": "dpu_copy_to",
             "direction": "TO_DPU",
             "sdk_api_kind": "SINGLE_COPY",
@@ -97,7 +99,45 @@ class TransportKeyEvaluationTest(unittest.TestCase):
                 float(mux_domain["p90_abs_pct_error"]),
                 float(base["p90_abs_pct_error"]),
             )
-            self.assertEqual(len(per_trace), 30)
+            self.assertEqual(len(per_trace), 36)
+
+    def test_can_hold_out_one_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for repeat_id in range(1, 5):
+                configured_dpus = "64" if repeat_id <= 2 else "128"
+                path = root / f"trace_{repeat_id}.csv"
+                rows = [
+                    self.sample_row(
+                        repeat_id,
+                        "INIT",
+                        "SAME_DPU",
+                        100 + repeat_id,
+                    ),
+                    self.sample_row(
+                        repeat_id,
+                        "ITERATIVE",
+                        "SAME_SLICE",
+                        200 + repeat_id,
+                    ),
+                ]
+                for row in rows:
+                    row["configured_dpus"] = configured_dpus
+                self.write_rows(path, rows)
+                paths.append(path)
+
+            summary, per_holdout = evaluate(paths, "configuration")
+            domain = next(
+                row
+                for row in summary
+                if row["model"] == "mux_domain_rank_invariant"
+                and row["scope"] == "BASE12_PHASE_MIXED"
+            )
+            self.assertEqual(domain["holdout_unit"], "configuration")
+            self.assertEqual(domain["holdout_groups"], 2)
+            self.assertEqual(domain["coverage_pct"], "100.000000")
+            self.assertEqual(len(per_holdout), 24)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from pathlib import Path
 from transport_key import (
     TRANSFER_OPS,
     transport_key_with_mux_domain_min,
+    transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
     sdk_topology_relation,
     transport_key,
@@ -66,6 +67,9 @@ def analyze(
     mux_domain_min_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
+    mux_domain_rank_invariant_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
     transfer_rows = 0
 
     for path in paths:
@@ -117,6 +121,9 @@ def analyze(
             ].append((path, row))
             mux_domain_min_groups[
                 transport_key_with_mux_domain_min(row)
+            ].append((path, row))
+            mux_domain_rank_invariant_groups[
+                transport_key_with_mux_domain_rank_invariant(row)
             ].append((path, row))
 
     summaries: list[dict[str, object]] = []
@@ -378,6 +385,9 @@ def analyze(
     )
     mux_relation_min_quality = group_quality(mux_relation_min_groups)
     mux_domain_min_quality = group_quality(mux_domain_min_groups)
+    mux_domain_rank_invariant_quality = group_quality(
+        mux_domain_rank_invariant_groups
+    )
     mixed_phase_hardware_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in groups.values()
@@ -389,6 +399,10 @@ def analyze(
     mixed_phase_mux_domain_min_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in mux_domain_min_groups.values()
+    )
+    mixed_phase_mux_domain_rank_invariant_groups = sum(
+        len({row["phase_class"] for _, row in samples}) > 1
+        for samples in mux_domain_rank_invariant_groups.values()
     )
     overview: dict[str, object] = {
         "transport_key_version": "v6_mux_pair_context",
@@ -444,6 +458,30 @@ def analyze(
         ),
         "mux_domain_min_stable_event_pct": (
             f"{mux_domain_min_quality['stable_event_pct']:.3f}"
+        ),
+        "mux_domain_rank_invariant_groups": len(
+            mux_domain_rank_invariant_groups
+        ),
+        "mux_domain_rank_invariant_groups_mixing_phase_classes": (
+            mixed_phase_mux_domain_rank_invariant_groups
+        ),
+        "mux_domain_rank_invariant_stable_groups": (
+            mux_domain_rank_invariant_quality["stable_groups"]
+        ),
+        "mux_domain_rank_invariant_unstable_groups": (
+            mux_domain_rank_invariant_quality["unstable_groups"]
+        ),
+        "mux_domain_rank_invariant_insufficient_groups": (
+            mux_domain_rank_invariant_quality["insufficient_groups"]
+        ),
+        "mux_domain_rank_invariant_insufficient_samples": (
+            mux_domain_rank_invariant_quality["insufficient_samples"]
+        ),
+        "mux_domain_rank_invariant_stable_transport_key_pct": (
+            f"{mux_domain_rank_invariant_quality['stable_key_pct']:.3f}"
+        ),
+        "mux_domain_rank_invariant_stable_event_pct": (
+            f"{mux_domain_rank_invariant_quality['stable_event_pct']:.3f}"
         ),
         "stable_groups": status_counts["stable"],
         "unstable_groups": status_counts["unstable"],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate BFS transport keys with leave-one-trace-out lookup prediction."""
+"""Evaluate BFS transport keys with held-out lookup prediction."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from transport_key import (
     sdk_topology_relation,
     transport_key,
     transport_key_with_mux_domain_min,
+    transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
     transport_key_with_phase,
     transport_key_without_phase,
@@ -26,6 +27,9 @@ MODEL_KEYS = {
     "phase_v2": transport_key_with_phase,
     "mux_relation_min": transport_key_with_mux_relation_min,
     "mux_domain_min": transport_key_with_mux_domain_min,
+    "mux_domain_rank_invariant": (
+        transport_key_with_mux_domain_rank_invariant
+    ),
     "v6_full": transport_key,
 }
 SCOPES = ("ALL_TRANSFER_EVENTS", "BASE12_PHASE_MIXED")
@@ -109,8 +113,31 @@ def error_summary(
 
 def evaluate(
     paths: list[Path],
+    holdout_unit: str = "trace",
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     traces = load_traces(paths)
+    holdout_groups: dict[str, set[Path]] = defaultdict(set)
+    for path, rows in traces.items():
+        if holdout_unit == "trace":
+            group = str(path)
+        elif holdout_unit == "configuration":
+            configurations = {
+                (row["configured_dpus"], row["num_tasklets"])
+                for row in rows
+            }
+            if len(configurations) != 1:
+                raise ValueError(
+                    f"{path}: expected one configured_dpus/num_tasklets pair"
+                )
+            configured_dpus, num_tasklets = configurations.pop()
+            group = f"{configured_dpus}dpu_{num_tasklets}tl"
+        else:
+            raise ValueError(f"unsupported holdout unit: {holdout_unit}")
+        holdout_groups[group].add(path)
+    if len(holdout_groups) < 2:
+        raise ValueError(
+            f"{holdout_unit} evaluation requires at least 2 holdout groups"
+        )
     phase_values: dict[str, set[str]] = defaultdict(set)
     for rows in traces.values():
         for row in rows:
@@ -128,13 +155,13 @@ def evaluate(
         for model in MODEL_KEYS
         for scope in SCOPES
     }
-    per_trace: list[dict[str, object]] = []
+    per_holdout: list[dict[str, object]] = []
 
     for model, key_function in MODEL_KEYS.items():
-        for held_out_path in paths:
+        for held_out_group, held_out_paths in sorted(holdout_groups.items()):
             training: dict[str, list[int]] = defaultdict(list)
             for path, rows in traces.items():
-                if path == held_out_path:
+                if path in held_out_paths:
                     continue
                 for row in rows:
                     training[key_function(row)].append(int(row["measured_ns"]))
@@ -146,7 +173,8 @@ def evaluate(
             for scope in SCOPES:
                 test_rows = [
                     row
-                    for row in traces[held_out_path]
+                    for path in sorted(held_out_paths)
+                    for row in traces[path]
                     if scope == "ALL_TRANSFER_EVENTS"
                     or transport_key_without_phase(row) in mixed_base_keys
                 ]
@@ -172,7 +200,9 @@ def evaluate(
                 row_summary: dict[str, object] = {
                     "model": model,
                     "scope": scope,
-                    "held_out_trace": str(held_out_path),
+                    "holdout_unit": holdout_unit,
+                    "held_out_group": held_out_group,
+                    "held_out_trace_count": len(held_out_paths),
                     "training_key_count": len(lookup),
                     "evaluation_rows": len(test_rows),
                     "predicted_rows": len(predicted),
@@ -185,7 +215,7 @@ def evaluate(
                 }
                 if predicted:
                     row_summary.update(error_summary(actual, predicted))
-                per_trace.append(row_summary)
+                per_holdout.append(row_summary)
 
     summary: list[dict[str, object]] = []
     for model in MODEL_KEYS:
@@ -194,6 +224,8 @@ def evaluate(
             row: dict[str, object] = {
                 "model": model,
                 "scope": scope,
+                "holdout_unit": holdout_unit,
+                "holdout_groups": len(holdout_groups),
                 "trace_files": len(paths),
                 "evaluation_rows": total,
                 "predicted_rows": len(predicted),
@@ -207,7 +239,7 @@ def evaluate(
             if predicted:
                 row.update(error_summary(actual, predicted))
             summary.append(row)
-    return summary, per_trace
+    return summary, per_holdout
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -221,15 +253,32 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("traces", nargs="+", type=Path)
+    parser.add_argument(
+        "--holdout-unit",
+        choices=("trace", "configuration"),
+        default="trace",
+    )
     parser.add_argument("--summary-output", required=True, type=Path)
-    parser.add_argument("--per-trace-output", required=True, type=Path)
+    parser.add_argument(
+        "--per-holdout-output",
+        "--per-trace-output",
+        dest="per_holdout_output",
+        required=True,
+        type=Path,
+    )
     args = parser.parse_args()
 
     if len(args.traces) < 2:
-        parser.error("leave-one-trace-out evaluation requires at least 2 traces")
-    summary, per_trace = evaluate(args.traces)
+        parser.error("held-out evaluation requires at least 2 traces")
+    try:
+        summary, per_holdout = evaluate(args.traces, args.holdout_unit)
+    except ValueError as error:
+        parser.error(str(error))
     write_csv(args.summary_output, summary)
-    write_csv(args.per_trace_output, per_trace)
+    write_csv(args.per_holdout_output, per_holdout)
+    print(f"holdout_unit={args.holdout_unit}")
+    print(f"holdout_groups={summary[0]['holdout_groups']}")
+    print(f"trace_files={len(args.traces)}")
     for row in summary:
         print(
             f"model={row['model']} scope={row['scope']} "
@@ -240,7 +289,7 @@ def main() -> int:
             f"signed_bias_pct={row.get('mean_signed_pct_error', '')}"
         )
     print(f"summary_csv={args.summary_output}")
-    print(f"per_trace_csv={args.per_trace_output}")
+    print(f"per_holdout_csv={args.per_holdout_output}")
     return 0
 
 
