@@ -2,7 +2,7 @@
 
 该实验固定 measured frontier copy 的 transport key，只改变前后 SDK 调用顺序。
 
-三种条件如下：
+四种条件如下：
 
 ```text
 CONTIGUOUS_FRONTIER_GROUP
@@ -11,6 +11,10 @@ CONTIGUOUS_FRONTIER_GROUP
 VISITED_FRONTIER_PARAMS_PER_DPU
   visited[0] -> measured frontier[0] -> params[0]
   visited[1] -> measured frontier[1] -> params[1]
+
+FRONTIER_PARAMS_PER_DPU
+  measured frontier[0] -> params[0]
+  measured frontier[1] -> params[1]
 
 D2H_MERGE_FRONTIER_PARAMS_PER_DPU
   完整 D2H frontier readback + CPU OR
@@ -90,4 +94,21 @@ per_dpu_paired_effects.csv
 analysis.log
 ```
 
-`ITERATIVE_VS_INIT_ORDER_EFFECT` 直接比较迭代式调用顺序与初始化式调用顺序。
+四项 paired effect 使用相同进程、sample 和 DPU 进行配对：
+
+```text
+PARAMS_INTERLEAVING_EFFECT
+  FRONTIER_PARAMS_PER_DPU - CONTIGUOUS_FRONTIER_GROUP
+
+VISITED_PREDECESSOR_EFFECT
+  VISITED_FRONTIER_PARAMS_PER_DPU - FRONTIER_PARAMS_PER_DPU
+
+D2H_GROUP_HISTORY_EFFECT
+  D2H_MERGE_FRONTIER_PARAMS_PER_DPU - FRONTIER_PARAMS_PER_DPU
+
+ITERATIVE_VS_INIT_ORDER_EFFECT
+  D2H_MERGE_FRONTIER_PARAMS_PER_DPU - VISITED_FRONTIER_PARAMS_PER_DPU
+```
+
+前三项分别量化 params 穿插、同 DPU visited 前驱和整组 D2H 加 CPU OR 历史。
+第四项保留真实迭代式顺序与初始化式顺序的直接比较。

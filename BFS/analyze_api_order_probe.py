@@ -15,18 +15,24 @@ from analyze_group_context_probe import distribution, effect_class, quantile
 CONDITIONS = (
     "CONTIGUOUS_FRONTIER_GROUP",
     "VISITED_FRONTIER_PARAMS_PER_DPU",
+    "FRONTIER_PARAMS_PER_DPU",
     "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
 )
 COMPARISONS = (
     (
-        "INIT_LIKE_ORDER_EFFECT",
-        "VISITED_FRONTIER_PARAMS_PER_DPU",
+        "PARAMS_INTERLEAVING_EFFECT",
+        "FRONTIER_PARAMS_PER_DPU",
         "CONTIGUOUS_FRONTIER_GROUP",
     ),
     (
-        "ITERATIVE_LIKE_ORDER_EFFECT",
+        "VISITED_PREDECESSOR_EFFECT",
+        "VISITED_FRONTIER_PARAMS_PER_DPU",
+        "FRONTIER_PARAMS_PER_DPU",
+    ),
+    (
+        "D2H_GROUP_HISTORY_EFFECT",
         "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
-        "CONTIGUOUS_FRONTIER_GROUP",
+        "FRONTIER_PARAMS_PER_DPU",
     ),
     (
         "ITERATIVE_VS_INIT_ORDER_EFFECT",
@@ -245,6 +251,7 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
             expected_order_class = {
                 "CONTIGUOUS_FRONTIER_GROUP": "CONTIGUOUS_CONTROL",
                 "VISITED_FRONTIER_PARAMS_PER_DPU": "INIT_LIKE_ORDER",
+                "FRONTIER_PARAMS_PER_DPU": "PARAMS_INTERLEAVED_CONTROL",
                 "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": "ITERATIVE_LIKE_ORDER",
             }[row["condition"]]
             if row["api_order_class"] != expected_order_class:

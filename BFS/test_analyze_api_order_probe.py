@@ -114,12 +114,14 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
     condition = CONDITIONS[(sample + order) % len(CONDITIONS)]
     condition_delta = {
         "CONTIGUOUS_FRONTIER_GROUP": 0,
-        "VISITED_FRONTIER_PARAMS_PER_DPU": 20,
+        "FRONTIER_PARAMS_PER_DPU": 10,
+        "VISITED_FRONTIER_PARAMS_PER_DPU": 30,
         "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": 60,
     }[condition]
     order_class = {
         "CONTIGUOUS_FRONTIER_GROUP": "CONTIGUOUS_CONTROL",
         "VISITED_FRONTIER_PARAMS_PER_DPU": "INIT_LIKE_ORDER",
+        "FRONTIER_PARAMS_PER_DPU": "PARAMS_INTERLEAVED_CONTROL",
         "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": "ITERATIVE_LIKE_ORDER",
     }[condition]
     interleaved = int(condition != "CONTIGUOUS_FRONTIER_GROUP")
@@ -225,7 +227,7 @@ class ApiOrderProbeAnalysisTest(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=FIELDS)
             writer.writeheader()
             for sample in range(6):
-                for order in range(3):
+                for order in range(4):
                     writer.writerows(make_sequence(process, sample, order))
         return path
 
@@ -239,17 +241,21 @@ class ApiOrderProbeAnalysisTest(unittest.TestCase):
             per_dpu_pairs = summarize_pairs(rows, True, 5.0)
             group_pairs = summarize_pairs(rows, False, 5.0)
 
-        self.assertEqual(len(rows), 144)
-        self.assertEqual(len(per_dpu_summaries), 12)
-        self.assertEqual(len(group_summaries), 3)
-        self.assertEqual(len(per_dpu_pairs), 12)
+        self.assertEqual(len(rows), 192)
+        self.assertEqual(len(per_dpu_summaries), 16)
+        self.assertEqual(len(group_summaries), 4)
+        self.assertEqual(len(per_dpu_pairs), 16)
         effects = {row["effect"]: row for row in group_pairs}
         self.assertEqual(
-            effects["INIT_LIKE_ORDER_EFFECT"]["effect_class"],
+            effects["PARAMS_INTERLEAVING_EFFECT"]["effect_class"],
             "CONSISTENT_SLOWER",
         )
         self.assertEqual(
-            effects["ITERATIVE_LIKE_ORDER_EFFECT"]["effect_class"],
+            effects["VISITED_PREDECESSOR_EFFECT"]["effect_class"],
+            "CONSISTENT_SLOWER",
+        )
+        self.assertEqual(
+            effects["D2H_GROUP_HISTORY_EFFECT"]["effect_class"],
             "CONSISTENT_SLOWER",
         )
         self.assertEqual(

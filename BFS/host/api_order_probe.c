@@ -16,8 +16,9 @@
 enum ApiOrderCondition {
     CONTIGUOUS_FRONTIER_GROUP = 0,
     VISITED_FRONTIER_PARAMS_PER_DPU = 1,
-    D2H_MERGE_FRONTIER_PARAMS_PER_DPU = 2,
-    NUM_API_ORDER_CONDITIONS = 3,
+    FRONTIER_PARAMS_PER_DPU = 2,
+    D2H_MERGE_FRONTIER_PARAMS_PER_DPU = 3,
+    NUM_API_ORDER_CONDITIONS = 4,
 };
 
 struct ApiOrderConfig {
@@ -164,6 +165,8 @@ static const char* apiOrderConditionName(enum ApiOrderCondition condition) {
             return "CONTIGUOUS_FRONTIER_GROUP";
         case VISITED_FRONTIER_PARAMS_PER_DPU:
             return "VISITED_FRONTIER_PARAMS_PER_DPU";
+        case FRONTIER_PARAMS_PER_DPU:
+            return "FRONTIER_PARAMS_PER_DPU";
         case D2H_MERGE_FRONTIER_PARAMS_PER_DPU:
             return "D2H_MERGE_FRONTIER_PARAMS_PER_DPU";
         default:
@@ -177,6 +180,8 @@ static const char* apiOrderClass(enum ApiOrderCondition condition) {
             return "CONTIGUOUS_CONTROL";
         case VISITED_FRONTIER_PARAMS_PER_DPU:
             return "INIT_LIKE_ORDER";
+        case FRONTIER_PARAMS_PER_DPU:
+            return "PARAMS_INTERLEAVED_CONTROL";
         case D2H_MERGE_FRONTIER_PARAMS_PER_DPU:
             return "ITERATIVE_LIKE_ORDER";
         default:
