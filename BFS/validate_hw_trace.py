@@ -12,6 +12,7 @@ from pathlib import Path
 
 from transport_key import (
     call_context,
+    derive_hardware_contexts,
     logical_distribution_class,
     offset_feature,
     phase_class,
@@ -200,6 +201,7 @@ def validate(path: Path) -> dict[str, object]:
 
     event_ids = [int(row["event_id"]) for row in rows]
     require(event_ids == list(range(len(rows))), "event_id is not contiguous from zero")
+    hardware_contexts = derive_hardware_contexts(rows)
     for row in rows:
         start = int(row["host_start_ns"])
         end = int(row["host_end_ns"])
@@ -223,7 +225,7 @@ def validate(path: Path) -> dict[str, object]:
 
     op_call_counts = Counter()
     dpu_op_call_counts = Counter()
-    for row in rows:
+    for row, expected_context in zip(rows, hardware_contexts):
         expected_op_index = op_call_counts[row["op"]]
         require(
             int(row["op_call_index"]) == expected_op_index,
@@ -267,6 +269,12 @@ def validate(path: Path) -> dict[str, object]:
             row["phase_class"] == phase_class(row["op"], row["subop"]),
             f"event {row['event_id']} has invalid phase_class",
         )
+        for field, expected_value in expected_context.items():
+            require(
+                row[field] == expected_value,
+                f"event {row['event_id']} has invalid {field}=<"
+                f"{row[field]}>, expected <{expected_value}>",
+            )
         require(
             row["offset_feature"] == offset_feature(row),
             f"event {row['event_id']} has invalid offset_feature",
@@ -338,12 +346,27 @@ def validate(path: Path) -> dict[str, object]:
         "global_dpu_id",
         "rank_ordinal",
         "dpu_id_in_rank",
+        "sdk_slice_id",
+        "sdk_member_id",
         "same_source_across_group",
         "phase_class",
         "target_symbol",
         "offset_bytes",
         "logical_bytes",
         "transfer_bytes",
+        "host_buffer_address",
+        "host_buffer_page_offset",
+        "host_buffer_reuse_class",
+        "previous_sdk_op",
+        "previous_sdk_direction",
+        "previous_sdk_transfer_bytes",
+        "previous_sdk_topology_relation",
+        "ns_since_previous_sdk_event",
+        "previous_dpu_direction",
+        "previous_dpu_transfer_bytes",
+        "previous_dpu_target_relation",
+        "launches_since_previous_dpu_transfer",
+        "target_region_reuse_class",
         "transport_key",
     )
     require(
@@ -374,6 +397,14 @@ def validate(path: Path) -> dict[str, object]:
     require(
         all(0 <= int(row["rank_ordinal"]) < rank_count for row in copy_rows),
         "copy event rank_ordinal is outside actual_ranks",
+    )
+    require(
+        all(0 <= int(row["sdk_slice_id"]) < 8 for row in copy_rows),
+        "copy event sdk_slice_id is outside 0..7",
+    )
+    require(
+        all(0 <= int(row["sdk_member_id"]) < 8 for row in copy_rows),
+        "copy event sdk_member_id is outside 0..7",
     )
     require(
         all(row["target_space"] == "MRAM" for row in copy_rows),
@@ -433,7 +464,12 @@ def validate(path: Path) -> dict[str, object]:
     dpu_topology = {}
     for row in copy_rows:
         dpu_id = int(row["global_dpu_id"])
-        topology = (int(row["rank_ordinal"]), int(row["dpu_id_in_rank"]))
+        topology = (
+            int(row["rank_ordinal"]),
+            int(row["dpu_id_in_rank"]),
+            int(row["sdk_slice_id"]),
+            int(row["sdk_member_id"]),
+        )
         require(
             dpu_id not in dpu_topology or dpu_topology[dpu_id] == topology,
             f"global_dpu_id={dpu_id} has inconsistent topology",
@@ -443,7 +479,7 @@ def validate(path: Path) -> dict[str, object]:
         set(dpu_topology) == set(range(nr_dpus)),
         "copy events do not cover every configured DPU",
     )
-    rank_members = Counter(rank for rank, _ in dpu_topology.values())
+    rank_members = Counter(topology[0] for topology in dpu_topology.values())
     require(
         rank_members == Counter({rank: 64 for rank in range(rank_count)}),
         f"rank membership={dict(rank_members)}, expected 64 DPUs per rank",
@@ -451,12 +487,21 @@ def validate(path: Path) -> dict[str, object]:
     for rank in range(rank_count):
         dpu_ids = {
             dpu_id_in_rank
-            for rank_ordinal, dpu_id_in_rank in dpu_topology.values()
+            for rank_ordinal, dpu_id_in_rank, _, _ in dpu_topology.values()
             if rank_ordinal == rank
         }
         require(
             dpu_ids == set(range(64)),
             f"rank {rank} DPU IDs differ from 0..63",
+        )
+        sdk_pairs = {
+            (slice_id, member_id)
+            for rank_ordinal, _, slice_id, member_id in dpu_topology.values()
+            if rank_ordinal == rank
+        }
+        require(
+            len(sdk_pairs) == 64,
+            f"rank {rank} SDK slice/member pairs are not unique",
         )
 
     logical_by_subop = Counter()

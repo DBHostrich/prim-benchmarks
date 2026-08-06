@@ -87,9 +87,9 @@ int main(int argc, char** argv) {
     }
     if(bfsHostTraceEnabled(&hostTrace)) {
         bfsHostTraceRecord(&hostTrace, "dpu_alloc", "", -1, "", false, 0,
-                           0, 0, 0, allocStartNs, allocEndNs);
+                           0, 0, 0, NULL, allocStartNs, allocEndNs);
         bfsHostTraceRecord(&hostTrace, "dpu_load", "", -1, "", false, 0,
-                           0, 0, 0, loadStartNs, loadEndNs);
+                           0, 0, 0, NULL, loadStartNs, loadEndNs);
     }
 
     // Initialize BFS data structures
@@ -256,6 +256,7 @@ int main(int argc, char** argv) {
             launchEndNs = bfsHostTraceNowNs();
             bfsHostTraceRecord(&hostTrace, "dpu_launch", "bfs_level", level,
                                "", false, 0, 0, 0, 0,
+                               NULL,
                                launchStartNs, launchEndNs);
         }
         stopTimer(&timer);
@@ -441,7 +442,7 @@ int main(int argc, char** argv) {
     if(bfsHostTraceEnabled(&hostTrace)) {
         freeEndNs = bfsHostTraceNowNs();
         bfsHostTraceRecord(&hostTrace, "dpu_free", "", -1, "", false, 0,
-                           0, 0, 0, freeStartNs, freeEndNs);
+                           0, 0, 0, NULL, freeStartNs, freeEndNs);
     }
 
     if(!bfsHostTraceWrite(&hostTrace)) {

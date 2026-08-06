@@ -13,6 +13,7 @@ from pathlib import Path
 from transport_key import (
     TRANSFER_OPS,
     transport_key,
+    transport_key_with_phase,
     transport_key_without_phase,
 )
 
@@ -41,6 +42,9 @@ def analyze(
     baseline_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
+    phase_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
     transfer_rows = 0
 
     for path in paths:
@@ -60,6 +64,7 @@ def analyze(
             transfer_rows += 1
             groups[row["transport_key"]].append((path, row))
             baseline_groups[transport_key_without_phase(row)].append((path, row))
+            phase_groups[transport_key_with_phase(row)].append((path, row))
 
     summaries: list[dict[str, object]] = []
     for key, samples in sorted(groups.items()):
@@ -107,6 +112,9 @@ def analyze(
         dpu_op_index_min, dpu_op_index_max = numeric_range(
             "dpu_op_call_index"
         )
+        previous_sdk_gap_min, previous_sdk_gap_max = numeric_range(
+            "ns_since_previous_sdk_event"
+        )
         summaries.append(
             {
                 "transport_key": key,
@@ -127,10 +135,45 @@ def analyze(
                 ],
                 "rank_ordinal": representative["rank_ordinal"],
                 "dpu_id_in_rank": representative["dpu_id_in_rank"],
+                "sdk_slice_id": representative["sdk_slice_id"],
+                "sdk_member_id": representative["sdk_member_id"],
                 "same_source_across_group": representative[
                     "same_source_across_group"
                 ],
-                "phase_class": representative["phase_class"],
+                "phase_class_values": joined_values("phase_class"),
+                "previous_sdk_ops": joined_values("previous_sdk_op"),
+                "previous_sdk_directions": joined_values(
+                    "previous_sdk_direction"
+                ),
+                "previous_sdk_transfer_bytes_values": joined_values(
+                    "previous_sdk_transfer_bytes", numeric=True
+                ),
+                "previous_sdk_topology_relations": joined_values(
+                    "previous_sdk_topology_relation"
+                ),
+                "ns_since_previous_sdk_event_min": previous_sdk_gap_min,
+                "ns_since_previous_sdk_event_max": previous_sdk_gap_max,
+                "previous_dpu_direction": representative[
+                    "previous_dpu_direction"
+                ],
+                "previous_dpu_transfer_bytes": representative[
+                    "previous_dpu_transfer_bytes"
+                ],
+                "previous_dpu_target_relation": representative[
+                    "previous_dpu_target_relation"
+                ],
+                "launches_since_previous_dpu_transfer": representative[
+                    "launches_since_previous_dpu_transfer"
+                ],
+                "target_region_reuse_class": representative[
+                    "target_region_reuse_class"
+                ],
+                "host_buffer_page_offset": representative[
+                    "host_buffer_page_offset"
+                ],
+                "host_buffer_reuse_class": representative[
+                    "host_buffer_reuse_class"
+                ],
                 "configured_dpus_values": joined_values(
                     "configured_dpus", numeric=True
                 ),
@@ -246,10 +289,19 @@ def analyze(
         return key_pct, event_pct
 
     baseline_key_pct, baseline_event_pct = stable_percentages(baseline_groups)
+    phase_key_pct, phase_event_pct = stable_percentages(phase_groups)
+    mixed_phase_hardware_groups = sum(
+        len({row["phase_class"] for _, row in samples}) > 1
+        for samples in groups.values()
+    )
     overview: dict[str, object] = {
+        "transport_key_version": "v3_hardware_context",
         "trace_files": len(paths),
         "transfer_rows": transfer_rows,
         "transport_key_groups": len(summaries),
+        "phase_v2_groups": len(phase_groups),
+        "baseline_12_field_groups": len(baseline_groups),
+        "hardware_groups_mixing_phase_classes": mixed_phase_hardware_groups,
         "stable_groups": status_counts["stable"],
         "unstable_groups": status_counts["unstable"],
         "insufficient_groups": status_counts["insufficient"],
@@ -258,6 +310,8 @@ def analyze(
         "insufficient_samples": sample_status_counts["insufficient"],
         "stable_transport_key_pct": f"{stable_transport_key_pct:.3f}",
         "stable_event_pct": f"{stable_event_pct:.3f}",
+        "phase_v2_stable_transport_key_pct": f"{phase_key_pct:.3f}",
+        "phase_v2_stable_event_pct": f"{phase_event_pct:.3f}",
         "baseline_12_field_stable_transport_key_pct": f"{baseline_key_pct:.3f}",
         "baseline_12_field_stable_event_pct": f"{baseline_event_pct:.3f}",
         "min_samples": min_samples,

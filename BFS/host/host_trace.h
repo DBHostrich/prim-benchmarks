@@ -18,6 +18,7 @@ struct BfsHostTraceEvent {
     uint64_t logicalBytes;
     uint64_t transferBytes;
     uint64_t offsetBytes;
+    uintptr_t hostBufferAddress;
     uint64_t opCallIndex;
     bool hasDpuOpCallIndex;
     uint64_t dpuOpCallIndex;
@@ -40,6 +41,8 @@ struct BfsHostTrace {
     uint64_t pretraceWarmupRuns;
     uint32_t* rankOrdinals;
     uint32_t* dpuIdsInRank;
+    uint32_t* sdkSliceIds;
+    uint32_t* sdkMemberIds;
     uint64_t* dpuCopyToCallCounts;
     uint64_t* dpuCopyFromCallCounts;
     uint64_t opCallCounts[BFS_HOST_TRACE_OP_SLOTS];
@@ -70,6 +73,7 @@ void bfsHostTraceRecord(
     uint64_t logicalBytes,
     uint64_t transferBytes,
     uint64_t offsetBytes,
+    const void* hostBuffer,
     uint64_t startNs,
     uint64_t endNs
 );

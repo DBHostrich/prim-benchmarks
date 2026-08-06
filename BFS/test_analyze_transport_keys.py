@@ -32,8 +32,21 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "active_dpus_per_rank": "1",
             "rank_ordinal": "0",
             "dpu_id_in_rank": "0",
+            "sdk_slice_id": "0",
+            "sdk_member_id": "0",
             "same_source_across_group": "1",
             "phase_class": "ITERATIVE",
+            "previous_sdk_op": "dpu_copy_to",
+            "previous_sdk_direction": "TO_DPU",
+            "previous_sdk_transfer_bytes": "48",
+            "previous_sdk_topology_relation": "SAME_RANK",
+            "previous_dpu_direction": "FROM_DPU",
+            "previous_dpu_transfer_bytes": "24576",
+            "previous_dpu_target_relation": "SAME_REGION",
+            "launches_since_previous_dpu_transfer": "0",
+            "target_region_reuse_class": "REUSED_REGION",
+            "host_buffer_page_offset": "0",
+            "host_buffer_reuse_class": "SAME_DIRECTION_REUSE",
             "logical_bytes": "24576",
             "offset_feature": "off=0:a8=1:a64=1:p4k=0:pages=6",
             "process_state": "fresh_process",
@@ -117,7 +130,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.assertEqual(summaries[0]["status"], "unstable")
             self.assertEqual(summaries[0]["status_reason"], "cv>25%")
 
-    def test_phase_class_separates_init_and_iterative_events(self) -> None:
+    def test_hardware_context_separates_init_and_iterative_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             iterative = self.sample_row(1, 149_000)
@@ -125,14 +138,24 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             initial["subop"] = "frontier_init"
             initial["bfs_level"] = ""
             initial["phase_class"] = "INIT"
+            initial["previous_dpu_direction"] = "TO_DPU"
+            initial["previous_dpu_target_relation"] = "DIFFERENT_REGION"
+            initial["target_region_reuse_class"] = "FIRST_REGION_ACCESS"
+            initial["host_buffer_reuse_class"] = "FIRST_SDK_USE"
             initial["transport_key"] = transport_key(initial)
             self.write_rows(path, [initial, iterative])
             summaries, _ = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 2)
             self.assertEqual(
-                {row["phase_class"] for row in summaries},
+                {row["phase_class_values"] for row in summaries},
                 {"INIT", "ITERATIVE"},
             )
+
+    def test_phase_class_is_diagnostic_outside_v3_key(self) -> None:
+        iterative = self.sample_row(1, 100)
+        initial = dict(iterative)
+        initial["phase_class"] = "INIT"
+        self.assertEqual(transport_key(initial), transport_key(iterative))
 
     def test_reports_same_trace_phase_ab_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +167,10 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 initial["subop"] = "frontier_init"
                 initial["bfs_level"] = ""
                 initial["phase_class"] = "INIT"
+                initial["previous_dpu_direction"] = "TO_DPU"
+                initial["previous_dpu_target_relation"] = "DIFFERENT_REGION"
+                initial["target_region_reuse_class"] = "FIRST_REGION_ACCESS"
+                initial["host_buffer_reuse_class"] = "FIRST_SDK_USE"
                 initial["transport_key"] = transport_key(initial)
                 iterative = self.sample_row(repeat_id, 149_000)
                 self.write_rows(path, [initial, iterative])
@@ -152,6 +179,9 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.assertEqual(len(summaries), 2)
             self.assertEqual(overview["stable_transport_key_pct"], "100.000")
             self.assertEqual(overview["stable_event_pct"], "100.000")
+            self.assertEqual(
+                overview["phase_v2_stable_transport_key_pct"], "100.000"
+            )
             self.assertEqual(
                 overview["baseline_12_field_stable_transport_key_pct"],
                 "0.000",

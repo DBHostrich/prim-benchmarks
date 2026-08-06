@@ -17,6 +17,7 @@ DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
 EXPECTED_GRAPH_SHA256="418c002fd2f70d25d6561465ffc7b4a6f14f7e406856aaba8ddc327ac4de10e6"
+TRANSPORT_KEY_VERSION="v3_hardware_context"
 
 mkdir -p "$RESULT_ROOT"
 cd "$SCRIPT_DIR"
@@ -73,9 +74,10 @@ for nr_dpus in $DPUS_LIST; do
         make NR_DPUS="$nr_dpus" NR_TASKLETS="$tasklets" all \
             > "$result_dir/build.log" 2>&1
         sha256sum bin/host_code bin/dpu_code > "$result_dir/binaries.sha256"
-        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
+        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
             "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
-            "$N_WARMUP" "$N_REPS" "$TRANSPORT_KEY_MIN_SAMPLES" \
+            "$N_WARMUP" "$N_REPS" "$TRANSPORT_KEY_VERSION" \
+            "$TRANSPORT_KEY_MIN_SAMPLES" \
             "$TRANSPORT_KEY_MIN_TRACES" \
             "$TRANSPORT_KEY_SPREAD_THRESHOLD_PCT" \
             "$TRANSPORT_KEY_CV_THRESHOLD_PCT" "$CREATE_ARCHIVE" \

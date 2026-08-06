@@ -57,6 +57,7 @@ static void copyToDPUTraced(
     endNs = bfsHostTraceNowNs();
     bfsHostTraceRecord(trace, "dpu_copy_to", subop, bfsLevel, "TO_DPU", true,
                        globalDpuId, logicalSize, transferSize, mramIdx,
+                       hostPtr,
                        startNs, endNs);
 }
 
@@ -83,6 +84,7 @@ static void copyFromDPUTraced(
     endNs = bfsHostTraceNowNs();
     bfsHostTraceRecord(trace, "dpu_copy_from", subop, bfsLevel, "FROM_DPU", true,
                        globalDpuId, logicalSize, transferSize, mramIdx,
+                       hostPtr,
                        startNs, endNs);
 }
 

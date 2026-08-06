@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import validate_hw_trace
 from transport_key import (
     call_context,
+    derive_hardware_contexts,
     logical_distribution_class,
     offset_feature,
     phase_class,
@@ -39,6 +40,8 @@ FIELDNAMES = [
     "active_dpus_per_rank",
     "rank_ordinal",
     "dpu_id_in_rank",
+    "sdk_slice_id",
+    "sdk_member_id",
     "same_source_across_group",
     "phase_class",
     "subop",
@@ -49,6 +52,19 @@ FIELDNAMES = [
     "offset_feature",
     "logical_bytes",
     "transfer_bytes",
+    "host_buffer_address",
+    "host_buffer_page_offset",
+    "host_buffer_reuse_class",
+    "previous_sdk_op",
+    "previous_sdk_direction",
+    "previous_sdk_transfer_bytes",
+    "previous_sdk_topology_relation",
+    "ns_since_previous_sdk_event",
+    "previous_dpu_direction",
+    "previous_dpu_transfer_bytes",
+    "previous_dpu_target_relation",
+    "launches_since_previous_dpu_transfer",
+    "target_region_reuse_class",
     "op_call_index",
     "dpu_op_call_index",
     "process_state",
@@ -136,6 +152,8 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "active_dpus_per_rank": "1" if has_dpu else "",
                     "rank_ordinal": str(dpu_id // 64) if has_dpu else "",
                     "dpu_id_in_rank": str(dpu_id % 64) if has_dpu else "",
+                    "sdk_slice_id": str((dpu_id % 64) // 8) if has_dpu else "",
+                    "sdk_member_id": str(dpu_id % 8) if has_dpu else "",
                     "same_source_across_group": same_source_across_group(
                         op, subop
                     ),
@@ -146,7 +164,23 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "target_symbol": (
                         "DPU_MRAM_HEAP_POINTER_NAME" if has_dpu else ""
                     ),
-                    "offset_bytes": "0" if has_dpu else "",
+                    "offset_bytes": (
+                        str(
+                            {
+                                "params_init": 0,
+                                "params_level": 0,
+                                "node_ptrs": 1_024,
+                                "neighbor_idxs": 8_192,
+                                "node_level_init": 16_384,
+                                "node_level_result": 16_384,
+                                "visited_init": 32_768,
+                                "frontier_init": 65_536,
+                                "frontier_broadcast": 65_536,
+                                "frontier_result": 65_536,
+                            }[subop]
+                        )
+                        if has_dpu else ""
+                    ),
                     "offset_feature": "",
                     "logical_bytes": (
                         str(logical_bytes) if logical_bytes is not None else ""
@@ -154,6 +188,31 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "transfer_bytes": (
                         str(transfer_bytes) if transfer_bytes is not None else ""
                     ),
+                    "host_buffer_address": (
+                        str(
+                            {
+                                "visited_init": 0x100000,
+                                "frontier_init": 0x200000,
+                                "frontier_broadcast": 0x300000,
+                                "frontier_result": (
+                                    0x300000 if dpu_id == 0 else 0x200000
+                                ),
+                            }.get(subop, 0x400000 + event_id * 64)
+                        )
+                        if has_dpu else ""
+                    ),
+                    "host_buffer_page_offset": "",
+                    "host_buffer_reuse_class": "",
+                    "previous_sdk_op": "",
+                    "previous_sdk_direction": "",
+                    "previous_sdk_transfer_bytes": "",
+                    "previous_sdk_topology_relation": "",
+                    "ns_since_previous_sdk_event": "",
+                    "previous_dpu_direction": "",
+                    "previous_dpu_transfer_bytes": "",
+                    "previous_dpu_target_relation": "",
+                    "launches_since_previous_dpu_transfer": "",
+                    "target_region_reuse_class": "",
                     "op_call_index": str(op_call_index),
                     "dpu_op_call_index": (
                         str(dpu_op_call_index)
@@ -171,7 +230,6 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 }
             row["offset_feature"] = offset_feature(row)
             row["call_context"] = call_context(row)
-            row["transport_key"] = transport_key(row)
             rows.append(row)
             timestamp += 200
             event_id += 1
@@ -270,6 +328,10 @@ class BfsTraceValidatorTest(unittest.TestCase):
             )
         append("dpu_free")
 
+        for row, context in zip(rows, derive_hardware_contexts(rows)):
+            row.update(context)
+            row["transport_key"] = transport_key(row)
+
         with path.open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=FIELDNAMES)
             writer.writeheader()
@@ -365,7 +427,7 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 by_subop["node_level_result"]["phase_class"], "FINALIZE"
             )
 
-    def test_transport_key_has_exact_ordered_physical_fields(self) -> None:
+    def test_transport_key_has_exact_ordered_hardware_context_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             self.write_trace(path, 256)
@@ -383,16 +445,30 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["active_ranks"], "1")
             self.assertEqual(row["active_dpus_per_rank"], "1")
             self.assertEqual(row["phase_class"], "ITERATIVE")
+            self.assertEqual(row["sdk_slice_id"], "2")
+            self.assertEqual(row["sdk_member_id"], "1")
+            self.assertEqual(row["previous_dpu_direction"], "FROM_DPU")
+            self.assertEqual(row["previous_dpu_target_relation"], "SAME_REGION")
+            self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v2;op=dpu_copy_to;direction=TO_DPU;"
+                "v3;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
                 "active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
                 "rank_ordinal=0;dpu_id_in_rank=17;"
-                "same_source_across_group=1;phase_class=ITERATIVE",
+                "same_source_across_group=1;sdk_slice_id=2;sdk_member_id=1;"
+                "previous_dpu_direction=FROM_DPU;"
+                "previous_dpu_transfer_bytes=24576;"
+                "previous_dpu_target_relation=SAME_REGION;"
+                "launches_since_previous_dpu_transfer=0;"
+                "target_region_reuse_class=REUSED_REGION;"
+                "host_buffer_page_offset=0;"
+                "host_buffer_reuse_class=SAME_DIRECTION_REUSE;"
+                "host_numa_node=0",
             )
+            self.assertNotIn("phase_class=", row["transport_key"])
 
 
 if __name__ == "__main__":

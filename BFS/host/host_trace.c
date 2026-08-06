@@ -138,6 +138,174 @@ static const char* phaseClass(const struct BfsHostTraceEvent* event) {
     return "UNKNOWN";
 }
 
+struct BfsDerivedTransferContext {
+    const char* previousSdkOp;
+    const char* previousSdkDirection;
+    uint64_t previousSdkTransferBytes;
+    const char* previousSdkTopologyRelation;
+    uint64_t nsSincePreviousSdkEvent;
+    const char* previousDpuDirection;
+    uint64_t previousDpuTransferBytes;
+    const char* previousDpuTargetRelation;
+    uint64_t launchesSincePreviousDpuTransfer;
+    const char* targetRegionReuseClass;
+    uint64_t hostBufferPageOffset;
+    const char* hostBufferReuseClass;
+};
+
+struct BfsHostBufferState {
+    uintptr_t address;
+    uint64_t transferBytes;
+    const char* direction;
+};
+
+static const char* sdkTopologyRelation(
+    const struct BfsHostTrace* trace,
+    const struct BfsHostTraceEvent* previous,
+    const struct BfsHostTraceEvent* current
+) {
+    if(previous == NULL) {
+        return "NONE";
+    }
+    if(!previous->hasDpu) {
+        return "COLLECTION";
+    }
+    if(previous->globalDpuId == current->globalDpuId) {
+        return "SAME_DPU";
+    }
+    if(trace->rankOrdinals[previous->globalDpuId]
+       == trace->rankOrdinals[current->globalDpuId]) {
+        return "SAME_RANK";
+    }
+    return "OTHER_RANK";
+}
+
+static bool deriveTransferContexts(
+    const struct BfsHostTrace* trace,
+    struct BfsDerivedTransferContext* contexts
+) {
+    size_t* previousDpuEvent;
+    size_t* lastDpuEvent;
+    uint64_t* lastDpuTransferLaunchCount;
+    struct BfsHostBufferState* hostBuffers;
+    size_t hostBufferCount = 0;
+    uint64_t launchCount = 0;
+    size_t i;
+
+    previousDpuEvent = malloc(trace->numEvents * sizeof(*previousDpuEvent));
+    lastDpuEvent = malloc(trace->configuredDpus * sizeof(*lastDpuEvent));
+    lastDpuTransferLaunchCount = calloc(
+        trace->configuredDpus, sizeof(*lastDpuTransferLaunchCount)
+    );
+    hostBuffers = malloc(trace->numEvents * sizeof(*hostBuffers));
+    if(previousDpuEvent == NULL || lastDpuEvent == NULL
+       || lastDpuTransferLaunchCount == NULL || hostBuffers == NULL) {
+        free(previousDpuEvent);
+        free(lastDpuEvent);
+        free(lastDpuTransferLaunchCount);
+        free(hostBuffers);
+        return false;
+    }
+    for(i = 0; i < trace->configuredDpus; ++i) {
+        lastDpuEvent[i] = SIZE_MAX;
+    }
+
+    for(i = 0; i < trace->numEvents; ++i) {
+        const struct BfsHostTraceEvent* event = &trace->events[i];
+        struct BfsDerivedTransferContext* context = &contexts[i];
+        const struct BfsHostTraceEvent* previousSdk = i == 0
+            ? NULL : &trace->events[i - 1];
+        size_t previousIndex;
+        size_t cursor;
+        size_t hostIndex;
+        bool targetSeen = false;
+
+        previousDpuEvent[i] = SIZE_MAX;
+        if(strcmp(event->op, "dpu_launch") == 0) {
+            ++launchCount;
+        }
+        if(!isTransferEvent(event)) {
+            continue;
+        }
+
+        context->previousSdkOp = previousSdk == NULL
+            ? "NONE" : previousSdk->op;
+        context->previousSdkDirection = previousSdk == NULL
+            || previousSdk->direction[0] == '\0'
+            ? "NONE" : previousSdk->direction;
+        context->previousSdkTransferBytes = previousSdk != NULL
+            && isTransferEvent(previousSdk)
+            ? previousSdk->transferBytes : 0;
+        context->previousSdkTopologyRelation = sdkTopologyRelation(
+            trace, previousSdk, event
+        );
+        context->nsSincePreviousSdkEvent = previousSdk == NULL
+            || event->startNs < previousSdk->endNs
+            ? 0 : event->startNs - previousSdk->endNs;
+
+        previousIndex = lastDpuEvent[event->globalDpuId];
+        previousDpuEvent[i] = previousIndex;
+        if(previousIndex == SIZE_MAX) {
+            context->previousDpuDirection = "NONE";
+            context->previousDpuTransferBytes = 0;
+            context->previousDpuTargetRelation = "NONE";
+        } else {
+            const struct BfsHostTraceEvent* previousDpu =
+                &trace->events[previousIndex];
+            context->previousDpuDirection = previousDpu->direction;
+            context->previousDpuTransferBytes = previousDpu->transferBytes;
+            context->previousDpuTargetRelation =
+                previousDpu->offsetBytes == event->offsetBytes
+                && previousDpu->transferBytes == event->transferBytes
+                ? "SAME_REGION" : "DIFFERENT_REGION";
+        }
+        context->launchesSincePreviousDpuTransfer =
+            launchCount - lastDpuTransferLaunchCount[event->globalDpuId];
+
+        cursor = previousIndex;
+        while(cursor != SIZE_MAX) {
+            const struct BfsHostTraceEvent* prior = &trace->events[cursor];
+            if(prior->offsetBytes == event->offsetBytes
+               && prior->transferBytes == event->transferBytes) {
+                targetSeen = true;
+                break;
+            }
+            cursor = previousDpuEvent[cursor];
+        }
+        context->targetRegionReuseClass = targetSeen
+            ? "REUSED_REGION" : "FIRST_REGION_ACCESS";
+
+        context->hostBufferPageOffset =
+            (uint64_t)(event->hostBufferAddress % (uintptr_t)4096);
+        context->hostBufferReuseClass = "FIRST_SDK_USE";
+        for(hostIndex = 0; hostIndex < hostBufferCount; ++hostIndex) {
+            if(hostBuffers[hostIndex].address == event->hostBufferAddress
+               && hostBuffers[hostIndex].transferBytes == event->transferBytes) {
+                context->hostBufferReuseClass =
+                    strcmp(hostBuffers[hostIndex].direction, event->direction) == 0
+                    ? "SAME_DIRECTION_REUSE" : "DIRECTION_SWITCH_REUSE";
+                hostBuffers[hostIndex].direction = event->direction;
+                break;
+            }
+        }
+        if(hostIndex == hostBufferCount) {
+            hostBuffers[hostBufferCount].address = event->hostBufferAddress;
+            hostBuffers[hostBufferCount].transferBytes = event->transferBytes;
+            hostBuffers[hostBufferCount].direction = event->direction;
+            ++hostBufferCount;
+        }
+
+        lastDpuEvent[event->globalDpuId] = i;
+        lastDpuTransferLaunchCount[event->globalDpuId] = launchCount;
+    }
+
+    free(previousDpuEvent);
+    free(lastDpuEvent);
+    free(lastDpuTransferLaunchCount);
+    free(hostBuffers);
+    return true;
+}
+
 static void formatOffsetFeature(
     const struct BfsHostTraceEvent* event,
     char* output,
@@ -184,10 +352,10 @@ static void formatCallContext(
 static bool formatTransportKey(
     const struct BfsHostTrace* trace,
     const struct BfsHostTraceEvent* event,
+    const struct BfsDerivedTransferContext* context,
     const char* eventSdkApiKind,
     const char* distributionClass,
     const char* sameSource,
-    const char* eventPhaseClass,
     char* output,
     size_t outputSize
 ) {
@@ -200,15 +368,27 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v2;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v3;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
         "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
-        "phase_class=%s",
+        "sdk_slice_id=%u;sdk_member_id=%u;"
+        "previous_dpu_direction=%s;previous_dpu_transfer_bytes=%" PRIu64
+        ";previous_dpu_target_relation=%s;"
+        "launches_since_previous_dpu_transfer=%" PRIu64
+        ";target_region_reuse_class=%s;host_buffer_page_offset=%" PRIu64
+        ";host_buffer_reuse_class=%s;host_numa_node=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
         event->transferBytes, trace->rankOrdinals[event->globalDpuId],
-        trace->dpuIdsInRank[event->globalDpuId], sameSource, eventPhaseClass
+        trace->dpuIdsInRank[event->globalDpuId], sameSource,
+        trace->sdkSliceIds[event->globalDpuId],
+        trace->sdkMemberIds[event->globalDpuId],
+        context->previousDpuDirection, context->previousDpuTransferBytes,
+        context->previousDpuTargetRelation,
+        context->launchesSincePreviousDpuTransfer,
+        context->targetRegionReuseClass, context->hostBufferPageOffset,
+        context->hostBufferReuseClass, trace->hostNumaNode
     );
     return result >= 0 && (size_t)result < outputSize;
 }
@@ -279,8 +459,8 @@ bool bfsHostTraceInit(
     const char* hostNumaNode = getenv("BFS_TRACE_HOST_NUMA_NODE");
     const char* processState = getenv("BFS_TRACE_PROCESS_STATE");
     const char* pretraceWarmupRuns = getenv("BFS_TRACE_PREWARM_RUNS");
-    struct dpu_set_t rank;
-    struct dpu_set_t dpu;
+    struct dpu_set_t rank = {0};
+    struct dpu_set_t dpu = {0};
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
@@ -315,12 +495,15 @@ bool bfsHostTraceInit(
 
     trace->rankOrdinals = calloc(configuredDpus, sizeof(*trace->rankOrdinals));
     trace->dpuIdsInRank = calloc(configuredDpus, sizeof(*trace->dpuIdsInRank));
+    trace->sdkSliceIds = calloc(configuredDpus, sizeof(*trace->sdkSliceIds));
+    trace->sdkMemberIds = calloc(configuredDpus, sizeof(*trace->sdkMemberIds));
     trace->dpuCopyToCallCounts = calloc(configuredDpus,
                                         sizeof(*trace->dpuCopyToCallCounts));
     trace->dpuCopyFromCallCounts = calloc(configuredDpus,
                                           sizeof(*trace->dpuCopyFromCallCounts));
     trace->events = calloc(trace->capacity, sizeof(*trace->events));
     if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
+       || trace->sdkSliceIds == NULL || trace->sdkMemberIds == NULL
        || trace->dpuCopyToCallCounts == NULL
        || trace->dpuCopyFromCallCounts == NULL || trace->events == NULL) {
         fprintf(stderr, "Could not allocate the BFS host trace buffers\n");
@@ -337,6 +520,8 @@ bool bfsHostTraceInit(
             }
             trace->rankOrdinals[globalDpuId] = rankOrdinal;
             trace->dpuIdsInRank[globalDpuId] = dpuIdInRank;
+            trace->sdkSliceIds[globalDpuId] = dpu_get_slice_id(dpu.dpu);
+            trace->sdkMemberIds[globalDpuId] = dpu_get_member_id(dpu.dpu);
             ++globalDpuId;
         }
     }
@@ -375,6 +560,7 @@ void bfsHostTraceRecord(
     uint64_t logicalBytes,
     uint64_t transferBytes,
     uint64_t offsetBytes,
+    const void* hostBuffer,
     uint64_t startNs,
     uint64_t endNs
 ) {
@@ -406,6 +592,7 @@ void bfsHostTraceRecord(
     event->logicalBytes = logicalBytes;
     event->transferBytes = transferBytes;
     event->offsetBytes = offsetBytes;
+    event->hostBufferAddress = (uintptr_t)hostBuffer;
     event->opCallIndex = trace->opCallCounts[opSlot(op)]++;
     if(hasDpu && strcmp(op, "dpu_copy_to") == 0) {
         event->hasDpuOpCallIndex = true;
@@ -421,6 +608,7 @@ void bfsHostTraceRecord(
 
 bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
     FILE* fp;
+    struct BfsDerivedTransferContext* contexts;
     size_t i;
 
     if(!bfsHostTraceEnabled(trace)) {
@@ -433,18 +621,34 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         return false;
     }
 
+    contexts = calloc(trace->numEvents, sizeof(*contexts));
+    if(contexts == NULL || !deriveTransferContexts(trace, contexts)) {
+        fprintf(stderr, "Could not derive BFS transfer hardware contexts\n");
+        free(contexts);
+        fclose(fp);
+        return false;
+    }
+
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
           "op,direction,sdk_api_kind,logical_distribution_class,target_space,"
           "transfer_bytes_per_dpu,active_dpus,active_ranks,active_dpus_per_rank,"
-          "rank_ordinal,dpu_id_in_rank,same_source_across_group,phase_class,"
+          "rank_ordinal,dpu_id_in_rank,sdk_slice_id,sdk_member_id,"
+          "same_source_across_group,phase_class,"
           "subop,bfs_level,global_dpu_id,target_symbol,offset_bytes,offset_feature,"
-          "logical_bytes,transfer_bytes,"
+          "logical_bytes,transfer_bytes,host_buffer_address,"
+          "host_buffer_page_offset,host_buffer_reuse_class,"
+          "previous_sdk_op,previous_sdk_direction,previous_sdk_transfer_bytes,"
+          "previous_sdk_topology_relation,ns_since_previous_sdk_event,"
+          "previous_dpu_direction,previous_dpu_transfer_bytes,"
+          "previous_dpu_target_relation,launches_since_previous_dpu_transfer,"
+          "target_region_reuse_class,"
           "op_call_index,dpu_op_call_index,process_state,pretrace_warmup_runs,"
           "host_numa_node,call_context,transport_key,"
           "host_start_ns,host_end_ns,measured_ns\n", fp);
 
     for(i = 0; i < trace->numEvents; ++i) {
         const struct BfsHostTraceEvent* event = &trace->events[i];
+        const struct BfsDerivedTransferContext* context = &contexts[i];
         const char* eventSdkApiKind = sdkApiKind(event);
         const char* distributionClass = logicalDistributionClass(event);
         const char* sameSource = sameSourceAcrossGroup(event);
@@ -455,12 +659,13 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
 
         formatOffsetFeature(event, offsetFeature, sizeof(offsetFeature));
         formatCallContext(trace, event, callContext, sizeof(callContext));
-        if(!formatTransportKey(trace, event, eventSdkApiKind,
-                              distributionClass, sameSource, eventPhaseClass,
+        if(!formatTransportKey(trace, event, context, eventSdkApiKind,
+                              distributionClass, sameSource,
                               transportKey,
                               sizeof(transportKey))) {
             fprintf(stderr, "BFS transport key is too long for event %" PRIu64 "\n",
                     event->eventId);
+            free(contexts);
             fclose(fp);
             return false;
         }
@@ -478,13 +683,15 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         writeCsvString(fp, distributionClass);
         fputc(',', fp);
         if(event->hasDpu) {
-            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,",
+            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,%u,%u,",
                     event->transferBytes,
                     trace->rankOrdinals[event->globalDpuId],
-                    trace->dpuIdsInRank[event->globalDpuId]);
+                    trace->dpuIdsInRank[event->globalDpuId],
+                    trace->sdkSliceIds[event->globalDpuId],
+                    trace->sdkMemberIds[event->globalDpuId]);
             writeCsvString(fp, sameSource);
         } else {
-            fputs(",,,,,,,", fp);
+            fputs(",,,,,,,,,", fp);
         }
         fputc(',', fp);
         writeCsvString(fp, eventPhaseClass);
@@ -499,10 +706,33 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
             fprintf(fp, "%u,DPU_MRAM_HEAP_POINTER_NAME,", event->globalDpuId);
             fprintf(fp, "%" PRIu64 ",", event->offsetBytes);
             writeCsvString(fp, offsetFeature);
-            fprintf(fp, ",%" PRIu64 ",%" PRIu64,
-                    event->logicalBytes, event->transferBytes);
+            fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIuPTR
+                    ",%" PRIu64 ",",
+                    event->logicalBytes, event->transferBytes,
+                    event->hostBufferAddress, context->hostBufferPageOffset);
+            writeCsvString(fp, context->hostBufferReuseClass);
+            fputc(',', fp);
+            writeCsvString(fp, context->previousSdkOp);
+            fputc(',', fp);
+            writeCsvString(fp, context->previousSdkDirection);
+            fprintf(fp, ",%" PRIu64 ",",
+                    context->previousSdkTransferBytes);
+            writeCsvString(fp, context->previousSdkTopologyRelation);
+            fprintf(fp, ",%" PRIu64 ",",
+                    context->nsSincePreviousSdkEvent);
+            writeCsvString(fp, context->previousDpuDirection);
+            fprintf(fp, ",%" PRIu64 ",",
+                    context->previousDpuTransferBytes);
+            writeCsvString(fp, context->previousDpuTargetRelation);
+            fprintf(fp, ",%" PRIu64 ",",
+                    context->launchesSincePreviousDpuTransfer);
+            writeCsvString(fp, context->targetRegionReuseClass);
         } else {
-            fputs(",,,none,,", fp);
+            size_t emptyField;
+            fputs(",,,none", fp);
+            for(emptyField = 0; emptyField < 15; ++emptyField) {
+                fputc(',', fp);
+            }
         }
         fprintf(fp, ",%" PRIu64 ",", event->opCallIndex);
         if(event->hasDpuOpCallIndex) {
@@ -523,8 +753,10 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
     if(fclose(fp) != 0) {
         fprintf(stderr, "Could not close BFS trace %s: %s\n",
                 trace->outputPath, strerror(errno));
+        free(contexts);
         return false;
     }
+    free(contexts);
     return true;
 }
 
@@ -534,6 +766,8 @@ void bfsHostTraceDestroy(struct BfsHostTrace* trace) {
     }
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
+    free(trace->sdkSliceIds);
+    free(trace->sdkMemberIds);
     free(trace->dpuCopyToCallCounts);
     free(trace->dpuCopyFromCallCounts);
     free(trace->events);
