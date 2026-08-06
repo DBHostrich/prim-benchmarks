@@ -8,6 +8,7 @@ import csv
 import statistics
 import sys
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 from transport_key import (
@@ -24,102 +25,123 @@ from transport_key import (
 
 
 EXPECTED_LEVELS = 10
-EXPECTED = {
-    256: {
-        "actual_ranks": 4,
-        "events": 8_973,
-        "copy_to": 6_144,
-        "copy_from": 2_816,
-        "h2d_logical_bytes": 78_495_160,
-        "h2d_transfer_bytes": 78_506_896,
-        "d2h_logical_bytes": 63_700_992,
-        "d2h_transfer_bytes": 63_700_992,
-        "subop_counts": {
-            "node_ptrs": 256,
-            "neighbor_idxs": 256,
-            "node_level_init": 256,
-            "visited_init": 256,
-            "frontier_init": 256,
-            "params_init": 256,
-            "frontier_broadcast": 2_304,
-            "params_level": 2_304,
-            "frontier_result": 2_560,
-            "node_level_result": 256,
-            "bfs_level": 10,
-        },
-        "logical_bytes_by_subop": {
-            "node_ptrs": 787_456,
-            "neighbor_idxs": 7_602_616,
-            "node_level_init": 786_432,
-            "visited_init": 6_291_456,
-            "frontier_init": 6_291_456,
-            "params_init": 11_264,
-            "frontier_broadcast": 56_623_104,
-            "params_level": 101_376,
-            "frontier_result": 62_914_560,
-            "node_level_result": 786_432,
-        },
-        "transfer_bytes_by_subop": {
-            "node_ptrs": 788_480,
-            "neighbor_idxs": 7_603_088,
-            "node_level_init": 786_432,
-            "visited_init": 6_291_456,
-            "frontier_init": 6_291_456,
-            "params_init": 12_288,
-            "frontier_broadcast": 56_623_104,
-            "params_level": 110_592,
-            "frontier_result": 62_914_560,
-            "node_level_result": 786_432,
-        },
-    },
-    512: {
-        "actual_ranks": 8,
-        "events": 17_933,
-        "copy_to": 12_288,
-        "copy_from": 5_632,
-        "h2d_logical_bytes": 147_814_840,
-        "h2d_transfer_bytes": 147_838_376,
-        "d2h_logical_bytes": 126_615_552,
-        "d2h_transfer_bytes": 126_615_552,
-        "subop_counts": {
-            "node_ptrs": 512,
-            "neighbor_idxs": 512,
-            "node_level_init": 512,
-            "visited_init": 512,
-            "frontier_init": 512,
-            "params_init": 512,
-            "frontier_broadcast": 4_608,
-            "params_level": 4_608,
-            "frontier_result": 5_120,
-            "node_level_result": 512,
-            "bfs_level": 10,
-        },
-        "logical_bytes_by_subop": {
-            "node_ptrs": 788_480,
-            "neighbor_idxs": 7_602_616,
-            "node_level_init": 786_432,
-            "visited_init": 12_582_912,
-            "frontier_init": 12_582_912,
-            "params_init": 22_528,
-            "frontier_broadcast": 113_246_208,
-            "params_level": 202_752,
-            "frontier_result": 125_829_120,
-            "node_level_result": 786_432,
-        },
-        "transfer_bytes_by_subop": {
-            "node_ptrs": 790_528,
-            "neighbor_idxs": 7_603_624,
-            "node_level_init": 786_432,
-            "visited_init": 12_582_912,
-            "frontier_init": 12_582_912,
-            "params_init": 24_576,
-            "frontier_broadcast": 113_246_208,
-            "params_level": 221_184,
-            "frontier_result": 125_829_120,
-            "node_level_result": 786_432,
-        },
-    },
-}
+GRAPH_PATH = Path(__file__).parent / "data" / "loc-gowalla_edges.txt"
+
+
+def round_up_to_8(value: int) -> int:
+    return ((value + 7) // 8) * 8
+
+
+@lru_cache(maxsize=1)
+def graph_degrees() -> list[int]:
+    with GRAPH_PATH.open() as stream:
+        header_nodes, header_columns, header_edges = map(
+            int, stream.readline().split()
+        )
+        num_nodes = ((max(header_nodes, header_columns) + 63) // 64) * 64
+        degrees = [0] * num_nodes
+        observed_edges = 0
+        for line in stream:
+            node, _ = map(int, line.split())
+            degrees[node] += 1
+            observed_edges += 1
+    require(
+        observed_edges == header_edges,
+        f"graph edges={observed_edges}, header reports {header_edges}",
+    )
+    return degrees
+
+
+def expected_metrics(nr_dpus: int) -> dict[str, object]:
+    degrees = graph_degrees()
+    num_nodes = len(degrees)
+    require(nr_dpus >= 64, f"configured_dpus={nr_dpus} is below one rank")
+    require(
+        nr_dpus % 64 == 0,
+        f"configured_dpus={nr_dpus} is not a whole number of 64-DPU ranks",
+    )
+    require(
+        num_nodes % nr_dpus == 0,
+        f"configured_dpus={nr_dpus} does not divide {num_nodes} nodes",
+    )
+    nodes_per_dpu = num_nodes // nr_dpus
+    frontier_bytes = num_nodes // 64 * 8
+    node_ptrs_logical = num_nodes * 4 + nr_dpus * 4
+    neighbor_logical = sum(degrees) * 4
+    neighbor_transfer = sum(
+        round_up_to_8(
+            sum(degrees[index : index + nodes_per_dpu]) * 4
+        )
+        for index in range(0, num_nodes, nodes_per_dpu)
+    )
+    logical_by_subop = {
+        "node_ptrs": node_ptrs_logical,
+        "neighbor_idxs": neighbor_logical,
+        "node_level_init": num_nodes * 4,
+        "visited_init": nr_dpus * frontier_bytes,
+        "frontier_init": nr_dpus * frontier_bytes,
+        "params_init": nr_dpus * 44,
+        "frontier_broadcast": 9 * nr_dpus * frontier_bytes,
+        "params_level": 9 * nr_dpus * 44,
+        "frontier_result": 10 * nr_dpus * frontier_bytes,
+        "node_level_result": num_nodes * 4,
+    }
+    transfer_by_subop = dict(logical_by_subop)
+    transfer_by_subop.update(
+        {
+            "node_ptrs": nr_dpus * round_up_to_8(
+                (nodes_per_dpu + 1) * 4
+            ),
+            "neighbor_idxs": neighbor_transfer,
+            "params_init": nr_dpus * 48,
+            "params_level": 9 * nr_dpus * 48,
+        }
+    )
+    subop_counts = {
+        "node_ptrs": nr_dpus,
+        "neighbor_idxs": nr_dpus,
+        "node_level_init": nr_dpus,
+        "visited_init": nr_dpus,
+        "frontier_init": nr_dpus,
+        "params_init": nr_dpus,
+        "frontier_broadcast": 9 * nr_dpus,
+        "params_level": 9 * nr_dpus,
+        "frontier_result": 10 * nr_dpus,
+        "node_level_result": nr_dpus,
+        "bfs_level": EXPECTED_LEVELS,
+    }
+    h2d_subops = {
+        "node_ptrs",
+        "neighbor_idxs",
+        "node_level_init",
+        "visited_init",
+        "frontier_init",
+        "params_init",
+        "frontier_broadcast",
+        "params_level",
+    }
+    d2h_subops = {"frontier_result", "node_level_result"}
+    return {
+        "actual_ranks": nr_dpus // 64,
+        "events": 35 * nr_dpus + 13,
+        "copy_to": 24 * nr_dpus,
+        "copy_from": 11 * nr_dpus,
+        "h2d_logical_bytes": sum(
+            logical_by_subop[subop] for subop in h2d_subops
+        ),
+        "h2d_transfer_bytes": sum(
+            transfer_by_subop[subop] for subop in h2d_subops
+        ),
+        "d2h_logical_bytes": sum(
+            logical_by_subop[subop] for subop in d2h_subops
+        ),
+        "d2h_transfer_bytes": sum(
+            transfer_by_subop[subop] for subop in d2h_subops
+        ),
+        "subop_counts": subop_counts,
+        "logical_bytes_by_subop": logical_by_subop,
+        "transfer_bytes_by_subop": transfer_by_subop,
+    }
 
 
 def require(condition: bool, message: str) -> None:
@@ -188,8 +210,7 @@ def validate(path: Path) -> dict[str, object]:
     require(len(actual_ranks) == 1, f"multiple actual_ranks values: {actual_ranks}")
 
     nr_dpus = configured.pop()
-    require(nr_dpus in EXPECTED, f"unsupported configured_dpus={nr_dpus}")
-    expected = EXPECTED[nr_dpus]
+    expected = expected_metrics(nr_dpus)
     rank_count = actual_ranks.pop()
     require(
         rank_count == expected["actual_ranks"],

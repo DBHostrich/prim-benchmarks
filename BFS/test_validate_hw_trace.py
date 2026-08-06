@@ -354,6 +354,26 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(summary["h2d_transfer_bytes"], 78_506_896)
             self.assertEqual(summary["d2h_transfer_bytes"], 63_700_992)
 
+    def test_valid_64_dpu_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 64)
+            summary = validate_hw_trace.validate(path)
+            self.assertEqual(summary["actual_ranks"], 1)
+            self.assertEqual(summary["events"], 2_253)
+
+    def test_valid_128_dpu_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 128)
+            summary = validate_hw_trace.validate(path)
+            self.assertEqual(summary["actual_ranks"], 2)
+            self.assertEqual(summary["events"], 4_493)
+
+    def test_rejects_partial_rank_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "whole number"):
+            validate_hw_trace.expected_metrics(96)
+
     def test_valid_512_dpu_trace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
