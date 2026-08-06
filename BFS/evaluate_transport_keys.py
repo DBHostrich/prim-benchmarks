@@ -8,7 +8,6 @@ import csv
 import math
 import statistics
 from collections import defaultdict
-from collections.abc import Callable
 from pathlib import Path
 
 from transport_key import (
@@ -22,8 +21,7 @@ from transport_key import (
 )
 
 
-KeyFunction = Callable[[dict[str, str]], str]
-MODEL_KEYS: dict[str, KeyFunction] = {
+MODEL_KEYS = {
     "base12": transport_key_without_phase,
     "phase_v2": transport_key_with_phase,
     "mux_relation_min": transport_key_with_mux_relation_min,
