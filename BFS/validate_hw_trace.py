@@ -418,6 +418,22 @@ def validate(path: Path) -> dict[str, object]:
         "copy event sdk_member_id is outside 0..7",
     )
     require(
+        all(
+            row["previous_sdk_topology_relation"]
+            in {
+                "NONE",
+                "COLLECTION",
+                "SAME_DPU",
+                "SAME_MUX_PAIR",
+                "SAME_SLICE",
+                "SAME_RANK",
+                "OTHER_RANK",
+            }
+            for row in copy_rows
+        ),
+        "copy event has an invalid previous SDK topology relation",
+    )
+    require(
         all(row["target_space"] == "MRAM" for row in copy_rows),
         "copy event target_space differs from MRAM",
     )

@@ -175,11 +175,19 @@ static const char* sdkTopologyRelation(
     if(previous->globalDpuId == current->globalDpuId) {
         return "SAME_DPU";
     }
-    if(trace->rankOrdinals[previous->globalDpuId]
-       == trace->rankOrdinals[current->globalDpuId]) {
+    if(trace->sdkPhysicalRankIds[previous->globalDpuId]
+       != trace->sdkPhysicalRankIds[current->globalDpuId]) {
+        return "OTHER_RANK";
+    }
+    if(trace->sdkSliceIds[previous->globalDpuId]
+       != trace->sdkSliceIds[current->globalDpuId]) {
         return "SAME_RANK";
     }
-    return "OTHER_RANK";
+    if(trace->sdkMemberIds[previous->globalDpuId] / 2
+       == trace->sdkMemberIds[current->globalDpuId] / 2) {
+        return "SAME_MUX_PAIR";
+    }
+    return "SAME_SLICE";
 }
 
 static bool deriveTransferContexts(
@@ -370,12 +378,13 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v5;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v6;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
         "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
         "sdk_physical_rank_id=%u;sdk_slice_id=%u;sdk_member_id=%u;"
+        "previous_sdk_topology_relation=%s;"
         "previous_dpu_direction=%s;previous_dpu_target_relation=%s;"
         "target_region_reuse_class=%s;host_numa_node=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
@@ -384,6 +393,7 @@ static bool formatTransportKey(
         trace->sdkPhysicalRankIds[event->globalDpuId],
         trace->sdkSliceIds[event->globalDpuId],
         trace->sdkMemberIds[event->globalDpuId],
+        context->previousSdkTopologyRelation,
         context->previousDpuDirection, context->previousDpuTargetRelation,
         context->targetRegionReuseClass, trace->hostNumaNode
     );

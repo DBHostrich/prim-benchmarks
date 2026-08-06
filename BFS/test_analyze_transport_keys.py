@@ -11,6 +11,7 @@ from analyze_transport_keys import analyze
 from transport_key import (
     transport_key,
     transport_key_with_full_context,
+    transport_key_without_mux_pair_context,
     transport_key_without_physical_rank,
 )
 
@@ -36,6 +37,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "active_dpus_per_rank": "1",
             "rank_ordinal": "0",
             "dpu_id_in_rank": "0",
+            "global_dpu_id": "0",
             "sdk_physical_rank_id": "12288",
             "sdk_slice_id": "0",
             "sdk_member_id": "0",
@@ -45,7 +47,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "previous_sdk_op": "dpu_copy_to",
             "previous_sdk_direction": "TO_DPU",
             "previous_sdk_transfer_bytes": "48",
-            "previous_sdk_topology_relation": "SAME_RANK",
+            "previous_sdk_topology_relation": "SAME_MUX_PAIR",
             "previous_dpu_direction": "FROM_DPU",
             "previous_dpu_transfer_bytes": "24576",
             "previous_dpu_target_relation": "SAME_REGION",
@@ -61,6 +63,8 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "op_call_index": "0",
             "dpu_op_call_index": "0",
             "transport_key": "",
+            "host_start_ns": "0",
+            "host_end_ns": str(duration_ns),
             "measured_ns": str(duration_ns),
         }
         row["transport_key"] = transport_key(row)
@@ -157,13 +161,13 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 {"INIT", "ITERATIVE"},
             )
 
-    def test_phase_class_is_diagnostic_outside_v5_key(self) -> None:
+    def test_phase_class_is_diagnostic_outside_v6_key(self) -> None:
         iterative = self.sample_row(1, 100)
         initial = dict(iterative)
         initial["phase_class"] = "INIT"
         self.assertEqual(transport_key(initial), transport_key(iterative))
 
-    def test_physical_rank_identity_separates_v5_key(self) -> None:
+    def test_physical_rank_identity_separates_v6_key(self) -> None:
         first = self.sample_row(1, 100)
         second = dict(first)
         second["sdk_physical_rank_id"] = "12289"
@@ -174,7 +178,17 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             transport_key_without_physical_rank(second),
         )
 
-    def test_reanalyzes_stored_v3_trace_with_v5_key(self) -> None:
+    def test_mux_pair_relation_separates_v6_key(self) -> None:
+        same_pair = self.sample_row(1, 100)
+        other_pair = dict(same_pair)
+        other_pair["previous_sdk_topology_relation"] = "SAME_SLICE"
+        self.assertNotEqual(transport_key(same_pair), transport_key(other_pair))
+        self.assertEqual(
+            transport_key_without_mux_pair_context(same_pair),
+            transport_key_without_mux_pair_context(other_pair),
+        )
+
+    def test_reanalyzes_stored_v3_trace_with_v6_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             row = self.sample_row(1, 100)
@@ -184,9 +198,10 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.write_rows(path, [row])
             summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 1)
-            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v5;"))
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v6;"))
             self.assertEqual(summaries[0]["sdk_physical_rank_id"], "unknown")
             self.assertEqual(overview["full_context_v3_groups"], 1)
+            self.assertEqual(overview["physical_identity_v5_groups"], 1)
 
     def test_reports_same_trace_phase_ab_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

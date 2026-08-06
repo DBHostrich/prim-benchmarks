@@ -47,9 +47,15 @@ FULL_HARDWARE_CONTEXT_FIELDS = (
     "host_buffer_reuse_class",
     "host_numa_node",
 )
+V5_TRANSPORT_KEY_FIELDS = (
+    BASE_TRANSPORT_KEY_FIELDS
+    + PHYSICAL_DPU_IDENTITY_FIELDS
+    + HISTORY_MIN_FIELDS[2:]
+)
 TRANSPORT_KEY_FIELDS = (
     BASE_TRANSPORT_KEY_FIELDS
     + PHYSICAL_DPU_IDENTITY_FIELDS
+    + ("previous_sdk_topology_relation",)
     + HISTORY_MIN_FIELDS[2:]
 )
 SHARED_SOURCE_SUBOPS = {
@@ -149,8 +155,16 @@ def physical_dpu_identity(row: Mapping[str, str]) -> str:
 def transport_key(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
-    return "v5;" + ";".join(
+    return "v6;" + ";".join(
         f"{name}={row[name]}" for name in TRANSPORT_KEY_FIELDS
+    )
+
+
+def transport_key_without_mux_pair_context(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    return "v5;" + ";".join(
+        f"{name}={row[name]}" for name in V5_TRANSPORT_KEY_FIELDS
     )
 
 
@@ -182,6 +196,26 @@ def transport_key_without_phase(row: Mapping[str, str]) -> str:
     return "v1;" + ";".join(
         f"{name}={row[name]}" for name in BASE_TRANSPORT_KEY_FIELDS
     )
+
+
+def sdk_topology_relation(
+    previous: Mapping[str, str] | None,
+    current: Mapping[str, str],
+) -> str:
+    if previous is None:
+        return "NONE"
+    previous_dpu_id = previous.get("global_dpu_id", "")
+    if previous_dpu_id == "":
+        return "COLLECTION"
+    if previous_dpu_id == current["global_dpu_id"]:
+        return "SAME_DPU"
+    if previous["rank_ordinal"] != current["rank_ordinal"]:
+        return "OTHER_RANK"
+    if previous["sdk_slice_id"] != current["sdk_slice_id"]:
+        return "SAME_RANK"
+    if int(previous["sdk_member_id"]) // 2 == int(current["sdk_member_id"]) // 2:
+        return "SAME_MUX_PAIR"
+    return "SAME_SLICE"
 
 
 def derive_hardware_contexts(
@@ -217,15 +251,7 @@ def derive_hardware_contexts(
                 if previous_sdk["op"] in TRANSFER_OPS
                 else "0"
             )
-            previous_dpu_id = previous_sdk["global_dpu_id"]
-            if previous_dpu_id == "":
-                previous_sdk_relation = "COLLECTION"
-            elif previous_dpu_id == dpu_id:
-                previous_sdk_relation = "SAME_DPU"
-            elif previous_sdk["rank_ordinal"] == row["rank_ordinal"]:
-                previous_sdk_relation = "SAME_RANK"
-            else:
-                previous_sdk_relation = "OTHER_RANK"
+            previous_sdk_relation = sdk_topology_relation(previous_sdk, row)
             since_previous_sdk = str(
                 max(
                     0,

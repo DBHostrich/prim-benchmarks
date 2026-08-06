@@ -460,11 +460,14 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 row["physical_dpu_identity"], "rank:12288/slice:2/member:1"
             )
             self.assertEqual(row["previous_dpu_direction"], "FROM_DPU")
+            self.assertEqual(
+                row["previous_sdk_topology_relation"], "SAME_MUX_PAIR"
+            )
             self.assertEqual(row["previous_dpu_target_relation"], "SAME_REGION")
             self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v5;op=dpu_copy_to;direction=TO_DPU;"
+                "v6;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
@@ -472,12 +475,35 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 "rank_ordinal=0;dpu_id_in_rank=17;"
                 "same_source_across_group=1;sdk_physical_rank_id=12288;"
                 "sdk_slice_id=2;sdk_member_id=1;"
+                "previous_sdk_topology_relation=SAME_MUX_PAIR;"
                 "previous_dpu_direction=FROM_DPU;"
                 "previous_dpu_target_relation=SAME_REGION;"
                 "target_region_reuse_class=REUSED_REGION;"
                 "host_numa_node=0",
             )
             self.assertNotIn("phase_class=", row["transport_key"])
+
+    def test_sdk_topology_relation_distinguishes_mux_pair_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 256)
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+        frontier_rows = {
+            int(row["global_dpu_id"]): row
+            for row in rows
+            if row["subop"] == "frontier_broadcast" and row["bfs_level"] == "2"
+        }
+        self.assertEqual(
+            frontier_rows[16]["previous_sdk_topology_relation"], "SAME_RANK"
+        )
+        self.assertEqual(
+            frontier_rows[17]["previous_sdk_topology_relation"],
+            "SAME_MUX_PAIR",
+        )
+        self.assertEqual(
+            frontier_rows[18]["previous_sdk_topology_relation"], "SAME_SLICE"
+        )
 
 
 if __name__ == "__main__":
