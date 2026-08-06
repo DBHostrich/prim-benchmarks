@@ -9,8 +9,11 @@ from pathlib import Path
 
 from analyze_transport_keys import analyze
 from transport_key import (
+    mux_domain_class,
     transport_key,
     transport_key_with_full_context,
+    transport_key_with_mux_domain_min,
+    transport_key_with_mux_relation_min,
     transport_key_without_mux_pair_context,
     transport_key_without_physical_rank,
 )
@@ -187,6 +190,55 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             transport_key_without_mux_pair_context(same_pair),
             transport_key_without_mux_pair_context(other_pair),
         )
+
+    def test_minimal_mux_keys_capture_relation_and_domain(self) -> None:
+        same_dpu = self.sample_row(1, 100)
+        same_dpu["previous_sdk_topology_relation"] = "SAME_DPU"
+        same_pair = dict(same_dpu)
+        same_pair["previous_sdk_topology_relation"] = "SAME_MUX_PAIR"
+        other_pair = dict(same_dpu)
+        other_pair["previous_sdk_topology_relation"] = "SAME_SLICE"
+
+        self.assertNotEqual(
+            transport_key_with_mux_relation_min(same_dpu),
+            transport_key_with_mux_relation_min(same_pair),
+        )
+        self.assertEqual(
+            transport_key_with_mux_domain_min(same_dpu),
+            transport_key_with_mux_domain_min(same_pair),
+        )
+        self.assertNotEqual(
+            transport_key_with_mux_domain_min(same_pair),
+            transport_key_with_mux_domain_min(other_pair),
+        )
+        self.assertEqual(mux_domain_class("COLLECTION"), "COLLECTION")
+
+    def test_reports_minimal_mux_key_phase_mixing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for repeat_id in range(1, 6):
+                path = root / f"trace_{repeat_id:02d}.csv"
+                initial = self.sample_row(repeat_id, 100)
+                initial["phase_class"] = "INIT"
+                initial["previous_sdk_topology_relation"] = "SAME_DPU"
+                initial["transport_key"] = transport_key(initial)
+                iterative = self.sample_row(repeat_id, 102)
+                iterative["previous_sdk_topology_relation"] = "SAME_MUX_PAIR"
+                iterative["transport_key"] = transport_key(iterative)
+                self.write_rows(path, [initial, iterative])
+                paths.append(path)
+
+            _, overview = analyze(paths, 5, 5, 25.0, 25.0)
+            self.assertEqual(overview["mux_relation_min_groups"], 2)
+            self.assertEqual(overview["mux_domain_min_groups"], 1)
+            self.assertEqual(
+                overview["mux_domain_min_groups_mixing_phase_classes"], 1
+            )
+            self.assertEqual(
+                overview["mux_domain_min_stable_transport_key_pct"],
+                "100.000",
+            )
 
     def test_reanalyzes_stored_v3_trace_with_v6_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

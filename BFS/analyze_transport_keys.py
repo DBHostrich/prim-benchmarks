@@ -12,6 +12,8 @@ from pathlib import Path
 
 from transport_key import (
     TRANSFER_OPS,
+    transport_key_with_mux_domain_min,
+    transport_key_with_mux_relation_min,
     sdk_topology_relation,
     transport_key,
     transport_key_with_full_context,
@@ -56,6 +58,12 @@ def analyze(
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
     physical_identity_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
+    mux_relation_min_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
+    mux_domain_min_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
     transfer_rows = 0
@@ -104,6 +112,12 @@ def analyze(
             full_context_groups[full_context_key].append((path, row))
             history_min_groups[history_min_key].append((path, row))
             physical_identity_groups[physical_identity_key].append((path, row))
+            mux_relation_min_groups[
+                transport_key_with_mux_relation_min(row)
+            ].append((path, row))
+            mux_domain_min_groups[
+                transport_key_with_mux_domain_min(row)
+            ].append((path, row))
 
     summaries: list[dict[str, object]] = []
     for key, samples in sorted(groups.items()):
@@ -287,17 +301,17 @@ def analyze(
         else 100.0 * sample_status_counts["stable"] / eligible_samples
     )
 
-    def stable_percentages(
+    def group_quality(
         grouped_samples: dict[str, list[tuple[Path, dict[str, str]]]],
-    ) -> tuple[float, float]:
-        stable_groups = 0
-        eligible_group_count = 0
-        stable_samples = 0
-        eligible_sample_count = 0
+    ) -> dict[str, float | int]:
+        group_counts = Counter()
+        sample_counts = Counter()
         for samples in grouped_samples.values():
             durations = [int(row["measured_ns"]) for _, row in samples]
             trace_count = len({str(path) for path, _ in samples})
             if len(durations) < min_samples or trace_count < min_traces:
+                group_counts["insufficient"] += 1
+                sample_counts["insufficient"] += len(durations)
                 continue
             median = float(statistics.median(durations))
             p10 = percentile(durations, 0.10)
@@ -316,22 +330,40 @@ def analyze(
                 spread_pct <= spread_threshold_pct
                 and cv_pct <= cv_threshold_pct
             )
-            eligible_group_count += 1
-            eligible_sample_count += len(durations)
-            if stable:
-                stable_groups += 1
-                stable_samples += len(durations)
+            status = "stable" if stable else "unstable"
+            group_counts[status] += 1
+            sample_counts[status] += len(durations)
+        eligible_group_count = group_counts["stable"] + group_counts["unstable"]
+        eligible_sample_count = (
+            sample_counts["stable"] + sample_counts["unstable"]
+        )
         key_pct = (
             0.0
             if eligible_group_count == 0
-            else 100.0 * stable_groups / eligible_group_count
+            else 100.0 * group_counts["stable"] / eligible_group_count
         )
         event_pct = (
             0.0
             if eligible_sample_count == 0
-            else 100.0 * stable_samples / eligible_sample_count
+            else 100.0 * sample_counts["stable"] / eligible_sample_count
         )
-        return key_pct, event_pct
+        return {
+            "stable_groups": group_counts["stable"],
+            "unstable_groups": group_counts["unstable"],
+            "insufficient_groups": group_counts["insufficient"],
+            "insufficient_samples": sample_counts["insufficient"],
+            "stable_key_pct": key_pct,
+            "stable_event_pct": event_pct,
+        }
+
+    def stable_percentages(
+        grouped_samples: dict[str, list[tuple[Path, dict[str, str]]]],
+    ) -> tuple[float, float]:
+        quality = group_quality(grouped_samples)
+        return (
+            float(quality["stable_key_pct"]),
+            float(quality["stable_event_pct"]),
+        )
 
     baseline_key_pct, baseline_event_pct = stable_percentages(baseline_groups)
     phase_key_pct, phase_event_pct = stable_percentages(phase_groups)
@@ -344,9 +376,19 @@ def analyze(
     physical_identity_key_pct, physical_identity_event_pct = stable_percentages(
         physical_identity_groups
     )
+    mux_relation_min_quality = group_quality(mux_relation_min_groups)
+    mux_domain_min_quality = group_quality(mux_domain_min_groups)
     mixed_phase_hardware_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in groups.values()
+    )
+    mixed_phase_mux_relation_min_groups = sum(
+        len({row["phase_class"] for _, row in samples}) > 1
+        for samples in mux_relation_min_groups.values()
+    )
+    mixed_phase_mux_domain_min_groups = sum(
+        len({row["phase_class"] for _, row in samples}) > 1
+        for samples in mux_domain_min_groups.values()
     )
     overview: dict[str, object] = {
         "transport_key_version": "v6_mux_pair_context",
@@ -359,6 +401,50 @@ def analyze(
         "full_context_v3_groups": len(full_context_groups),
         "baseline_12_field_groups": len(baseline_groups),
         "hardware_groups_mixing_phase_classes": mixed_phase_hardware_groups,
+        "mux_relation_min_groups": len(mux_relation_min_groups),
+        "mux_relation_min_groups_mixing_phase_classes": (
+            mixed_phase_mux_relation_min_groups
+        ),
+        "mux_relation_min_stable_groups": mux_relation_min_quality[
+            "stable_groups"
+        ],
+        "mux_relation_min_unstable_groups": mux_relation_min_quality[
+            "unstable_groups"
+        ],
+        "mux_relation_min_insufficient_groups": mux_relation_min_quality[
+            "insufficient_groups"
+        ],
+        "mux_relation_min_insufficient_samples": mux_relation_min_quality[
+            "insufficient_samples"
+        ],
+        "mux_relation_min_stable_transport_key_pct": (
+            f"{mux_relation_min_quality['stable_key_pct']:.3f}"
+        ),
+        "mux_relation_min_stable_event_pct": (
+            f"{mux_relation_min_quality['stable_event_pct']:.3f}"
+        ),
+        "mux_domain_min_groups": len(mux_domain_min_groups),
+        "mux_domain_min_groups_mixing_phase_classes": (
+            mixed_phase_mux_domain_min_groups
+        ),
+        "mux_domain_min_stable_groups": mux_domain_min_quality[
+            "stable_groups"
+        ],
+        "mux_domain_min_unstable_groups": mux_domain_min_quality[
+            "unstable_groups"
+        ],
+        "mux_domain_min_insufficient_groups": mux_domain_min_quality[
+            "insufficient_groups"
+        ],
+        "mux_domain_min_insufficient_samples": mux_domain_min_quality[
+            "insufficient_samples"
+        ],
+        "mux_domain_min_stable_transport_key_pct": (
+            f"{mux_domain_min_quality['stable_key_pct']:.3f}"
+        ),
+        "mux_domain_min_stable_event_pct": (
+            f"{mux_domain_min_quality['stable_event_pct']:.3f}"
+        ),
         "stable_groups": status_counts["stable"],
         "unstable_groups": status_counts["unstable"],
         "insufficient_groups": status_counts["insufficient"],

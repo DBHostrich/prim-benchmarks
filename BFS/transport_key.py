@@ -22,6 +22,9 @@ BASE_TRANSPORT_KEY_FIELDS = (
     "same_source_across_group",
 )
 PHASE_TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + ("phase_class",)
+MUX_RELATION_MIN_FIELDS = BASE_TRANSPORT_KEY_FIELDS + (
+    "previous_sdk_topology_relation",
+)
 HISTORY_MIN_FIELDS = (
     "sdk_slice_id",
     "sdk_member_id",
@@ -196,6 +199,34 @@ def transport_key_without_phase(row: Mapping[str, str]) -> str:
     return "v1;" + ";".join(
         f"{name}={row[name]}" for name in BASE_TRANSPORT_KEY_FIELDS
     )
+
+
+def mux_domain_class(relation: str) -> str:
+    if relation in {"SAME_DPU", "SAME_MUX_PAIR"}:
+        return "SAME_MUX_DOMAIN"
+    if relation in {"SAME_SLICE", "SAME_RANK", "OTHER_RANK"}:
+        return "DIFFERENT_MUX_DOMAIN"
+    return relation
+
+
+def transport_key_with_mux_relation_min(row: Mapping[str, str]) -> str:
+    """Base transport shape plus the exact immediate SDK topology relation."""
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    return "mux_relation_min;" + ";".join(
+        f"{name}={row[name]}" for name in MUX_RELATION_MIN_FIELDS
+    )
+
+
+def transport_key_with_mux_domain_min(row: Mapping[str, str]) -> str:
+    """Base transport shape plus compressed immediate MUX-domain state."""
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    base = ";".join(
+        f"{name}={row[name]}" for name in BASE_TRANSPORT_KEY_FIELDS
+    )
+    domain = mux_domain_class(row["previous_sdk_topology_relation"])
+    return f"mux_domain_min;{base};previous_sdk_mux_domain_class={domain}"
 
 
 def sdk_topology_relation(
