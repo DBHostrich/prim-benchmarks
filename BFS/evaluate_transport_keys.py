@@ -14,10 +14,12 @@ from transport_key import (
     TRANSFER_OPS,
     sdk_topology_relation,
     transport_key,
+    transport_key_with_mux_domain_allocated_topology,
     transport_key_with_mux_domain_min,
     transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
     transport_key_with_phase,
+    transport_key_with_phase_allocated_topology,
     transport_key_without_phase,
 )
 
@@ -25,8 +27,14 @@ from transport_key import (
 MODEL_KEYS = {
     "base12": (transport_key_without_phase,),
     "phase_v2": (transport_key_with_phase,),
+    "phase_allocated_topology": (
+        transport_key_with_phase_allocated_topology,
+    ),
     "mux_relation_min": (transport_key_with_mux_relation_min,),
     "mux_domain_min": (transport_key_with_mux_domain_min,),
+    "mux_domain_allocated_topology": (
+        transport_key_with_mux_domain_allocated_topology,
+    ),
     "mux_domain_rank_invariant": (
         transport_key_with_mux_domain_rank_invariant,
     ),

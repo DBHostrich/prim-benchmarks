@@ -248,6 +248,43 @@ def transport_key_with_mux_domain_rank_invariant(
     )
 
 
+def allocated_topology_context(row: Mapping[str, str]) -> str:
+    return (
+        f"allocated_dpus={row['configured_dpus']};"
+        f"allocated_ranks={row['actual_ranks']}"
+    )
+
+
+def transport_key_with_phase_allocated_topology(
+    row: Mapping[str, str],
+) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    base = ";".join(
+        f"{name}={row[name]}" for name in BASE_TRANSPORT_KEY_FIELDS
+    )
+    return (
+        f"phase_allocated_topology;{base};"
+        f"{allocated_topology_context(row)};phase_class={row['phase_class']}"
+    )
+
+
+def transport_key_with_mux_domain_allocated_topology(
+    row: Mapping[str, str],
+) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    base = ";".join(
+        f"{name}={row[name]}" for name in BASE_TRANSPORT_KEY_FIELDS
+    )
+    domain = mux_domain_class(row["previous_sdk_topology_relation"])
+    return (
+        f"mux_domain_allocated_topology;{base};"
+        f"{allocated_topology_context(row)};"
+        f"previous_sdk_mux_domain_class={domain}"
+    )
+
+
 def sdk_topology_relation(
     previous: Mapping[str, str] | None,
     current: Mapping[str, str],

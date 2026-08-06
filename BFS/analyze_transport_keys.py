@@ -13,12 +13,14 @@ from pathlib import Path
 from transport_key import (
     TRANSFER_OPS,
     transport_key_with_mux_domain_min,
+    transport_key_with_mux_domain_allocated_topology,
     transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
     sdk_topology_relation,
     transport_key,
     transport_key_with_full_context,
     transport_key_with_phase,
+    transport_key_with_phase_allocated_topology,
     transport_key_without_mux_pair_context,
     transport_key_without_physical_rank,
     transport_key_without_phase,
@@ -68,6 +70,12 @@ def analyze(
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
     mux_domain_rank_invariant_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
+    phase_allocated_topology_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
+    mux_domain_allocated_topology_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
     transfer_rows = 0
@@ -124,6 +132,12 @@ def analyze(
             ].append((path, row))
             mux_domain_rank_invariant_groups[
                 transport_key_with_mux_domain_rank_invariant(row)
+            ].append((path, row))
+            phase_allocated_topology_groups[
+                transport_key_with_phase_allocated_topology(row)
+            ].append((path, row))
+            mux_domain_allocated_topology_groups[
+                transport_key_with_mux_domain_allocated_topology(row)
             ].append((path, row))
 
     summaries: list[dict[str, object]] = []
@@ -388,6 +402,12 @@ def analyze(
     mux_domain_rank_invariant_quality = group_quality(
         mux_domain_rank_invariant_groups
     )
+    phase_allocated_topology_quality = group_quality(
+        phase_allocated_topology_groups
+    )
+    mux_domain_allocated_topology_quality = group_quality(
+        mux_domain_allocated_topology_groups
+    )
     mixed_phase_hardware_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in groups.values()
@@ -403,6 +423,10 @@ def analyze(
     mixed_phase_mux_domain_rank_invariant_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in mux_domain_rank_invariant_groups.values()
+    )
+    mixed_phase_mux_domain_allocated_topology_groups = sum(
+        len({row["phase_class"] for _, row in samples}) > 1
+        for samples in mux_domain_allocated_topology_groups.values()
     )
     overview: dict[str, object] = {
         "transport_key_version": "v6_mux_pair_context",
@@ -482,6 +506,51 @@ def analyze(
         ),
         "mux_domain_rank_invariant_stable_event_pct": (
             f"{mux_domain_rank_invariant_quality['stable_event_pct']:.3f}"
+        ),
+        "phase_allocated_topology_groups": len(
+            phase_allocated_topology_groups
+        ),
+        "phase_allocated_topology_stable_groups": (
+            phase_allocated_topology_quality["stable_groups"]
+        ),
+        "phase_allocated_topology_unstable_groups": (
+            phase_allocated_topology_quality["unstable_groups"]
+        ),
+        "phase_allocated_topology_insufficient_groups": (
+            phase_allocated_topology_quality["insufficient_groups"]
+        ),
+        "phase_allocated_topology_insufficient_samples": (
+            phase_allocated_topology_quality["insufficient_samples"]
+        ),
+        "phase_allocated_topology_stable_transport_key_pct": (
+            f"{phase_allocated_topology_quality['stable_key_pct']:.3f}"
+        ),
+        "phase_allocated_topology_stable_event_pct": (
+            f"{phase_allocated_topology_quality['stable_event_pct']:.3f}"
+        ),
+        "mux_domain_allocated_topology_groups": len(
+            mux_domain_allocated_topology_groups
+        ),
+        "mux_domain_allocated_topology_groups_mixing_phase_classes": (
+            mixed_phase_mux_domain_allocated_topology_groups
+        ),
+        "mux_domain_allocated_topology_stable_groups": (
+            mux_domain_allocated_topology_quality["stable_groups"]
+        ),
+        "mux_domain_allocated_topology_unstable_groups": (
+            mux_domain_allocated_topology_quality["unstable_groups"]
+        ),
+        "mux_domain_allocated_topology_insufficient_groups": (
+            mux_domain_allocated_topology_quality["insufficient_groups"]
+        ),
+        "mux_domain_allocated_topology_insufficient_samples": (
+            mux_domain_allocated_topology_quality["insufficient_samples"]
+        ),
+        "mux_domain_allocated_topology_stable_transport_key_pct": (
+            f"{mux_domain_allocated_topology_quality['stable_key_pct']:.3f}"
+        ),
+        "mux_domain_allocated_topology_stable_event_pct": (
+            f"{mux_domain_allocated_topology_quality['stable_event_pct']:.3f}"
         ),
         "stable_groups": status_counts["stable"],
         "unstable_groups": status_counts["unstable"],

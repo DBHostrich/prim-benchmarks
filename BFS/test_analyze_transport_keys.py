@@ -13,8 +13,10 @@ from transport_key import (
     transport_key,
     transport_key_with_full_context,
     transport_key_with_mux_domain_min,
+    transport_key_with_mux_domain_allocated_topology,
     transport_key_with_mux_domain_rank_invariant,
     transport_key_with_mux_relation_min,
+    transport_key_with_phase_allocated_topology,
     transport_key_without_mux_pair_context,
     transport_key_without_physical_rank,
 )
@@ -27,6 +29,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "repeat_id": str(repeat_id),
             "event_id": "0",
             "configured_dpus": "256",
+            "actual_ranks": "4",
             "num_tasklets": "1",
             "op": "dpu_copy_to",
             "subop": "frontier_broadcast",
@@ -229,6 +232,21 @@ class TransportKeyAnalysisTest(unittest.TestCase):
         self.assertEqual(
             transport_key_with_mux_domain_rank_invariant(first_rank),
             transport_key_with_mux_domain_rank_invariant(second_rank),
+        )
+
+    def test_allocated_topology_separates_sdk_allocation_scale(self) -> None:
+        small = self.sample_row(1, 100)
+        large = dict(small)
+        large["configured_dpus"] = "512"
+        large["actual_ranks"] = "8"
+
+        self.assertNotEqual(
+            transport_key_with_phase_allocated_topology(small),
+            transport_key_with_phase_allocated_topology(large),
+        )
+        self.assertNotEqual(
+            transport_key_with_mux_domain_allocated_topology(small),
+            transport_key_with_mux_domain_allocated_topology(large),
         )
 
     def test_reports_minimal_mux_key_phase_mixing(self) -> None:
