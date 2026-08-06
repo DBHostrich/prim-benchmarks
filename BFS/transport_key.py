@@ -30,6 +30,11 @@ HISTORY_MIN_FIELDS = (
     "target_region_reuse_class",
     "host_numa_node",
 )
+PHYSICAL_DPU_IDENTITY_FIELDS = (
+    "sdk_physical_rank_id",
+    "sdk_slice_id",
+    "sdk_member_id",
+)
 FULL_HARDWARE_CONTEXT_FIELDS = (
     "sdk_slice_id",
     "sdk_member_id",
@@ -42,7 +47,11 @@ FULL_HARDWARE_CONTEXT_FIELDS = (
     "host_buffer_reuse_class",
     "host_numa_node",
 )
-TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + HISTORY_MIN_FIELDS
+TRANSPORT_KEY_FIELDS = (
+    BASE_TRANSPORT_KEY_FIELDS
+    + PHYSICAL_DPU_IDENTITY_FIELDS
+    + HISTORY_MIN_FIELDS[2:]
+)
 SHARED_SOURCE_SUBOPS = {
     "visited_init",
     "frontier_init",
@@ -128,12 +137,28 @@ def call_context(row: Mapping[str, str]) -> str:
     )
 
 
+def physical_dpu_identity(row: Mapping[str, str]) -> str:
+    if row["global_dpu_id"] == "":
+        return ""
+    return (
+        f"rank:{row['sdk_physical_rank_id']}/"
+        f"slice:{row['sdk_slice_id']}/member:{row['sdk_member_id']}"
+    )
+
+
 def transport_key(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
-    return "v4;" + ";".join(
+    return "v5;" + ";".join(
         f"{name}={row[name]}" for name in TRANSPORT_KEY_FIELDS
     )
+
+
+def transport_key_without_physical_rank(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    fields = BASE_TRANSPORT_KEY_FIELDS + HISTORY_MIN_FIELDS
+    return "v4;" + ";".join(f"{name}={row[name]}" for name in fields)
 
 
 def transport_key_with_full_context(row: Mapping[str, str]) -> str:

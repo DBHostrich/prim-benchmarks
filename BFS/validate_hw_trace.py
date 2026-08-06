@@ -16,6 +16,7 @@ from transport_key import (
     logical_distribution_class,
     offset_feature,
     phase_class,
+    physical_dpu_identity,
     same_source_across_group,
     sdk_api_kind,
     transport_key,
@@ -284,6 +285,10 @@ def validate(path: Path) -> dict[str, object]:
             f"event {row['event_id']} has invalid call_context",
         )
         require(
+            row["physical_dpu_identity"] == physical_dpu_identity(row),
+            f"event {row['event_id']} has invalid physical_dpu_identity",
+        )
+        require(
             row["transport_key"] == transport_key(row),
             f"event {row['event_id']} has invalid transport_key",
         )
@@ -346,8 +351,10 @@ def validate(path: Path) -> dict[str, object]:
         "global_dpu_id",
         "rank_ordinal",
         "dpu_id_in_rank",
+        "sdk_physical_rank_id",
         "sdk_slice_id",
         "sdk_member_id",
+        "physical_dpu_identity",
         "same_source_across_group",
         "phase_class",
         "target_symbol",
@@ -397,6 +404,10 @@ def validate(path: Path) -> dict[str, object]:
     require(
         all(0 <= int(row["rank_ordinal"]) < rank_count for row in copy_rows),
         "copy event rank_ordinal is outside actual_ranks",
+    )
+    require(
+        all(int(row["sdk_physical_rank_id"]) >= 0 for row in copy_rows),
+        "copy event has an invalid sdk_physical_rank_id",
     )
     require(
         all(0 <= int(row["sdk_slice_id"]) < 8 for row in copy_rows),
@@ -467,6 +478,7 @@ def validate(path: Path) -> dict[str, object]:
         topology = (
             int(row["rank_ordinal"]),
             int(row["dpu_id_in_rank"]),
+            int(row["sdk_physical_rank_id"]),
             int(row["sdk_slice_id"]),
             int(row["sdk_member_id"]),
         )
@@ -487,7 +499,7 @@ def validate(path: Path) -> dict[str, object]:
     for rank in range(rank_count):
         dpu_ids = {
             dpu_id_in_rank
-            for rank_ordinal, dpu_id_in_rank, _, _ in dpu_topology.values()
+            for rank_ordinal, dpu_id_in_rank, _, _, _ in dpu_topology.values()
             if rank_ordinal == rank
         }
         require(
@@ -496,13 +508,26 @@ def validate(path: Path) -> dict[str, object]:
         )
         sdk_pairs = {
             (slice_id, member_id)
-            for rank_ordinal, _, slice_id, member_id in dpu_topology.values()
+            for rank_ordinal, _, _, slice_id, member_id in dpu_topology.values()
             if rank_ordinal == rank
         }
         require(
             len(sdk_pairs) == 64,
             f"rank {rank} SDK slice/member pairs are not unique",
         )
+    physical_dpu_identities = {
+        (
+            physical_rank_id,
+            slice_id,
+            member_id,
+        )
+        for _, _, physical_rank_id, slice_id, member_id
+        in dpu_topology.values()
+    }
+    require(
+        len(physical_dpu_identities) == nr_dpus,
+        "physical rank/slice/member tuples are not unique",
+    )
 
     logical_by_subop = Counter()
     transfer_by_subop = Counter()

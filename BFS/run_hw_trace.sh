@@ -17,7 +17,7 @@ DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
 EXPECTED_GRAPH_SHA256="418c002fd2f70d25d6561465ffc7b4a6f14f7e406856aaba8ddc327ac4de10e6"
-TRANSPORT_KEY_VERSION="v4_history_min"
+TRANSPORT_KEY_VERSION="v5_physical_dpu_identity"
 
 mkdir -p "$RESULT_ROOT"
 cd "$SCRIPT_DIR"
@@ -33,6 +33,7 @@ uname -a > "$RESULT_ROOT/uname.txt"
 lscpu > "$RESULT_ROOT/lscpu.txt"
 numactl --hardware > "$RESULT_ROOT/numa.txt" 2>&1 || true
 numactl --show > "$RESULT_ROOT/numactl_show.txt" 2>&1 || true
+ls -l /dev/dpu_rank* > "$RESULT_ROOT/dpu_rank_devices.txt" 2>&1 || true
 git -C "$WORKSPACE_DIR/prim-benchmarks" rev-parse HEAD > "$RESULT_ROOT/prim_git_commit.txt"
 git -C "$WORKSPACE_DIR/prim-benchmarks" status --short > "$RESULT_ROOT/prim_git_status.txt"
 sha256sum "$GRAPH_PATH" > "$RESULT_ROOT/graph.sha256"

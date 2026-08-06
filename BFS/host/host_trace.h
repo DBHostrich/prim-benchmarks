@@ -41,6 +41,7 @@ struct BfsHostTrace {
     uint64_t pretraceWarmupRuns;
     uint32_t* rankOrdinals;
     uint32_t* dpuIdsInRank;
+    uint32_t* sdkPhysicalRankIds;
     uint32_t* sdkSliceIds;
     uint32_t* sdkMemberIds;
     uint64_t* dpuCopyToCallCounts;

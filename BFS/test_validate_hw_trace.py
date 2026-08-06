@@ -16,6 +16,7 @@ from transport_key import (
     logical_distribution_class,
     offset_feature,
     phase_class,
+    physical_dpu_identity,
     same_source_across_group,
     sdk_api_kind,
     transport_key,
@@ -40,8 +41,10 @@ FIELDNAMES = [
     "active_dpus_per_rank",
     "rank_ordinal",
     "dpu_id_in_rank",
+    "sdk_physical_rank_id",
     "sdk_slice_id",
     "sdk_member_id",
+    "physical_dpu_identity",
     "same_source_across_group",
     "phase_class",
     "subop",
@@ -152,8 +155,12 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "active_dpus_per_rank": "1" if has_dpu else "",
                     "rank_ordinal": str(dpu_id // 64) if has_dpu else "",
                     "dpu_id_in_rank": str(dpu_id % 64) if has_dpu else "",
+                    "sdk_physical_rank_id": (
+                        str(12_288 + dpu_id // 64) if has_dpu else ""
+                    ),
                     "sdk_slice_id": str((dpu_id % 64) // 8) if has_dpu else "",
                     "sdk_member_id": str(dpu_id % 8) if has_dpu else "",
+                    "physical_dpu_identity": "",
                     "same_source_across_group": same_source_across_group(
                         op, subop
                     ),
@@ -230,6 +237,7 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 }
             row["offset_feature"] = offset_feature(row)
             row["call_context"] = call_context(row)
+            row["physical_dpu_identity"] = physical_dpu_identity(row)
             rows.append(row)
             timestamp += 200
             event_id += 1
@@ -445,20 +453,25 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["active_ranks"], "1")
             self.assertEqual(row["active_dpus_per_rank"], "1")
             self.assertEqual(row["phase_class"], "ITERATIVE")
+            self.assertEqual(row["sdk_physical_rank_id"], "12288")
             self.assertEqual(row["sdk_slice_id"], "2")
             self.assertEqual(row["sdk_member_id"], "1")
+            self.assertEqual(
+                row["physical_dpu_identity"], "rank:12288/slice:2/member:1"
+            )
             self.assertEqual(row["previous_dpu_direction"], "FROM_DPU")
             self.assertEqual(row["previous_dpu_target_relation"], "SAME_REGION")
             self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v4;op=dpu_copy_to;direction=TO_DPU;"
+                "v5;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
                 "active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
                 "rank_ordinal=0;dpu_id_in_rank=17;"
-                "same_source_across_group=1;sdk_slice_id=2;sdk_member_id=1;"
+                "same_source_across_group=1;sdk_physical_rank_id=12288;"
+                "sdk_slice_id=2;sdk_member_id=1;"
                 "previous_dpu_direction=FROM_DPU;"
                 "previous_dpu_target_relation=SAME_REGION;"
                 "target_region_reuse_class=REUSED_REGION;"

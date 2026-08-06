@@ -8,7 +8,11 @@ import unittest
 from pathlib import Path
 
 from analyze_transport_keys import analyze
-from transport_key import transport_key, transport_key_with_full_context
+from transport_key import (
+    transport_key,
+    transport_key_with_full_context,
+    transport_key_without_physical_rank,
+)
 
 
 class TransportKeyAnalysisTest(unittest.TestCase):
@@ -32,8 +36,10 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "active_dpus_per_rank": "1",
             "rank_ordinal": "0",
             "dpu_id_in_rank": "0",
+            "sdk_physical_rank_id": "12288",
             "sdk_slice_id": "0",
             "sdk_member_id": "0",
+            "physical_dpu_identity": "rank:12288/slice:0/member:0",
             "same_source_across_group": "1",
             "phase_class": "ITERATIVE",
             "previous_sdk_op": "dpu_copy_to",
@@ -151,21 +157,35 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 {"INIT", "ITERATIVE"},
             )
 
-    def test_phase_class_is_diagnostic_outside_v4_key(self) -> None:
+    def test_phase_class_is_diagnostic_outside_v5_key(self) -> None:
         iterative = self.sample_row(1, 100)
         initial = dict(iterative)
         initial["phase_class"] = "INIT"
         self.assertEqual(transport_key(initial), transport_key(iterative))
 
-    def test_reanalyzes_stored_v3_trace_with_v4_key(self) -> None:
+    def test_physical_rank_identity_separates_v5_key(self) -> None:
+        first = self.sample_row(1, 100)
+        second = dict(first)
+        second["sdk_physical_rank_id"] = "12289"
+        second["physical_dpu_identity"] = "rank:12289/slice:0/member:0"
+        self.assertNotEqual(transport_key(first), transport_key(second))
+        self.assertEqual(
+            transport_key_without_physical_rank(first),
+            transport_key_without_physical_rank(second),
+        )
+
+    def test_reanalyzes_stored_v3_trace_with_v5_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             row = self.sample_row(1, 100)
             row["transport_key"] = transport_key_with_full_context(row)
+            row.pop("sdk_physical_rank_id")
+            row.pop("physical_dpu_identity")
             self.write_rows(path, [row])
             summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 1)
-            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v4;"))
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v5;"))
+            self.assertEqual(summaries[0]["sdk_physical_rank_id"], "unknown")
             self.assertEqual(overview["full_context_v3_groups"], 1)
 
     def test_reports_same_trace_phase_ab_comparison(self) -> None:

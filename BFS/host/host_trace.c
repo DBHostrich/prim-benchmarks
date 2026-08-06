@@ -2,6 +2,8 @@
 
 #include "host_trace.h"
 
+#include <dpu_management.h>
+
 #include <errno.h>
 #include <inttypes.h>
 #include <ctype.h>
@@ -368,17 +370,18 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v4;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v5;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
         "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
-        "sdk_slice_id=%u;sdk_member_id=%u;"
+        "sdk_physical_rank_id=%u;sdk_slice_id=%u;sdk_member_id=%u;"
         "previous_dpu_direction=%s;previous_dpu_target_relation=%s;"
         "target_region_reuse_class=%s;host_numa_node=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
         event->transferBytes, trace->rankOrdinals[event->globalDpuId],
         trace->dpuIdsInRank[event->globalDpuId], sameSource,
+        trace->sdkPhysicalRankIds[event->globalDpuId],
         trace->sdkSliceIds[event->globalDpuId],
         trace->sdkMemberIds[event->globalDpuId],
         context->previousDpuDirection, context->previousDpuTargetRelation,
@@ -455,6 +458,7 @@ bool bfsHostTraceInit(
     const char* pretraceWarmupRuns = getenv("BFS_TRACE_PREWARM_RUNS");
     struct dpu_set_t rank = {0};
     struct dpu_set_t dpu = {0};
+    struct dpu_rank_t* sdkRank;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
@@ -489,6 +493,9 @@ bool bfsHostTraceInit(
 
     trace->rankOrdinals = calloc(configuredDpus, sizeof(*trace->rankOrdinals));
     trace->dpuIdsInRank = calloc(configuredDpus, sizeof(*trace->dpuIdsInRank));
+    trace->sdkPhysicalRankIds = calloc(
+        configuredDpus, sizeof(*trace->sdkPhysicalRankIds)
+    );
     trace->sdkSliceIds = calloc(configuredDpus, sizeof(*trace->sdkSliceIds));
     trace->sdkMemberIds = calloc(configuredDpus, sizeof(*trace->sdkMemberIds));
     trace->dpuCopyToCallCounts = calloc(configuredDpus,
@@ -497,6 +504,7 @@ bool bfsHostTraceInit(
                                           sizeof(*trace->dpuCopyFromCallCounts));
     trace->events = calloc(trace->capacity, sizeof(*trace->events));
     if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
+       || trace->sdkPhysicalRankIds == NULL
        || trace->sdkSliceIds == NULL || trace->sdkMemberIds == NULL
        || trace->dpuCopyToCallCounts == NULL
        || trace->dpuCopyFromCallCounts == NULL || trace->events == NULL) {
@@ -506,6 +514,12 @@ bool bfsHostTraceInit(
     }
 
     DPU_RANK_FOREACH(dpuSet, rank, rankOrdinal) {
+        sdkRank = dpu_rank_from_set(rank);
+        if(sdkRank == NULL) {
+            fprintf(stderr, "Could not resolve SDK rank %u\n", rankOrdinal);
+            bfsHostTraceDestroy(trace);
+            return false;
+        }
         DPU_FOREACH(rank, dpu, dpuIdInRank) {
             if(globalDpuId >= configuredDpus) {
                 fprintf(stderr, "Allocated DPU topology exceeds configured DPU count\n");
@@ -514,6 +528,7 @@ bool bfsHostTraceInit(
             }
             trace->rankOrdinals[globalDpuId] = rankOrdinal;
             trace->dpuIdsInRank[globalDpuId] = dpuIdInRank;
+            trace->sdkPhysicalRankIds[globalDpuId] = dpu_get_rank_id(sdkRank);
             trace->sdkSliceIds[globalDpuId] = dpu_get_slice_id(dpu.dpu);
             trace->sdkMemberIds[globalDpuId] = dpu_get_member_id(dpu.dpu);
             ++globalDpuId;
@@ -626,7 +641,8 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
           "op,direction,sdk_api_kind,logical_distribution_class,target_space,"
           "transfer_bytes_per_dpu,active_dpus,active_ranks,active_dpus_per_rank,"
-          "rank_ordinal,dpu_id_in_rank,sdk_slice_id,sdk_member_id,"
+          "rank_ordinal,dpu_id_in_rank,sdk_physical_rank_id,"
+          "sdk_slice_id,sdk_member_id,physical_dpu_identity,"
           "same_source_across_group,phase_class,"
           "subop,bfs_level,global_dpu_id,target_symbol,offset_bytes,offset_feature,"
           "logical_bytes,transfer_bytes,host_buffer_address,"
@@ -649,10 +665,22 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         const char* eventPhaseClass = phaseClass(event);
         char offsetFeature[160];
         char callContext[256];
+        char physicalDpuIdentity[128];
         char transportKey[1024];
 
         formatOffsetFeature(event, offsetFeature, sizeof(offsetFeature));
         formatCallContext(trace, event, callContext, sizeof(callContext));
+        if(event->hasDpu) {
+            snprintf(
+                physicalDpuIdentity, sizeof(physicalDpuIdentity),
+                "rank:%u/slice:%u/member:%u",
+                trace->sdkPhysicalRankIds[event->globalDpuId],
+                trace->sdkSliceIds[event->globalDpuId],
+                trace->sdkMemberIds[event->globalDpuId]
+            );
+        } else {
+            physicalDpuIdentity[0] = '\0';
+        }
         if(!formatTransportKey(trace, event, context, eventSdkApiKind,
                               distributionClass, sameSource,
                               transportKey,
@@ -677,15 +705,18 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         writeCsvString(fp, distributionClass);
         fputc(',', fp);
         if(event->hasDpu) {
-            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,%u,%u,",
+            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,%u,%u,%u,",
                     event->transferBytes,
                     trace->rankOrdinals[event->globalDpuId],
                     trace->dpuIdsInRank[event->globalDpuId],
+                    trace->sdkPhysicalRankIds[event->globalDpuId],
                     trace->sdkSliceIds[event->globalDpuId],
                     trace->sdkMemberIds[event->globalDpuId]);
+            writeCsvString(fp, physicalDpuIdentity);
+            fputc(',', fp);
             writeCsvString(fp, sameSource);
         } else {
-            fputs(",,,,,,,,,", fp);
+            fputs(",,,,,,,,,,,", fp);
         }
         fputc(',', fp);
         writeCsvString(fp, eventPhaseClass);
@@ -760,6 +791,7 @@ void bfsHostTraceDestroy(struct BfsHostTrace* trace) {
     }
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
+    free(trace->sdkPhysicalRankIds);
     free(trace->sdkSliceIds);
     free(trace->sdkMemberIds);
     free(trace->dpuCopyToCallCounts);

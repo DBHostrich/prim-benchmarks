@@ -15,6 +15,7 @@ from transport_key import (
     transport_key,
     transport_key_with_full_context,
     transport_key_with_phase,
+    transport_key_without_physical_rank,
     transport_key_without_phase,
 )
 
@@ -49,6 +50,9 @@ def analyze(
     full_context_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
+    history_min_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
     transfer_rows = 0
 
     for path in paths:
@@ -59,9 +63,18 @@ def analyze(
         for row in rows:
             if row["op"] not in TRANSFER_OPS:
                 continue
+            if "sdk_physical_rank_id" not in row:
+                row["sdk_physical_rank_id"] = "unknown"
+            if "physical_dpu_identity" not in row:
+                row["physical_dpu_identity"] = "unknown"
             expected_key = transport_key(row)
+            history_min_key = transport_key_without_physical_rank(row)
             full_context_key = transport_key_with_full_context(row)
-            if row["transport_key"] not in {expected_key, full_context_key}:
+            if row["transport_key"] not in {
+                expected_key,
+                history_min_key,
+                full_context_key,
+            }:
                 raise ValueError(
                     f"{path}: event {row.get('event_id', '?')} has invalid "
                     "transport_key"
@@ -71,6 +84,7 @@ def analyze(
             baseline_groups[transport_key_without_phase(row)].append((path, row))
             phase_groups[transport_key_with_phase(row)].append((path, row))
             full_context_groups[full_context_key].append((path, row))
+            history_min_groups[history_min_key].append((path, row))
 
     summaries: list[dict[str, object]] = []
     for key, samples in sorted(groups.items()):
@@ -141,8 +155,14 @@ def analyze(
                 ],
                 "rank_ordinal": representative["rank_ordinal"],
                 "dpu_id_in_rank": representative["dpu_id_in_rank"],
+                "sdk_physical_rank_id": representative[
+                    "sdk_physical_rank_id"
+                ],
                 "sdk_slice_id": representative["sdk_slice_id"],
                 "sdk_member_id": representative["sdk_member_id"],
+                "physical_dpu_identity": representative[
+                    "physical_dpu_identity"
+                ],
                 "same_source_across_group": representative[
                     "same_source_across_group"
                 ],
@@ -299,16 +319,20 @@ def analyze(
     full_context_key_pct, full_context_event_pct = stable_percentages(
         full_context_groups
     )
+    history_min_key_pct, history_min_event_pct = stable_percentages(
+        history_min_groups
+    )
     mixed_phase_hardware_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in groups.values()
     )
     overview: dict[str, object] = {
-        "transport_key_version": "v4_history_min",
+        "transport_key_version": "v5_physical_dpu_identity",
         "trace_files": len(paths),
         "transfer_rows": transfer_rows,
         "transport_key_groups": len(summaries),
         "phase_v2_groups": len(phase_groups),
+        "history_min_v4_groups": len(history_min_groups),
         "full_context_v3_groups": len(full_context_groups),
         "baseline_12_field_groups": len(baseline_groups),
         "hardware_groups_mixing_phase_classes": mixed_phase_hardware_groups,
@@ -322,6 +346,10 @@ def analyze(
         "stable_event_pct": f"{stable_event_pct:.3f}",
         "phase_v2_stable_transport_key_pct": f"{phase_key_pct:.3f}",
         "phase_v2_stable_event_pct": f"{phase_event_pct:.3f}",
+        "history_min_v4_stable_transport_key_pct": (
+            f"{history_min_key_pct:.3f}"
+        ),
+        "history_min_v4_stable_event_pct": f"{history_min_event_pct:.3f}",
         "full_context_v3_stable_transport_key_pct": (
             f"{full_context_key_pct:.3f}"
         ),
