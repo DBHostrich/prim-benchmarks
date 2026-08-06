@@ -267,11 +267,15 @@ def summarize_conditions(
 def effect_class(
     median_pct: float, p10_delta: float, p90_delta: float, threshold_pct: float
 ) -> str:
-    if median_pct >= threshold_pct and p10_delta > 0:
-        return "CONSISTENT_SLOWER"
-    if median_pct <= -threshold_pct and p90_delta < 0:
-        return "CONSISTENT_FASTER"
-    return "MIXED_OR_SMALL"
+    if p10_delta > 0:
+        if median_pct >= threshold_pct:
+            return "CONSISTENT_SLOWER"
+        return "CONSISTENT_SMALL_SLOWER"
+    if p90_delta < 0:
+        if median_pct <= -threshold_pct:
+            return "CONSISTENT_FASTER"
+        return "CONSISTENT_SMALL_FASTER"
+    return "MIXED"
 
 
 def summarize_pairs(

@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
-"""Validate and analyze the full-DPU BFS transfer-group context probe."""
+"""Validate and analyze the controlled BFS API-order probe."""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+
+from analyze_group_context_probe import distribution, effect_class, quantile
 
 
 CONDITIONS = (
-    "H2D_GROUP_THEN_H2D_GROUP",
-    "D2H_GROUP_THEN_H2D_GROUP",
-    "LAUNCH_D2H_GROUP_THEN_H2D_GROUP",
+    "CONTIGUOUS_FRONTIER_GROUP",
+    "VISITED_FRONTIER_PARAMS_PER_DPU",
+    "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
 )
-CONDITION_INDEX = {condition: index for index, condition in enumerate(CONDITIONS)}
 COMPARISONS = (
     (
-        "D2H_GROUP_HISTORY_EFFECT",
-        "D2H_GROUP_THEN_H2D_GROUP",
-        "H2D_GROUP_THEN_H2D_GROUP",
+        "INIT_LIKE_ORDER_EFFECT",
+        "VISITED_FRONTIER_PARAMS_PER_DPU",
+        "CONTIGUOUS_FRONTIER_GROUP",
     ),
     (
-        "AFTER_LAUNCH_GROUP_EFFECT",
-        "LAUNCH_D2H_GROUP_THEN_H2D_GROUP",
-        "D2H_GROUP_THEN_H2D_GROUP",
+        "ITERATIVE_LIKE_ORDER_EFFECT",
+        "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
+        "CONTIGUOUS_FRONTIER_GROUP",
     ),
     (
-        "COMBINED_ITERATIVE_GROUP_EFFECT",
-        "LAUNCH_D2H_GROUP_THEN_H2D_GROUP",
-        "H2D_GROUP_THEN_H2D_GROUP",
+        "ITERATIVE_VS_INIT_ORDER_EFFECT",
+        "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
+        "VISITED_FRONTIER_PARAMS_PER_DPU",
     ),
 )
 REQUIRED_FIELDS = {
@@ -44,14 +43,14 @@ REQUIRED_FIELDS = {
     "sample_index",
     "order_index",
     "condition",
-    "predecessor_chain",
+    "api_order_class",
     "group_index",
     "group_size",
     "target_global_dpu_id",
     "rank_ordinal",
     "dpu_id_in_rank",
     "rank_boundary_before",
-    "same_rank_as_previous",
+    "same_rank_as_previous_sdk_event",
     "op",
     "direction",
     "sdk_api_kind",
@@ -70,83 +69,87 @@ REQUIRED_FIELDS = {
     "source_content_hash",
     "source_alignment_bytes",
     "target_precondition",
-    "group_previous_op",
-    "group_previous_direction",
+    "previous_op",
+    "previous_event_role",
+    "previous_direction",
+    "previous_transfer_bytes",
+    "previous_target_global_dpu_id",
+    "same_dpu_as_previous",
     "direction_switched",
-    "after_launch",
-    "predecessor_group_ns",
-    "launch_ns",
-    "ns_since_previous_sdk_event",
+    "params_transfer_bytes",
+    "interleaved_params",
+    "predecessor_d2h_group_ns",
     "source_pretouch_ns",
-    "group_start_ns",
-    "group_end_ns",
+    "ns_since_previous_sdk_event",
+    "sequence_start_ns",
+    "sequence_end_ns",
+    "sequence_span_ns",
     "host_start_ns",
     "host_end_ns",
     "measured_ns",
-    "measured_group_ns",
+    "frontier_sum_ns",
     "verification",
 }
 
 
-def quantile(values: list[float], q: float) -> float:
-    ordered = sorted(values)
-    if not ordered:
-        raise ValueError("quantile requires at least one value")
-    if len(ordered) == 1:
-        return ordered[0]
-    position = (len(ordered) - 1) * q
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
-def distribution(values: Iterable[float]) -> dict[str, float | int]:
-    data = list(values)
-    median = statistics.median(data)
-    mean = statistics.mean(data)
-    stdev = statistics.stdev(data) if len(data) > 1 else 0.0
-    p10 = quantile(data, 0.10)
-    p90 = quantile(data, 0.90)
-    return {
-        "n": len(data),
-        "median_ns": median,
-        "p10_ns": p10,
-        "p90_ns": p90,
-        "mean_ns": mean,
-        "cv_pct": 0.0 if mean == 0 else stdev / mean * 100.0,
-        "spread_pct": 0.0 if median == 0 else (p90 - p10) / median * 100.0,
-    }
-
-
-def effect_class(
-    median_pct: float, p10_delta: float, p90_delta: float, threshold_pct: float
-) -> str:
-    if p10_delta > 0:
-        if median_pct >= threshold_pct:
-            return "CONSISTENT_SLOWER"
-        return "CONSISTENT_SMALL_SLOWER"
-    if p90_delta < 0:
-        if median_pct <= -threshold_pct:
-            return "CONSISTENT_FASTER"
-        return "CONSISTENT_SMALL_FASTER"
-    return "MIXED"
-
-
-def _expected_predecessor(condition: str) -> tuple[str, str, str, str]:
-    if condition == "H2D_GROUP_THEN_H2D_GROUP":
-        return ("dpu_copy_to", "TO_DPU", "0", "0")
-    if condition == "D2H_GROUP_THEN_H2D_GROUP":
-        return ("dpu_copy_from", "FROM_DPU", "1", "0")
-    return ("dpu_copy_from", "FROM_DPU", "1", "1")
+def _expected_previous(
+    condition: str, index: int, group_size: int, transfer_bytes: int
+) -> tuple[str, str, str, int, int, int, int]:
+    if condition == "VISITED_FRONTIER_PARAMS_PER_DPU":
+        return (
+            "dpu_copy_to",
+            "visited_control",
+            "TO_DPU",
+            transfer_bytes,
+            index,
+            1,
+            0,
+        )
+    if index == 0:
+        if condition == "D2H_MERGE_FRONTIER_PARAMS_PER_DPU":
+            return (
+                "dpu_copy_from",
+                "frontier_readback",
+                "FROM_DPU",
+                transfer_bytes,
+                group_size - 1,
+                0,
+                1,
+            )
+        return (
+            "dpu_copy_to",
+            "frontier_precondition",
+            "TO_DPU",
+            transfer_bytes,
+            group_size - 1,
+            0,
+            0,
+        )
+    if condition == "CONTIGUOUS_FRONTIER_GROUP":
+        return (
+            "dpu_copy_to",
+            "measured_frontier",
+            "TO_DPU",
+            transfer_bytes,
+            index - 1,
+            0,
+            0,
+        )
+    return (
+        "dpu_copy_to",
+        "params_control",
+        "TO_DPU",
+        48,
+        index - 1,
+        0,
+        0,
+    )
 
 
 def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen_trace_keys: set[tuple[str, str]] = set()
-    source_hashes_by_size: dict[str, set[str]] = defaultdict(set)
+    hashes_by_size: dict[str, set[str]] = defaultdict(set)
     topology_reference: dict[str, tuple[str, str, str]] = {}
 
     for path in paths:
@@ -164,7 +167,7 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
             raise ValueError(f"{path}: duplicate run/process key {trace_key}")
         seen_trace_keys.add(trace_key)
 
-        file_fixed_fields = (
+        fixed_fields = (
             "run_id",
             "process_repeat",
             "configured_dpus",
@@ -188,20 +191,18 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
             "source_content_hash",
             "source_alignment_bytes",
             "target_precondition",
+            "params_transfer_bytes",
         )
-        fixed = {field: file_rows[0][field] for field in file_fixed_fields}
-        by_sample_condition: dict[tuple[int, str], list[dict[str, str]]] = (
-            defaultdict(list)
-        )
+        fixed = {field: file_rows[0][field] for field in fixed_fields}
+        by_group: dict[tuple[int, str], list[dict[str, str]]] = defaultdict(list)
         by_sample: dict[int, set[str]] = defaultdict(set)
 
         for row in file_rows:
             row["_trace_file"] = str(path)
             if any(row[field] != value for field, value in fixed.items()):
-                raise ValueError(f"{path}: controlled group fields changed")
-            condition = row["condition"]
-            if condition not in CONDITION_INDEX:
-                raise ValueError(f"{path}: unknown condition {condition}")
+                raise ValueError(f"{path}: controlled fields changed")
+            if row["condition"] not in CONDITIONS:
+                raise ValueError(f"{path}: unknown condition {row['condition']}")
             if row["verification"] != "ok":
                 raise ValueError(f"{path}: readback verification failed")
             if (
@@ -221,11 +222,11 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 "1",
                 "1",
             ):
-                raise ValueError(f"{path}: single-copy active topology changed")
+                raise ValueError(f"{path}: active topology changed")
             if row["same_source_across_group"] != "1":
-                raise ValueError(f"{path}: group source reuse invariant is false")
+                raise ValueError(f"{path}: group source reuse invariant changed")
             if row["same_source_across_conditions"] != "1":
-                raise ValueError(f"{path}: condition source reuse invariant is false")
+                raise ValueError(f"{path}: condition source reuse invariant changed")
             alignment = int(row["source_alignment_bytes"])
             if alignment != 4096 or int(row["source_pointer"], 0) % alignment != 0:
                 raise ValueError(f"{path}: fixed source pointer is misaligned")
@@ -233,36 +234,35 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 raise ValueError(f"{path}: fixed source hash is zero")
             if row["target_precondition"] != "ZERO_WRITTEN":
                 raise ValueError(f"{path}: target precondition changed")
+            if int(row["params_transfer_bytes"]) != 48:
+                raise ValueError(f"{path}: params physical transfer is not 48 B")
 
             sample = int(row["sample_index"])
             order = int(row["order_index"])
             expected_condition = CONDITIONS[(sample + order) % len(CONDITIONS)]
-            if condition != expected_condition:
+            if row["condition"] != expected_condition:
                 raise ValueError(f"{path}: Latin-order invariant failed")
-            actual_predecessor = (
-                row["group_previous_op"],
-                row["group_previous_direction"],
-                row["direction_switched"],
-                row["after_launch"],
-            )
-            if actual_predecessor != _expected_predecessor(condition):
-                raise ValueError(f"{path}: predecessor semantics changed")
-            if condition.startswith("LAUNCH_"):
-                if int(row["launch_ns"]) <= 0:
-                    raise ValueError(f"{path}: launch condition has zero launch_ns")
-            elif int(row["launch_ns"]) != 0:
-                raise ValueError(f"{path}: non-launch condition has launch_ns")
-
+            expected_order_class = {
+                "CONTIGUOUS_FRONTIER_GROUP": "CONTIGUOUS_CONTROL",
+                "VISITED_FRONTIER_PARAMS_PER_DPU": "INIT_LIKE_ORDER",
+                "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": "ITERATIVE_LIKE_ORDER",
+            }[row["condition"]]
+            if row["api_order_class"] != expected_order_class:
+                raise ValueError(f"{path}: API-order class changed")
+            if row["phase_class"] != "CONTROLLED_API_ORDER_PROBE":
+                raise ValueError(f"{path}: probe phase provenance changed")
+            if int(row["source_pretouch_ns"]) <= 0:
+                raise ValueError(f"{path}: source pretouch was not recorded")
             start_ns = int(row["host_start_ns"])
             end_ns = int(row["host_end_ns"])
             if end_ns - start_ns != int(row["measured_ns"]):
                 raise ValueError(f"{path}: call time conservation failed")
-            group_start = int(row["group_start_ns"])
-            group_end = int(row["group_end_ns"])
-            if group_end - group_start != int(row["measured_group_ns"]):
-                raise ValueError(f"{path}: group time conservation failed")
-            if start_ns < group_start or end_ns > group_end:
-                raise ValueError(f"{path}: call lies outside measured group")
+            sequence_start = int(row["sequence_start_ns"])
+            sequence_end = int(row["sequence_end_ns"])
+            if sequence_end - sequence_start != int(row["sequence_span_ns"]):
+                raise ValueError(f"{path}: sequence time conservation failed")
+            if start_ns < sequence_start or end_ns > sequence_end:
+                raise ValueError(f"{path}: call lies outside sequence")
 
             global_id = row["target_global_dpu_id"]
             topology = (
@@ -270,69 +270,113 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 row["dpu_id_in_rank"],
                 row["offset_bytes"],
             )
-            prior_topology = topology_reference.setdefault(global_id, topology)
-            if topology != prior_topology:
-                raise ValueError(f"{path}: DPU topology or target offset changed")
+            previous_topology = topology_reference.setdefault(global_id, topology)
+            if topology != previous_topology:
+                raise ValueError(f"{path}: topology or frontier offset changed")
 
-            by_sample_condition[(sample, condition)].append(row)
-            by_sample[sample].add(condition)
-            source_hashes_by_size[row["transfer_bytes_per_dpu"]].add(
+            by_group[(sample, row["condition"])].append(row)
+            by_sample[sample].add(row["condition"])
+            hashes_by_size[row["transfer_bytes_per_dpu"]].add(
                 row["source_content_hash"]
             )
             rows.append(row)
 
-        expected_samples = list(range(len(by_sample)))
-        if sorted(by_sample) != expected_samples:
-            raise ValueError(f"{path}: sample indexes are not contiguous from zero")
-        for sample, observed in by_sample.items():
-            if observed != set(CONDITIONS):
-                raise ValueError(f"{path}: sample {sample} has conditions {observed}")
+        if sorted(by_sample) != list(range(len(by_sample))):
+            raise ValueError(f"{path}: sample indexes are not contiguous")
+        for sample, conditions in by_sample.items():
+            if conditions != set(CONDITIONS):
+                raise ValueError(f"{path}: sample {sample} condition set changed")
 
-        configured_dpus = int(fixed["configured_dpus"])
-        for (sample, condition), group_rows in by_sample_condition.items():
+        group_size = int(fixed["group_size"])
+        transfer_bytes = int(fixed["transfer_bytes_per_dpu"])
+        for (sample, condition), group_rows in by_group.items():
             ordered = sorted(group_rows, key=lambda row: int(row["group_index"]))
-            indexes = [int(row["group_index"]) for row in ordered]
-            global_ids = [int(row["target_global_dpu_id"]) for row in ordered]
-            if indexes != list(range(configured_dpus)):
-                raise ValueError(
-                    f"{path}: sample {sample} {condition} group indexes changed"
-                )
-            if global_ids != list(range(configured_dpus)):
-                raise ValueError(
-                    f"{path}: sample {sample} {condition} DPU order changed"
-                )
+            if [int(row["group_index"]) for row in ordered] != list(
+                range(group_size)
+            ):
+                raise ValueError(f"{path}: group indexes changed")
+            if [int(row["target_global_dpu_id"]) for row in ordered] != list(
+                range(group_size)
+            ):
+                raise ValueError(f"{path}: measured DPU order changed")
             common_fields = (
-                "group_start_ns",
-                "group_end_ns",
-                "measured_group_ns",
-                "predecessor_group_ns",
-                "launch_ns",
+                "sequence_start_ns",
+                "sequence_end_ns",
+                "sequence_span_ns",
+                "frontier_sum_ns",
+                "predecessor_d2h_group_ns",
                 "source_pretouch_ns",
             )
             for field in common_fields:
                 if len({row[field] for row in ordered}) != 1:
-                    raise ValueError(f"{path}: {field} changed within group")
+                    raise ValueError(f"{path}: {field} changed within sequence")
+            if sum(int(row["measured_ns"]) for row in ordered) != int(
+                ordered[0]["frontier_sum_ns"]
+            ):
+                raise ValueError(f"{path}: frontier sum conservation failed")
+
+            expected_interleaved = condition != "CONTIGUOUS_FRONTIER_GROUP"
+            expected_d2h = condition == "D2H_MERGE_FRONTIER_PARAMS_PER_DPU"
             for index, row in enumerate(ordered):
+                expected_previous = _expected_previous(
+                    condition, index, group_size, transfer_bytes
+                )
+                actual_previous = (
+                    row["previous_op"],
+                    row["previous_event_role"],
+                    row["previous_direction"],
+                    int(row["previous_transfer_bytes"]),
+                    int(row["previous_target_global_dpu_id"]),
+                    int(row["same_dpu_as_previous"]),
+                    int(row["direction_switched"]),
+                )
+                if actual_previous != expected_previous:
+                    raise ValueError(
+                        f"{path}: previous-event semantics changed for "
+                        f"{condition} DPU {index}"
+                    )
+                if int(row["interleaved_params"]) != int(expected_interleaved):
+                    raise ValueError(f"{path}: interleaved params label changed")
+                if expected_d2h != (int(row["predecessor_d2h_group_ns"]) > 0):
+                    raise ValueError(f"{path}: D2H predecessor label changed")
+                previous_target = int(row["previous_target_global_dpu_id"])
+                expected_same_rank = (
+                    ordered[previous_target]["rank_ordinal"] == row["rank_ordinal"]
+                )
+                if int(row["same_rank_as_previous_sdk_event"]) != int(
+                    expected_same_rank
+                ):
+                    raise ValueError(f"{path}: previous-rank label changed")
                 expected_boundary = index == 0 or (
                     ordered[index - 1]["rank_ordinal"] != row["rank_ordinal"]
                 )
                 if int(row["rank_boundary_before"]) != int(expected_boundary):
                     raise ValueError(f"{path}: rank boundary label changed")
-                if int(row["same_rank_as_previous"]) != int(
-                    index > 0 and not expected_boundary
-                ):
-                    raise ValueError(f"{path}: previous-rank label changed")
-                if index > 0 and int(row["host_start_ns"]) < int(
-                    ordered[index - 1]["host_end_ns"]
-                ):
-                    raise ValueError(f"{path}: measured calls overlap or reorder")
+                if int(row["ns_since_previous_sdk_event"]) < 0:
+                    raise ValueError(f"{path}: negative SDK-event gap")
 
-    for transfer_bytes, hashes in source_hashes_by_size.items():
+    for transfer_bytes, hashes in hashes_by_size.items():
         if len(hashes) != 1:
             raise ValueError(
-                f"transfer size {transfer_bytes}: controlled source hashes changed"
+                f"transfer size {transfer_bytes}: source hashes changed"
             )
     return rows
+
+
+def group_measurements(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    output: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        key = (
+            row["_trace_file"],
+            row["process_repeat"],
+            row["sample_index"],
+            row["condition"],
+        )
+        if key not in seen:
+            seen.add(key)
+            output.append(row)
+    return output
 
 
 def _stability(
@@ -356,127 +400,87 @@ def _stability(
     return stats, label
 
 
-def summarize_per_dpu_conditions(
+def summarize_conditions(
     rows: list[dict[str, str]],
-    min_samples: int = 20,
-    min_traces: int = 5,
-    spread_threshold_pct: float = 25.0,
-    cv_threshold_pct: float = 25.0,
-) -> list[dict[str, object]]:
-    grouped: dict[tuple[str, ...], list[tuple[int, str]]] = defaultdict(list)
-    for row in rows:
-        key = (
-            row["configured_dpus"],
-            row["num_tasklets"],
-            row["target_global_dpu_id"],
-            row["rank_ordinal"],
-            row["dpu_id_in_rank"],
-            row["group_index"],
-            row["transfer_bytes_per_dpu"],
-            row["offset_bytes"],
-            row["condition"],
-        )
-        grouped[key].append((int(row["measured_ns"]), row["_trace_file"]))
-
-    output: list[dict[str, object]] = []
-    for key, samples in sorted(grouped.items()):
-        trace_files = len({sample[1] for sample in samples})
-        stats, label = _stability(
-            [sample[0] for sample in samples],
-            trace_files,
-            min_samples,
-            min_traces,
-            spread_threshold_pct,
-            cv_threshold_pct,
-        )
-        output.append(
-            {
-                "configured_dpus": key[0],
-                "num_tasklets": key[1],
-                "target_global_dpu_id": key[2],
-                "rank_ordinal": key[3],
-                "dpu_id_in_rank": key[4],
-                "group_index": key[5],
-                "transfer_bytes_per_dpu": key[6],
-                "offset_bytes": key[7],
-                "condition": key[8],
-                "trace_files": trace_files,
-                **stats,
-                "stability": label,
-            }
-        )
-    return output
-
-
-def group_measurements(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    measurements: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for row in rows:
-        key = (
-            row["_trace_file"],
-            row["process_repeat"],
-            row["sample_index"],
-            row["condition"],
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        measurements.append(row)
-    return measurements
-
-
-def summarize_group_conditions(
-    rows: list[dict[str, str]],
-    min_samples: int = 20,
-    min_traces: int = 5,
-    spread_threshold_pct: float = 25.0,
-    cv_threshold_pct: float = 25.0,
-) -> list[dict[str, object]]:
-    grouped: dict[tuple[str, ...], list[tuple[int, str]]] = defaultdict(list)
-    for row in group_measurements(rows):
-        key = (
-            row["configured_dpus"],
-            row["num_tasklets"],
-            row["actual_ranks"],
-            row["group_size"],
-            row["transfer_bytes_per_dpu"],
-            row["condition"],
-        )
-        grouped[key].append((int(row["measured_group_ns"]), row["_trace_file"]))
-
-    output: list[dict[str, object]] = []
-    for key, samples in sorted(grouped.items()):
-        trace_files = len({sample[1] for sample in samples})
-        stats, label = _stability(
-            [sample[0] for sample in samples],
-            trace_files,
-            min_samples,
-            min_traces,
-            spread_threshold_pct,
-            cv_threshold_pct,
-        )
-        output.append(
-            {
-                "configured_dpus": key[0],
-                "num_tasklets": key[1],
-                "actual_ranks": key[2],
-                "group_size": key[3],
-                "transfer_bytes_per_dpu": key[4],
-                "condition": key[5],
-                "trace_files": trace_files,
-                **stats,
-                "stability": label,
-            }
-        )
-    return output
-
-
-def _summarize_pairs(
-    measurements: list[dict[str, str]],
-    value_field: str,
     per_dpu: bool,
-    effect_threshold_pct: float,
+    min_samples: int = 20,
+    min_traces: int = 5,
+    spread_threshold_pct: float = 25.0,
+    cv_threshold_pct: float = 25.0,
 ) -> list[dict[str, object]]:
+    measurements = rows if per_dpu else group_measurements(rows)
+    value_field = "measured_ns" if per_dpu else "frontier_sum_ns"
+    grouped: dict[tuple[str, ...], list[tuple[int, str]]] = defaultdict(list)
+    for row in measurements:
+        key_parts = [row["configured_dpus"], row["num_tasklets"]]
+        if per_dpu:
+            key_parts.extend(
+                [
+                    row["target_global_dpu_id"],
+                    row["rank_ordinal"],
+                    row["dpu_id_in_rank"],
+                    row["group_index"],
+                ]
+            )
+        else:
+            key_parts.extend([row["actual_ranks"], row["group_size"]])
+        key_parts.extend([row["transfer_bytes_per_dpu"], row["condition"]])
+        grouped[tuple(key_parts)].append(
+            (int(row[value_field]), row["_trace_file"])
+        )
+
+    output: list[dict[str, object]] = []
+    for key, samples in sorted(grouped.items()):
+        trace_count = len({sample[1] for sample in samples})
+        stats, label = _stability(
+            [sample[0] for sample in samples],
+            trace_count,
+            min_samples,
+            min_traces,
+            spread_threshold_pct,
+            cv_threshold_pct,
+        )
+        row: dict[str, object] = {
+            "configured_dpus": key[0],
+            "num_tasklets": key[1],
+        }
+        cursor = 2
+        if per_dpu:
+            row.update(
+                {
+                    "target_global_dpu_id": key[cursor],
+                    "rank_ordinal": key[cursor + 1],
+                    "dpu_id_in_rank": key[cursor + 2],
+                    "group_index": key[cursor + 3],
+                }
+            )
+            cursor += 4
+        else:
+            row.update(
+                {
+                    "actual_ranks": key[cursor],
+                    "group_size": key[cursor + 1],
+                }
+            )
+            cursor += 2
+        row.update(
+            {
+                "transfer_bytes_per_dpu": key[cursor],
+                "condition": key[cursor + 1],
+                "trace_files": trace_count,
+                **stats,
+                "stability": label,
+            }
+        )
+        output.append(row)
+    return output
+
+
+def summarize_pairs(
+    rows: list[dict[str, str]], per_dpu: bool, effect_threshold_pct: float
+) -> list[dict[str, object]]:
+    measurements = rows if per_dpu else group_measurements(rows)
+    value_field = "measured_ns" if per_dpu else "frontier_sum_ns"
     paired: dict[tuple[str, ...], dict[str, int]] = defaultdict(dict)
     metadata: dict[tuple[str, ...], dict[str, str]] = {}
     for row in measurements:
@@ -499,10 +503,7 @@ def _summarize_pairs(
         for effect, lhs, rhs in COMPARISONS:
             delta = float(values[lhs] - values[rhs])
             delta_pct = 0.0 if values[rhs] == 0 else delta / values[rhs] * 100.0
-            group_key = [
-                row["configured_dpus"],
-                row["num_tasklets"],
-            ]
+            group_key = [row["configured_dpus"], row["num_tasklets"]]
             if per_dpu:
                 group_key.extend(
                     [
@@ -569,20 +570,6 @@ def _summarize_pairs(
     return output
 
 
-def summarize_per_dpu_pairs(
-    rows: list[dict[str, str]], effect_threshold_pct: float
-) -> list[dict[str, object]]:
-    return _summarize_pairs(rows, "measured_ns", True, effect_threshold_pct)
-
-
-def summarize_group_pairs(
-    rows: list[dict[str, str]], effect_threshold_pct: float
-) -> list[dict[str, object]]:
-    return _summarize_pairs(
-        group_measurements(rows), "measured_group_ns", False, effect_threshold_pct
-    )
-
-
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         raise ValueError(f"refusing to write empty analysis table {path}")
@@ -614,27 +601,26 @@ def main() -> None:
         "spread_threshold_pct": args.spread_threshold_pct,
         "cv_threshold_pct": args.cv_threshold_pct,
     }
-    per_dpu_summaries = summarize_per_dpu_conditions(rows, **summary_args)
-    group_summaries = summarize_group_conditions(rows, **summary_args)
-    per_dpu_pairs = summarize_per_dpu_pairs(rows, args.effect_threshold_pct)
-    group_pairs = summarize_group_pairs(rows, args.effect_threshold_pct)
+    per_dpu_summaries = summarize_conditions(rows, True, **summary_args)
+    group_summaries = summarize_conditions(rows, False, **summary_args)
+    per_dpu_pairs = summarize_pairs(rows, True, args.effect_threshold_pct)
+    group_pairs = summarize_pairs(rows, False, args.effect_threshold_pct)
     write_csv(args.per_dpu_summary_output, per_dpu_summaries)
     write_csv(args.per_dpu_paired_output, per_dpu_pairs)
     write_csv(args.group_summary_output, group_summaries)
     write_csv(args.group_paired_output, group_pairs)
 
-    measured_groups = group_measurements(rows)
     print(f"trace_files={len(args.traces)}")
     print(f"per_dpu_rows={len(rows)}")
-    print(f"measured_groups={len(measured_groups)}")
+    print(f"measured_sequences={len(group_measurements(rows))}")
     print(f"group_size={rows[0]['group_size']}")
     print(
         "source_control="
-        f"shared_group_pointer,content_hash={rows[0]['source_content_hash']},"
+        f"content_hash={rows[0]['source_content_hash']},"
         f"alignment={rows[0]['source_alignment_bytes']},"
-        f"target_precondition={rows[0]['target_precondition']}"
+        f"frontier_target_precondition={rows[0]['target_precondition']}"
     )
-    print("\ngroup condition summaries:")
+    print("\ngroup frontier-sum summaries:")
     for row in group_summaries:
         print(
             f"  condition={row['condition']} n={row['n']} "

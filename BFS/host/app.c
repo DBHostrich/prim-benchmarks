@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "api_order_probe.h"
 #include "context_probe.h"
 #include "mram-management.h"
 #include "../support/common.h"
@@ -51,12 +52,14 @@ int main(int argc, char** argv) {
     bool traceRequested = bfsHostTraceRequested();
     bool contextProbeRequested = bfsContextProbeRequested();
     bool groupContextProbeRequested = bfsGroupContextProbeRequested();
+    bool apiOrderProbeRequested = bfsApiOrderProbeRequested();
     uint64_t allocStartNs = 0;
     uint64_t allocEndNs = 0;
     uint64_t loadStartNs = 0;
     uint64_t loadEndNs = 0;
     if((unsigned int)traceRequested + (unsigned int)contextProbeRequested
-       + (unsigned int)groupContextProbeRequested > 1) {
+       + (unsigned int)groupContextProbeRequested
+       + (unsigned int)apiOrderProbeRequested > 1) {
         PRINT_ERROR("BFS trace and context probe modes are mutually exclusive");
         return EXIT_FAILURE;
     }
@@ -197,10 +200,22 @@ int main(int argc, char** argv) {
     }
     PRINT_INFO(p.verbosity >= 1, "    CPU-DPU Time: %f ms", loadTime*1e3);
 
-    if(contextProbeRequested || groupContextProbeRequested) {
-        bool probeOk = contextProbeRequested
-            ? bfsRunContextProbe(dpu_set, numDPUs, dpuParams, numNodes)
-            : bfsRunGroupContextProbe(dpu_set, numDPUs, dpuParams, numNodes);
+    if(contextProbeRequested || groupContextProbeRequested
+       || apiOrderProbeRequested) {
+        bool probeOk;
+        if(contextProbeRequested) {
+            probeOk = bfsRunContextProbe(
+                dpu_set, numDPUs, dpuParams, numNodes
+            );
+        } else if(groupContextProbeRequested) {
+            probeOk = bfsRunGroupContextProbe(
+                dpu_set, numDPUs, dpuParams, numNodes
+            );
+        } else {
+            probeOk = bfsRunApiOrderProbe(
+                dpu_set, numDPUs, dpuParams, dpuParams_m, numNodes
+            );
+        }
         freeCOOGraph(cooGraph);
         freeCSRGraph(csrGraph);
         free(nodeLevel);
