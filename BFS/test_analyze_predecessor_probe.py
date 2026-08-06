@@ -93,7 +93,7 @@ def make_trace(process: int, samples: int = 6) -> list[dict[str, str]]:
                         "active_dpus": "1",
                         "active_ranks": "1",
                         "active_dpus_per_rank": "1",
-                        "offset_bytes": str(1000 + target * 100),
+                        "offset_bytes": str(5000 + target * 100),
                         "same_source_across_group": "1",
                         "phase_class": "CONTROLLED_PREDECESSOR_FACTORIAL",
                         "source_buffer_class": "SHARED_FIXED_BUFFER",

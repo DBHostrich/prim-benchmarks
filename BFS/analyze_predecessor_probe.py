@@ -127,6 +127,7 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
     seen_trace_keys: set[tuple[str, str]] = set()
     hashes_by_size: dict[str, set[str]] = defaultdict(set)
     topology_reference: dict[str, tuple[str, ...]] = {}
+    predecessor_offset_reference: dict[str, str] = {}
 
     for path in paths:
         with path.open(newline="") as handle:
@@ -288,10 +289,18 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 row["predecessor_dpu_ordinal_in_rank"],
                 row["predecessor_slice_id"],
                 row["predecessor_member_id"],
-                row["previous_offset_bytes"],
             )
-            if predecessor_topology != observed_predecessor_topology:
+            if (
+                predecessor_topology is None
+                or predecessor_topology[:4] != observed_predecessor_topology
+            ):
                 raise ValueError(f"{path}: predecessor topology metadata changed")
+            previous_offset = row["previous_offset_bytes"]
+            prior_previous_offset = predecessor_offset_reference.setdefault(
+                str(predecessor_id), previous_offset
+            )
+            if previous_offset != prior_previous_offset:
+                raise ValueError(f"{path}: predecessor MRAM offset changed")
             if same_dpu:
                 if predecessor_id != global_id or row["transition_class"] != "SAME_DPU":
                     raise ValueError(f"{path}: same-DPU transition changed")
