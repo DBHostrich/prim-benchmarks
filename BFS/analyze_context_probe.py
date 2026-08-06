@@ -33,6 +33,10 @@ FIXED_FIELDS = (
     "offset_bytes",
     "source_buffer_class",
     "same_source_across_conditions",
+    "source_pointer",
+    "source_content_hash",
+    "source_alignment_bytes",
+    "target_precondition",
 )
 REQUIRED_FIELDS = set(
     FIXED_FIELDS
@@ -99,6 +103,7 @@ def distribution(values: Iterable[float]) -> dict[str, float | int]:
 def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen_trace_keys: set[tuple[str, str, str]] = set()
+    source_hashes_by_size: dict[str, set[str]] = defaultdict(set)
 
     for path in paths:
         with path.open(newline="") as handle:
@@ -142,6 +147,17 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 raise ValueError(f"{path}: final source buffer is not fixed")
             if row["same_source_across_conditions"] != "1":
                 raise ValueError(f"{path}: source reuse invariant is false")
+            if int(row["source_pointer"], 0) == 0:
+                raise ValueError(f"{path}: fixed source pointer is null")
+            if int(row["source_content_hash"], 0) == 0:
+                raise ValueError(f"{path}: fixed source hash is zero")
+            source_alignment = int(row["source_alignment_bytes"])
+            if source_alignment != 4096:
+                raise ValueError(f"{path}: source alignment is {source_alignment}")
+            if int(row["source_pointer"], 0) % source_alignment != 0:
+                raise ValueError(f"{path}: fixed source pointer is misaligned")
+            if row["target_precondition"] != "ZERO_WRITTEN":
+                raise ValueError(f"{path}: target precondition changed")
             if int(row["source_pretouch_ns"]) <= 0:
                 raise ValueError(f"{path}: source buffer pretouch was not recorded")
 
@@ -174,6 +190,9 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 raise ValueError(f"{path}: non-launch condition has launch_ns")
             by_sample[sample_index].append(row)
             rows.append(row)
+            source_hashes_by_size[row["transfer_bytes_per_dpu"]].add(
+                row["source_content_hash"]
+            )
 
         expected_samples = list(range(len(by_sample)))
         if sorted(by_sample) != expected_samples:
@@ -184,6 +203,11 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 raise ValueError(
                     f"{path}: sample {sample_index} has conditions {observed}"
                 )
+    for transfer_bytes, hashes in source_hashes_by_size.items():
+        if len(hashes) != 1:
+            raise ValueError(
+                f"transfer size {transfer_bytes}: controlled source hashes changed"
+            )
     return rows
 
 
@@ -368,6 +392,12 @@ def main() -> None:
     print(f"trace_files={len(args.traces)}")
     print(f"rows={len(rows)}")
     print(f"paired_cycles={len(rows) // len(CONDITIONS)}")
+    print(
+        "source_control="
+        f"same_pointer_within_trace,content_hash={rows[0]['source_content_hash']},"
+        f"alignment={rows[0]['source_alignment_bytes']},"
+        f"target_precondition={rows[0]['target_precondition']}"
+    )
     print("\ncondition summaries:")
     for row in summaries:
         print(

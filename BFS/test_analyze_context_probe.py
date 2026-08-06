@@ -36,6 +36,10 @@ FIELDS = [
     "offset_bytes",
     "source_buffer_class",
     "same_source_across_conditions",
+    "source_pointer",
+    "source_content_hash",
+    "source_alignment_bytes",
+    "target_precondition",
     "previous_op",
     "previous_direction",
     "direction_switched",
@@ -104,6 +108,10 @@ def make_row(process: int, sample: int, order: int) -> dict[str, str]:
         "offset_bytes": "4096",
         "source_buffer_class": "SHARED_FIXED_BUFFER",
         "same_source_across_conditions": "1",
+        "source_pointer": "0x100000",
+        "source_content_hash": "0x123456789abcdef0",
+        "source_alignment_bytes": "4096",
+        "target_precondition": "ZERO_WRITTEN",
         "previous_op": previous_op,
         "previous_direction": previous_direction,
         "direction_switched": switched,
@@ -165,6 +173,21 @@ class ContextProbeAnalysisTest(unittest.TestCase):
                 writer.writeheader()
                 writer.writerows(rows)
             with self.assertRaisesRegex(ValueError, "time conservation"):
+                read_and_validate([path])
+
+    def test_misaligned_fixed_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.write_trace(root, 1)
+            with path.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                row["source_pointer"] = "0x100001"
+            with path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "misaligned"):
                 read_and_validate([path])
 
 

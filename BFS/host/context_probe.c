@@ -27,7 +27,32 @@ struct ProbeConfig {
     uint32_t targetGlobalDpuId;
 };
 
+enum GroupProbeCondition {
+    H2D_GROUP_THEN_H2D_GROUP = 0,
+    D2H_GROUP_THEN_H2D_GROUP = 1,
+    LAUNCH_D2H_GROUP_THEN_H2D_GROUP = 2,
+    NUM_GROUP_PROBE_CONDITIONS = 3,
+};
+
+struct GroupProbeConfig {
+    const char* outputPath;
+    const char* runId;
+    uint64_t processRepeat;
+    uint64_t samples;
+    uint64_t warmups;
+};
+
+struct GroupProbeDpu {
+    struct dpu_set_t dpu;
+    uint32_t globalDpuId;
+    uint32_t rankOrdinal;
+    uint32_t dpuIdInRank;
+    uint32_t targetOffset;
+};
+
 static volatile uint64_t sourceTouchSink;
+
+#define PROBE_HOST_BUFFER_ALIGNMENT UINT32_C(4096)
 
 static uint64_t nowNs(void) {
     struct timespec now;
@@ -199,6 +224,27 @@ static void touchSourceBuffer(const uint8_t* sourceBuffer, uint32_t size) {
     sourceTouchSink ^= checksum;
 }
 
+static uint64_t hashBuffer(const uint8_t* buffer, uint32_t size) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+
+    for(uint32_t i = 0; i < size; ++i) {
+        hash ^= buffer[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint8_t* allocateAlignedBuffer(uint32_t size) {
+    void* buffer = NULL;
+    int error = posix_memalign(&buffer, PROBE_HOST_BUFFER_ALIGNMENT, size);
+
+    if(error != 0) {
+        errno = error;
+        return NULL;
+    }
+    return (uint8_t*)buffer;
+}
+
 static bool runOneCondition(
     FILE* output,
     const struct ProbeConfig* config,
@@ -212,6 +258,7 @@ static bool runOneCondition(
     uint32_t transferBytes,
     const uint8_t* zeroBuffer,
     const uint8_t* sourceBuffer,
+    uint64_t sourceContentHash,
     uint8_t* readbackBuffer,
     uint64_t sampleIndex,
     uint32_t orderIndex,
@@ -279,12 +326,15 @@ static bool runOneCondition(
             output,
             "%s,%" PRIu64 ",%u,%u,%u,%u,%u,%u,%" PRIu64 ",%u,%s,%s,"
             "dpu_copy_to,TO_DPU,SINGLE_COPY,MRAM,%u,%u,SHARED_FIXED_BUFFER,1,"
+            "0x%" PRIxPTR ",0x%016" PRIx64 ",%u,ZERO_WRITTEN,"
             "%s,%s,%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
             ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%s\n",
             config->runId, config->processRepeat, configuredDpus, NR_TASKLETS,
             actualRanks, config->targetGlobalDpuId, targetRankOrdinal,
             targetDpuIdInRank, sampleIndex, orderIndex, conditionName(condition),
             predecessorChain(condition), transferBytes, targetOffset,
+            (uintptr_t)sourceBuffer, sourceContentHash,
+            PROBE_HOST_BUFFER_ALIGNMENT,
             previousOp, previousDirection, directionSwitched, afterLaunch,
             predecessorEndNs - predecessorStartNs,
             launchEndNs - launchStartNs,
@@ -319,6 +369,7 @@ bool bfsRunContextProbe(
     uint8_t* zeroBuffer;
     uint8_t* sourceBuffer;
     uint8_t* readbackBuffer;
+    uint64_t sourceContentHash;
     FILE* output;
     uint64_t cycle;
     uint32_t orderIndex;
@@ -347,9 +398,9 @@ bool bfsRunContextProbe(
 
     transferBytes = numNodes / 64 * sizeof(uint64_t);
     targetOffset = dpuParams[config.targetGlobalDpuId].dpuNextFrontier_m;
-    zeroBuffer = calloc(transferBytes, 1);
-    sourceBuffer = malloc(transferBytes);
-    readbackBuffer = malloc(transferBytes);
+    zeroBuffer = allocateAlignedBuffer(transferBytes);
+    sourceBuffer = allocateAlignedBuffer(transferBytes);
+    readbackBuffer = allocateAlignedBuffer(transferBytes);
     if(zeroBuffer == NULL || sourceBuffer == NULL || readbackBuffer == NULL) {
         fprintf(stderr, "Could not allocate context probe host buffers\n");
         free(zeroBuffer);
@@ -357,9 +408,12 @@ bool bfsRunContextProbe(
         free(readbackBuffer);
         return false;
     }
+    memset(zeroBuffer, 0, transferBytes);
+    memset(readbackBuffer, 0, transferBytes);
     for(uint32_t i = 0; i < transferBytes; ++i) {
         sourceBuffer[i] = (uint8_t)(UINT8_C(0xa5) ^ (uint8_t)(i & 0x3f));
     }
+    sourceContentHash = hashBuffer(sourceBuffer, transferBytes);
 
     output = fopen(config.outputPath, "w");
     if(output == NULL) {
@@ -375,7 +429,8 @@ bool bfsRunContextProbe(
         "target_global_dpu_id,rank_ordinal,dpu_id_in_rank,sample_index,"
         "order_index,condition,predecessor_chain,op,direction,sdk_api_kind,"
         "target_space,transfer_bytes_per_dpu,offset_bytes,source_buffer_class,"
-        "same_source_across_conditions,previous_op,previous_direction,"
+        "same_source_across_conditions,source_pointer,source_content_hash,"
+        "source_alignment_bytes,target_precondition,previous_op,previous_direction,"
         "direction_switched,after_launch,predecessor_ns,launch_ns,"
         "ns_since_previous_sdk_event,source_pretouch_ns,host_start_ns,"
         "host_end_ns,measured_ns,verification\n",
@@ -391,7 +446,8 @@ bool bfsRunContextProbe(
             success = runOneCondition(
                 output, &config, dpuSet, targetDpu, configuredDpus, actualRanks,
                 targetRankOrdinal, targetDpuIdInRank, targetOffset, transferBytes,
-                zeroBuffer, sourceBuffer, readbackBuffer, cycle, orderIndex,
+                zeroBuffer, sourceBuffer, sourceContentHash, readbackBuffer,
+                cycle, orderIndex,
                 condition, false
             );
             if(!success) {
@@ -406,7 +462,8 @@ bool bfsRunContextProbe(
             success = runOneCondition(
                 output, &config, dpuSet, targetDpu, configuredDpus, actualRanks,
                 targetRankOrdinal, targetDpuIdInRank, targetOffset, transferBytes,
-                zeroBuffer, sourceBuffer, readbackBuffer, cycle, orderIndex,
+                zeroBuffer, sourceBuffer, sourceContentHash, readbackBuffer,
+                cycle, orderIndex,
                 condition, true
             );
             if(!success) {
@@ -426,6 +483,425 @@ bool bfsRunContextProbe(
     if(success) {
         printf("Context probe wrote %" PRIu64 " samples per condition to %s\n",
                config.samples, config.outputPath);
+    }
+    return success;
+}
+
+static bool loadGroupConfig(struct GroupProbeConfig* config) {
+    memset(config, 0, sizeof(*config));
+    config->outputPath = getenv("BFS_GROUP_CONTEXT_PROBE_CSV");
+    config->runId = getenv("BFS_GROUP_CONTEXT_PROBE_RUN_ID");
+    if(config->outputPath == NULL || config->outputPath[0] == '\0') {
+        return false;
+    }
+    if(config->runId == NULL || config->runId[0] == '\0') {
+        config->runId = "bfs_group_context_probe";
+    }
+    if(!parseUnsigned("BFS_GROUP_CONTEXT_PROBE_PROCESS_REPEAT",
+                      getenv("BFS_GROUP_CONTEXT_PROBE_PROCESS_REPEAT"), 0,
+                      &config->processRepeat)
+       || !parseUnsigned("BFS_GROUP_CONTEXT_PROBE_SAMPLES",
+                         getenv("BFS_GROUP_CONTEXT_PROBE_SAMPLES"), 30,
+                         &config->samples)
+       || !parseUnsigned("BFS_GROUP_CONTEXT_PROBE_WARMUPS",
+                         getenv("BFS_GROUP_CONTEXT_PROBE_WARMUPS"), 3,
+                         &config->warmups)) {
+        return false;
+    }
+    if(config->samples == 0) {
+        fprintf(stderr, "Group context probe requires samples > 0\n");
+        return false;
+    }
+    return true;
+}
+
+bool bfsGroupContextProbeRequested(void) {
+    const char* outputPath = getenv("BFS_GROUP_CONTEXT_PROBE_CSV");
+    return outputPath != NULL && outputPath[0] != '\0';
+}
+
+static const char* groupConditionName(enum GroupProbeCondition condition) {
+    switch(condition) {
+        case H2D_GROUP_THEN_H2D_GROUP:
+            return "H2D_GROUP_THEN_H2D_GROUP";
+        case D2H_GROUP_THEN_H2D_GROUP:
+            return "D2H_GROUP_THEN_H2D_GROUP";
+        case LAUNCH_D2H_GROUP_THEN_H2D_GROUP:
+            return "LAUNCH_D2H_GROUP_THEN_H2D_GROUP";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char* groupPredecessorChain(enum GroupProbeCondition condition) {
+    switch(condition) {
+        case H2D_GROUP_THEN_H2D_GROUP:
+            return "H2D_GROUP>MEASURED_H2D_GROUP";
+        case D2H_GROUP_THEN_H2D_GROUP:
+            return "H2D_SETUP_GROUP>D2H_GROUP>MEASURED_H2D_GROUP";
+        case LAUNCH_D2H_GROUP_THEN_H2D_GROUP:
+            return "H2D_SETUP_GROUP>LAUNCH>D2H_GROUP>MEASURED_H2D_GROUP";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static bool buildGroupDpuList(
+    struct dpu_set_t dpuSet,
+    uint32_t configuredDpus,
+    const struct DPUParams* dpuParams,
+    struct GroupProbeDpu* dpuList
+) {
+    struct dpu_set_t rank;
+    struct dpu_set_t dpu;
+    uint32_t rankOrdinal;
+    uint32_t dpuIdInRank;
+    uint32_t globalDpuId = 0;
+
+    DPU_RANK_FOREACH(dpuSet, rank, rankOrdinal) {
+        DPU_FOREACH(rank, dpu, dpuIdInRank) {
+            if(globalDpuId >= configuredDpus) {
+                fprintf(stderr, "Group context probe discovered too many DPUs\n");
+                return false;
+            }
+            if(dpuParams[globalDpuId].dpuNumNodes == 0) {
+                fprintf(stderr,
+                        "Group context probe requires every allocated DPU to be active; "
+                        "DPU %u is inactive\n",
+                        globalDpuId);
+                return false;
+            }
+            dpuList[globalDpuId].dpu = dpu;
+            dpuList[globalDpuId].globalDpuId = globalDpuId;
+            dpuList[globalDpuId].rankOrdinal = rankOrdinal;
+            dpuList[globalDpuId].dpuIdInRank = dpuIdInRank;
+            dpuList[globalDpuId].targetOffset =
+                dpuParams[globalDpuId].dpuNextFrontier_m;
+            ++globalDpuId;
+        }
+    }
+    if(globalDpuId != configuredDpus) {
+        fprintf(stderr,
+                "Group context probe discovered %u DPUs, expected %u\n",
+                globalDpuId, configuredDpus);
+        return false;
+    }
+    return true;
+}
+
+static void copyToGroup(
+    const struct GroupProbeDpu* dpuList,
+    uint32_t dpuCount,
+    const uint8_t* source,
+    uint32_t transferBytes
+) {
+    for(uint32_t i = 0; i < dpuCount; ++i) {
+        copyTo(dpuList[i].dpu, dpuList[i].targetOffset,
+               source, transferBytes);
+    }
+}
+
+static void copyFromGroupAndMerge(
+    const struct GroupProbeDpu* dpuList,
+    uint32_t dpuCount,
+    uint8_t* readbackBuffer,
+    uint64_t* mergeBuffer,
+    uint32_t transferBytes
+) {
+    uint32_t words = transferBytes / sizeof(uint64_t);
+
+    memset(mergeBuffer, 0, transferBytes);
+    for(uint32_t i = 0; i < dpuCount; ++i) {
+        copyFrom(dpuList[i].dpu, dpuList[i].targetOffset,
+                 readbackBuffer, transferBytes);
+        for(uint32_t word = 0; word < words; ++word) {
+            mergeBuffer[word] |= ((uint64_t*)readbackBuffer)[word];
+        }
+    }
+}
+
+static bool verifyGroup(
+    const struct GroupProbeDpu* dpuList,
+    uint32_t dpuCount,
+    const uint8_t* sourceBuffer,
+    uint8_t* readbackBuffer,
+    uint32_t transferBytes,
+    uint64_t sampleIndex,
+    enum GroupProbeCondition condition
+) {
+    for(uint32_t i = 0; i < dpuCount; ++i) {
+        memset(readbackBuffer, 0, transferBytes);
+        copyFrom(dpuList[i].dpu, dpuList[i].targetOffset,
+                 readbackBuffer, transferBytes);
+        if(memcmp(sourceBuffer, readbackBuffer, transferBytes) != 0) {
+            fprintf(stderr,
+                    "Group context probe readback mismatch for sample %" PRIu64
+                    ", condition %s, DPU %u\n",
+                    sampleIndex, groupConditionName(condition),
+                    dpuList[i].globalDpuId);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool runOneGroupCondition(
+    FILE* output,
+    const struct GroupProbeConfig* config,
+    struct dpu_set_t dpuSet,
+    const struct GroupProbeDpu* dpuList,
+    uint32_t configuredDpus,
+    uint32_t actualRanks,
+    uint32_t transferBytes,
+    const uint8_t* zeroBuffer,
+    const uint8_t* sourceBuffer,
+    uint64_t sourceContentHash,
+    uint8_t* readbackBuffer,
+    uint64_t* mergeBuffer,
+    uint64_t* callStartNs,
+    uint64_t* callEndNs,
+    uint64_t sampleIndex,
+    uint32_t orderIndex,
+    enum GroupProbeCondition condition,
+    bool record
+) {
+    uint64_t predecessorStartNs;
+    uint64_t predecessorEndNs;
+    uint64_t launchStartNs = 0;
+    uint64_t launchEndNs = 0;
+    uint64_t sourcePretouchStartNs;
+    uint64_t sourcePretouchEndNs;
+    uint64_t groupStartNs;
+    uint64_t groupEndNs;
+    const char* previousOp;
+    const char* previousDirection;
+    unsigned int directionSwitched;
+    unsigned int afterLaunch;
+
+    copyToGroup(dpuList, configuredDpus, zeroBuffer, transferBytes);
+    if(condition == H2D_GROUP_THEN_H2D_GROUP) {
+        predecessorStartNs = nowNs();
+        copyToGroup(dpuList, configuredDpus, zeroBuffer, transferBytes);
+        predecessorEndNs = nowNs();
+        previousOp = "dpu_copy_to";
+        previousDirection = "TO_DPU";
+        directionSwitched = 0;
+        afterLaunch = 0;
+    } else if(condition == D2H_GROUP_THEN_H2D_GROUP) {
+        predecessorStartNs = nowNs();
+        copyFromGroupAndMerge(dpuList, configuredDpus, readbackBuffer,
+                              mergeBuffer, transferBytes);
+        predecessorEndNs = nowNs();
+        previousOp = "dpu_copy_from";
+        previousDirection = "FROM_DPU";
+        directionSwitched = 1;
+        afterLaunch = 0;
+    } else {
+        launchStartNs = nowNs();
+        DPU_ASSERT(dpu_launch(dpuSet, DPU_SYNCHRONOUS));
+        launchEndNs = nowNs();
+        predecessorStartNs = nowNs();
+        copyFromGroupAndMerge(dpuList, configuredDpus, readbackBuffer,
+                              mergeBuffer, transferBytes);
+        predecessorEndNs = nowNs();
+        previousOp = "dpu_copy_from";
+        previousDirection = "FROM_DPU";
+        directionSwitched = 1;
+        afterLaunch = 1;
+    }
+
+    sourcePretouchStartNs = nowNs();
+    touchSourceBuffer(sourceBuffer, transferBytes);
+    sourcePretouchEndNs = nowNs();
+
+    groupStartNs = nowNs();
+    for(uint32_t i = 0; i < configuredDpus; ++i) {
+        callStartNs[i] = nowNs();
+        copyTo(dpuList[i].dpu, dpuList[i].targetOffset,
+               sourceBuffer, transferBytes);
+        callEndNs[i] = nowNs();
+    }
+    groupEndNs = nowNs();
+
+    if(!verifyGroup(dpuList, configuredDpus, sourceBuffer, readbackBuffer,
+                    transferBytes, sampleIndex, condition)) {
+        return false;
+    }
+
+    if(record) {
+        for(uint32_t i = 0; i < configuredDpus; ++i) {
+            bool rankBoundary = i == 0
+                || dpuList[i - 1].rankOrdinal != dpuList[i].rankOrdinal;
+            bool sameRankAsPrevious = i > 0 && !rankBoundary;
+            uint64_t nsSincePreviousSdkEvent = i == 0
+                ? callStartNs[i] - predecessorEndNs
+                : callStartNs[i] - callEndNs[i - 1];
+            fprintf(
+                output,
+                "%s,%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%u,%s,%s,%u,%u,%u,"
+                "%u,%u,%u,%u,dpu_copy_to,TO_DPU,SINGLE_COPY,"
+                "SHARED_REPLICATION,MRAM,%u,1,1,1,%u,1,CONTROLLED_GROUP_PROBE,"
+                "SHARED_FIXED_BUFFER,1,0x%" PRIxPTR ",0x%016" PRIx64
+                ",%u,ZERO_WRITTEN,%s,%s,%u,%u,%" PRIu64 ",%" PRIu64
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                ",ok\n",
+                config->runId, config->processRepeat, configuredDpus,
+                NR_TASKLETS, actualRanks, sampleIndex, orderIndex,
+                groupConditionName(condition), groupPredecessorChain(condition),
+                i, configuredDpus, dpuList[i].globalDpuId,
+                dpuList[i].rankOrdinal, dpuList[i].dpuIdInRank,
+                rankBoundary ? 1U : 0U, sameRankAsPrevious ? 1U : 0U,
+                transferBytes, dpuList[i].targetOffset,
+                (uintptr_t)sourceBuffer, sourceContentHash,
+                PROBE_HOST_BUFFER_ALIGNMENT, previousOp, previousDirection,
+                directionSwitched, afterLaunch,
+                predecessorEndNs - predecessorStartNs,
+                launchEndNs - launchStartNs, nsSincePreviousSdkEvent,
+                sourcePretouchEndNs - sourcePretouchStartNs,
+                groupStartNs, groupEndNs, callStartNs[i], callEndNs[i],
+                callEndNs[i] - callStartNs[i],
+                groupEndNs - groupStartNs
+            );
+        }
+    }
+    return true;
+}
+
+bool bfsRunGroupContextProbe(
+    struct dpu_set_t dpuSet,
+    uint32_t configuredDpus,
+    const struct DPUParams* dpuParams,
+    uint32_t numNodes
+) {
+    struct GroupProbeConfig config;
+    struct GroupProbeDpu* dpuList = NULL;
+    uint32_t actualRanks;
+    uint32_t transferBytes;
+    uint8_t* zeroBuffer = NULL;
+    uint8_t* sourceBuffer = NULL;
+    uint8_t* readbackBuffer = NULL;
+    uint64_t* mergeBuffer = NULL;
+    uint64_t* callStartNs = NULL;
+    uint64_t* callEndNs = NULL;
+    uint64_t sourceContentHash;
+    FILE* output = NULL;
+    bool success = true;
+
+    if(!loadGroupConfig(&config)) {
+        return false;
+    }
+    if(configuredDpus == 0 || numNodes == 0 || numNodes % 64 != 0) {
+        fprintf(stderr,
+                "Group context probe requires DPUs and a node count divisible by 64\n");
+        return false;
+    }
+    DPU_ASSERT(dpu_get_nr_ranks(dpuSet, &actualRanks));
+    transferBytes = numNodes / 64 * sizeof(uint64_t);
+
+    dpuList = calloc(configuredDpus, sizeof(*dpuList));
+    zeroBuffer = allocateAlignedBuffer(transferBytes);
+    sourceBuffer = allocateAlignedBuffer(transferBytes);
+    readbackBuffer = allocateAlignedBuffer(transferBytes);
+    mergeBuffer = (uint64_t*)allocateAlignedBuffer(transferBytes);
+    callStartNs = calloc(configuredDpus, sizeof(*callStartNs));
+    callEndNs = calloc(configuredDpus, sizeof(*callEndNs));
+    if(dpuList == NULL || zeroBuffer == NULL || sourceBuffer == NULL
+       || readbackBuffer == NULL || mergeBuffer == NULL
+       || callStartNs == NULL || callEndNs == NULL) {
+        fprintf(stderr, "Could not allocate group context probe buffers\n");
+        success = false;
+        goto cleanup;
+    }
+    if(!buildGroupDpuList(dpuSet, configuredDpus, dpuParams, dpuList)) {
+        success = false;
+        goto cleanup;
+    }
+    memset(zeroBuffer, 0, transferBytes);
+    memset(readbackBuffer, 0, transferBytes);
+    memset(mergeBuffer, 0, transferBytes);
+    for(uint32_t i = 0; i < transferBytes; ++i) {
+        sourceBuffer[i] = (uint8_t)(UINT8_C(0xa5) ^ (uint8_t)(i & 0x3f));
+    }
+    sourceContentHash = hashBuffer(sourceBuffer, transferBytes);
+
+    output = fopen(config.outputPath, "w");
+    if(output == NULL) {
+        fprintf(stderr, "Could not open group context probe CSV %s: %s\n",
+                config.outputPath, strerror(errno));
+        success = false;
+        goto cleanup;
+    }
+    fputs(
+        "run_id,process_repeat,configured_dpus,num_tasklets,actual_ranks,"
+        "sample_index,order_index,condition,predecessor_chain,group_index,"
+        "group_size,target_global_dpu_id,rank_ordinal,dpu_id_in_rank,"
+        "rank_boundary_before,same_rank_as_previous,op,direction,sdk_api_kind,"
+        "logical_distribution_class,target_space,transfer_bytes_per_dpu,"
+        "active_dpus,active_ranks,active_dpus_per_rank,offset_bytes,"
+        "same_source_across_group,phase_class,source_buffer_class,"
+        "same_source_across_conditions,source_pointer,source_content_hash,"
+        "source_alignment_bytes,target_precondition,group_previous_op,"
+        "group_previous_direction,direction_switched,after_launch,"
+        "predecessor_group_ns,launch_ns,ns_since_previous_sdk_event,"
+        "source_pretouch_ns,group_start_ns,group_end_ns,host_start_ns,"
+        "host_end_ns,measured_ns,measured_group_ns,verification\n",
+        output
+    );
+
+    for(uint64_t cycle = 0; cycle < config.warmups && success; ++cycle) {
+        for(uint32_t orderIndex = 0;
+            orderIndex < NUM_GROUP_PROBE_CONDITIONS; ++orderIndex) {
+            enum GroupProbeCondition condition = (enum GroupProbeCondition)(
+                (cycle + orderIndex) % NUM_GROUP_PROBE_CONDITIONS
+            );
+            success = runOneGroupCondition(
+                output, &config, dpuSet, dpuList, configuredDpus, actualRanks,
+                transferBytes, zeroBuffer, sourceBuffer, sourceContentHash,
+                readbackBuffer, mergeBuffer, callStartNs, callEndNs, cycle,
+                orderIndex, condition, false
+            );
+            if(!success) {
+                break;
+            }
+        }
+    }
+    for(uint64_t cycle = 0; cycle < config.samples && success; ++cycle) {
+        for(uint32_t orderIndex = 0;
+            orderIndex < NUM_GROUP_PROBE_CONDITIONS; ++orderIndex) {
+            enum GroupProbeCondition condition = (enum GroupProbeCondition)(
+                (cycle + orderIndex) % NUM_GROUP_PROBE_CONDITIONS
+            );
+            success = runOneGroupCondition(
+                output, &config, dpuSet, dpuList, configuredDpus, actualRanks,
+                transferBytes, zeroBuffer, sourceBuffer, sourceContentHash,
+                readbackBuffer, mergeBuffer, callStartNs, callEndNs, cycle,
+                orderIndex, condition, true
+            );
+            if(!success) {
+                break;
+            }
+        }
+    }
+
+cleanup:
+    if(output != NULL && fclose(output) != 0) {
+        fprintf(stderr, "Could not close group context probe CSV %s\n",
+                config.outputPath);
+        success = false;
+    }
+    free(dpuList);
+    free(zeroBuffer);
+    free(sourceBuffer);
+    free(readbackBuffer);
+    free(mergeBuffer);
+    free(callStartNs);
+    free(callEndNs);
+
+    if(success) {
+        printf("Group context probe wrote %" PRIu64
+               " samples per condition across %u DPUs to %s\n",
+               config.samples, configuredDpus, config.outputPath);
     }
     return success;
 }

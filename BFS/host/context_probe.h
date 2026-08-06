@@ -10,7 +10,16 @@
 
 bool bfsContextProbeRequested(void);
 
+bool bfsGroupContextProbeRequested(void);
+
 bool bfsRunContextProbe(
+    struct dpu_set_t dpuSet,
+    uint32_t configuredDpus,
+    const struct DPUParams* dpuParams,
+    uint32_t numNodes
+);
+
+bool bfsRunGroupContextProbe(
     struct dpu_set_t dpuSet,
     uint32_t configuredDpus,
     const struct DPUParams* dpuParams,
