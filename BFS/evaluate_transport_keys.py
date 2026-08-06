@@ -334,6 +334,16 @@ def main() -> int:
             f"mean_ape_pct={row.get('mean_abs_pct_error', '')} "
             f"signed_bias_pct={row.get('mean_signed_pct_error', '')}"
         )
+    if args.holdout_unit == "configuration":
+        for row in per_holdout:
+            print(
+                f"heldout={row['held_out_group']} model={row['model']} "
+                f"scope={row['scope']} coverage_pct={row['coverage_pct']} "
+                f"fallback_pct={row['fallback_predicted_pct']} "
+                f"p90_ape_pct={row.get('p90_abs_pct_error', '')} "
+                f"mean_ape_pct={row.get('mean_abs_pct_error', '')} "
+                f"signed_bias_pct={row.get('mean_signed_pct_error', '')}"
+            )
     print(f"summary_csv={args.summary_output}")
     print(f"per_holdout_csv={args.per_holdout_output}")
     return 0
