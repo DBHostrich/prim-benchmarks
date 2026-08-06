@@ -31,6 +31,10 @@ FIELDS = [
     "target_global_dpu_id",
     "rank_ordinal",
     "dpu_id_in_rank",
+    "sdk_physical_rank_id",
+    "sdk_slice_id",
+    "sdk_member_id",
+    "physical_dpu_identity",
     "rank_boundary_before",
     "same_rank_as_previous_sdk_event",
     "op",
@@ -74,10 +78,20 @@ FIELDS = [
 ]
 
 
-def previous_fields(condition: str, dpu: int) -> tuple[str, str, str, int, int, int, int]:
+def target_order(condition: str) -> list[int]:
+    if condition == "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU":
+        return [1, 0, 3, 2]
+    return list(range(4))
+
+
+def previous_fields(
+    condition: str, position: int
+) -> tuple[str, str, str, int, int, int, int]:
+    targets = target_order(condition)
+    target = targets[position]
     if condition == "VISITED_FRONTIER_PARAMS_PER_DPU":
-        return ("dpu_copy_to", "visited_control", "TO_DPU", 24576, dpu, 1, 0)
-    if dpu == 0:
+        return ("dpu_copy_to", "visited_control", "TO_DPU", 24576, target, 1, 0)
+    if position == 0:
         if condition == "D2H_MERGE_FRONTIER_PARAMS_PER_DPU":
             return (
                 "dpu_copy_from",
@@ -103,25 +117,28 @@ def previous_fields(condition: str, dpu: int) -> tuple[str, str, str, int, int, 
             "measured_frontier",
             "TO_DPU",
             24576,
-            dpu - 1,
+            targets[position - 1],
             0,
             0,
         )
-    return ("dpu_copy_to", "params_control", "TO_DPU", 48, dpu - 1, 0, 0)
+    return (
+        "dpu_copy_to",
+        "params_control",
+        "TO_DPU",
+        48,
+        targets[position - 1],
+        0,
+        0,
+    )
 
 
 def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]:
     condition = CONDITIONS[(sample + order) % len(CONDITIONS)]
-    condition_delta = {
-        "CONTIGUOUS_FRONTIER_GROUP": 0,
-        "FRONTIER_PARAMS_PER_DPU": 10,
-        "VISITED_FRONTIER_PARAMS_PER_DPU": 30,
-        "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": 60,
-    }[condition]
     order_class = {
         "CONTIGUOUS_FRONTIER_GROUP": "CONTIGUOUS_CONTROL",
         "VISITED_FRONTIER_PARAMS_PER_DPU": "INIT_LIKE_ORDER",
         "FRONTIER_PARAMS_PER_DPU": "PARAMS_INTERLEAVED_CONTROL",
+        "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU": "PAIR_REVERSED_CONTROL",
         "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": "ITERATIVE_LIKE_ORDER",
     }[condition]
     interleaved = int(condition != "CONTIGUOUS_FRONTIER_GROUP")
@@ -130,25 +147,36 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
     )
     sequence_start = 1_000_000 + sample * 100_000 + order * 20_000
     cursor = sequence_start + 5
-    calls: list[tuple[int, int]] = []
-    for dpu in range(4):
+    calls: dict[int, tuple[int, int]] = {}
+    targets = target_order(condition)
+    for target in targets:
         if condition == "VISITED_FRONTIER_PARAMS_PER_DPU":
             cursor += 50
-        measured = 100 + dpu + condition_delta + process
-        calls.append((cursor, cursor + measured))
+        if condition == "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU":
+            condition_delta = -20 if target % 2 == 0 else 40
+        else:
+            condition_delta = {
+                "CONTIGUOUS_FRONTIER_GROUP": 0,
+                "FRONTIER_PARAMS_PER_DPU": 10,
+                "VISITED_FRONTIER_PARAMS_PER_DPU": 30,
+                "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": 60,
+            }[condition]
+        measured = 100 + target + condition_delta + process
+        calls[target] = (cursor, cursor + measured)
         cursor += measured
         if interleaved:
             cursor += 10
         else:
             cursor += 3
     sequence_end = cursor + 5
-    frontier_sum = sum(end - start for start, end in calls)
+    frontier_sum = sum(end - start for start, end in calls.values())
 
     rows: list[dict[str, str]] = []
-    for dpu in range(4):
-        rank = dpu // 2
-        in_rank = dpu % 2
-        boundary = dpu == 0 or in_rank == 0
+    for position, target in enumerate(targets):
+        rank = target // 2
+        in_rank = target % 2
+        previous_position = position - 1
+        boundary = position == 0 or targets[previous_position] // 2 != rank
         (
             previous_op,
             previous_role,
@@ -157,7 +185,7 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
             previous_target,
             same_dpu,
             switched,
-        ) = previous_fields(condition, dpu)
+        ) = previous_fields(condition, position)
         previous_rank = previous_target // 2
         rows.append(
             {
@@ -170,11 +198,17 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
                 "order_index": str(order),
                 "condition": condition,
                 "api_order_class": order_class,
-                "group_index": str(dpu),
+                "group_index": str(position),
                 "group_size": "4",
-                "target_global_dpu_id": str(dpu),
+                "target_global_dpu_id": str(target),
                 "rank_ordinal": str(rank),
                 "dpu_id_in_rank": str(in_rank),
+                "sdk_physical_rank_id": str(12_288 + rank),
+                "sdk_slice_id": "0",
+                "sdk_member_id": str(in_rank),
+                "physical_dpu_identity": (
+                    f"rank:{12_288 + rank}/slice:0/member:{in_rank}"
+                ),
                 "rank_boundary_before": str(int(boundary)),
                 "same_rank_as_previous_sdk_event": str(int(previous_rank == rank)),
                 "op": "dpu_copy_to",
@@ -186,7 +220,7 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
                 "active_dpus": "1",
                 "active_ranks": "1",
                 "active_dpus_per_rank": "1",
-                "offset_bytes": str(4096 + dpu * 128),
+                "offset_bytes": str(4096 + target * 128),
                 "same_source_across_group": "1",
                 "phase_class": "CONTROLLED_API_ORDER_PROBE",
                 "source_buffer_class": "SHARED_FIXED_BUFFER",
@@ -210,9 +244,9 @@ def make_sequence(process: int, sample: int, order: int) -> list[dict[str, str]]
                 "sequence_start_ns": str(sequence_start),
                 "sequence_end_ns": str(sequence_end),
                 "sequence_span_ns": str(sequence_end - sequence_start),
-                "host_start_ns": str(calls[dpu][0]),
-                "host_end_ns": str(calls[dpu][1]),
-                "measured_ns": str(calls[dpu][1] - calls[dpu][0]),
+                "host_start_ns": str(calls[target][0]),
+                "host_end_ns": str(calls[target][1]),
+                "measured_ns": str(calls[target][1] - calls[target][0]),
                 "frontier_sum_ns": str(frontier_sum),
                 "verification": "ok",
             }
@@ -227,7 +261,7 @@ class ApiOrderProbeAnalysisTest(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=FIELDS)
             writer.writeheader()
             for sample in range(6):
-                for order in range(4):
+                for order in range(5):
                     writer.writerows(make_sequence(process, sample, order))
         return path
 
@@ -241,10 +275,10 @@ class ApiOrderProbeAnalysisTest(unittest.TestCase):
             per_dpu_pairs = summarize_pairs(rows, True, 5.0)
             group_pairs = summarize_pairs(rows, False, 5.0)
 
-        self.assertEqual(len(rows), 192)
-        self.assertEqual(len(per_dpu_summaries), 16)
-        self.assertEqual(len(group_summaries), 4)
-        self.assertEqual(len(per_dpu_pairs), 16)
+        self.assertEqual(len(rows), 240)
+        self.assertEqual(len(per_dpu_summaries), 20)
+        self.assertEqual(len(group_summaries), 5)
+        self.assertEqual(len(per_dpu_pairs), 20)
         effects = {row["effect"]: row for row in group_pairs}
         self.assertEqual(
             effects["PARAMS_INTERLEAVING_EFFECT"]["effect_class"],
@@ -261,6 +295,13 @@ class ApiOrderProbeAnalysisTest(unittest.TestCase):
         self.assertEqual(
             effects["ITERATIVE_VS_INIT_ORDER_EFFECT"]["paired_n"], 12
         )
+        pair_rows = {
+            int(row["target_global_dpu_id"]): row
+            for row in per_dpu_pairs
+            if row["effect"] == "PAIR_REVERSED_ORDER_EFFECT"
+        }
+        self.assertEqual(pair_rows[0]["effect_class"], "CONSISTENT_FASTER")
+        self.assertEqual(pair_rows[1]["effect_class"], "CONSISTENT_SLOWER")
 
     def test_previous_event_failure_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

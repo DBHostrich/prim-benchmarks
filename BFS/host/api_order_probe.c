@@ -2,6 +2,8 @@
 
 #include "api_order_probe.h"
 
+#include <dpu_management.h>
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -17,8 +19,9 @@ enum ApiOrderCondition {
     CONTIGUOUS_FRONTIER_GROUP = 0,
     VISITED_FRONTIER_PARAMS_PER_DPU = 1,
     FRONTIER_PARAMS_PER_DPU = 2,
-    D2H_MERGE_FRONTIER_PARAMS_PER_DPU = 3,
-    NUM_API_ORDER_CONDITIONS = 4,
+    PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU = 3,
+    D2H_MERGE_FRONTIER_PARAMS_PER_DPU = 4,
+    NUM_API_ORDER_CONDITIONS = 5,
 };
 
 struct ApiOrderConfig {
@@ -34,6 +37,9 @@ struct ApiOrderDpu {
     uint32_t globalDpuId;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
+    uint32_t physicalRankId;
+    uint32_t sliceId;
+    uint32_t memberId;
     uint32_t frontierOffset;
     uint32_t visitedOffset;
     uint32_t paramsOffset;
@@ -167,6 +173,8 @@ static const char* apiOrderConditionName(enum ApiOrderCondition condition) {
             return "VISITED_FRONTIER_PARAMS_PER_DPU";
         case FRONTIER_PARAMS_PER_DPU:
             return "FRONTIER_PARAMS_PER_DPU";
+        case PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU:
+            return "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU";
         case D2H_MERGE_FRONTIER_PARAMS_PER_DPU:
             return "D2H_MERGE_FRONTIER_PARAMS_PER_DPU";
         default:
@@ -182,6 +190,8 @@ static const char* apiOrderClass(enum ApiOrderCondition condition) {
             return "INIT_LIKE_ORDER";
         case FRONTIER_PARAMS_PER_DPU:
             return "PARAMS_INTERLEAVED_CONTROL";
+        case PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU:
+            return "PAIR_REVERSED_CONTROL";
         case D2H_MERGE_FRONTIER_PARAMS_PER_DPU:
             return "ITERATIVE_LIKE_ORDER";
         default:
@@ -198,11 +208,18 @@ static bool buildApiOrderDpuList(
 ) {
     struct dpu_set_t rank;
     struct dpu_set_t dpu;
+    struct dpu_rank_t* sdkRank;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
 
     DPU_RANK_FOREACH(dpuSet, rank, rankOrdinal) {
+        sdkRank = dpu_rank_from_set(rank);
+        if(sdkRank == NULL) {
+            fprintf(stderr, "API-order probe could not resolve SDK rank %u\n",
+                    rankOrdinal);
+            return false;
+        }
         DPU_FOREACH(rank, dpu, dpuIdInRank) {
             if(globalDpuId >= configuredDpus) {
                 fprintf(stderr, "API-order probe discovered too many DPUs\n");
@@ -219,6 +236,9 @@ static bool buildApiOrderDpuList(
             dpuList[globalDpuId].globalDpuId = globalDpuId;
             dpuList[globalDpuId].rankOrdinal = rankOrdinal;
             dpuList[globalDpuId].dpuIdInRank = dpuIdInRank;
+            dpuList[globalDpuId].physicalRankId = dpu_get_rank_id(sdkRank);
+            dpuList[globalDpuId].sliceId = dpu_get_slice_id(dpu.dpu);
+            dpuList[globalDpuId].memberId = dpu_get_member_id(dpu.dpu);
             dpuList[globalDpuId].frontierOffset =
                 dpuParams[globalDpuId].dpuNextFrontier_m;
             dpuList[globalDpuId].visitedOffset =
@@ -233,7 +253,32 @@ static bool buildApiOrderDpuList(
                 globalDpuId, configuredDpus);
         return false;
     }
+    if((configuredDpus % 2) != 0) {
+        fprintf(stderr, "API-order probe requires an even DPU count\n");
+        return false;
+    }
+    for(uint32_t i = 0; i < configuredDpus; i += 2) {
+        if(dpuList[i].physicalRankId != dpuList[i + 1].physicalRankId
+           || dpuList[i].sliceId != dpuList[i + 1].sliceId
+           || (dpuList[i].memberId % 2) != 0
+           || dpuList[i + 1].memberId != dpuList[i].memberId + 1) {
+            fprintf(stderr,
+                    "API-order probe DPU %u/%u are not an adjacent member pair\n",
+                    i, i + 1);
+            return false;
+        }
+    }
     return true;
+}
+
+static uint32_t apiOrderTargetIndex(
+    enum ApiOrderCondition condition,
+    uint32_t sequencePosition
+) {
+    if(condition == PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU) {
+        return sequencePosition ^ UINT32_C(1);
+    }
+    return sequencePosition;
 }
 
 static uint64_t preconditionFrontiers(
@@ -345,24 +390,28 @@ static bool runOneApiOrderCondition(
     sequenceStartNs = apiOrderNowNs();
 
     for(uint32_t i = 0; i < configuredDpus; ++i) {
+        uint32_t targetIndex = apiOrderTargetIndex(condition, i);
+
         if(condition == VISITED_FRONTIER_PARAMS_PER_DPU) {
-            apiOrderCopyTo(dpuList[i].dpu, dpuList[i].visitedOffset,
+            apiOrderCopyTo(dpuList[targetIndex].dpu,
+                           dpuList[targetIndex].visitedOffset,
                            zeroBuffer, transferBytes);
             lastSdkEndNs = apiOrderNowNs();
         }
 
-        callStartNs[i] = apiOrderNowNs();
-        gapNs[i] = callStartNs[i] - lastSdkEndNs;
-        apiOrderCopyTo(dpuList[i].dpu, dpuList[i].frontierOffset,
+        callStartNs[targetIndex] = apiOrderNowNs();
+        gapNs[targetIndex] = callStartNs[targetIndex] - lastSdkEndNs;
+        apiOrderCopyTo(dpuList[targetIndex].dpu,
+                       dpuList[targetIndex].frontierOffset,
                        sourceBuffer, transferBytes);
-        callEndNs[i] = apiOrderNowNs();
-        frontierSumNs += callEndNs[i] - callStartNs[i];
-        lastSdkEndNs = callEndNs[i];
+        callEndNs[targetIndex] = apiOrderNowNs();
+        frontierSumNs += callEndNs[targetIndex] - callStartNs[targetIndex];
+        lastSdkEndNs = callEndNs[targetIndex];
 
         if(interleavedParams) {
             apiOrderCopyTo(
-                dpuList[i].dpu, dpuList[i].paramsOffset,
-                paramsBuffers + (uint64_t)i * paramsTransferBytes,
+                dpuList[targetIndex].dpu, dpuList[targetIndex].paramsOffset,
+                paramsBuffers + (uint64_t)targetIndex * paramsTransferBytes,
                 paramsTransferBytes
             );
             lastSdkEndNs = apiOrderNowNs();
@@ -378,6 +427,7 @@ static bool runOneApiOrderCondition(
 
     if(record) {
         for(uint32_t i = 0; i < configuredDpus; ++i) {
+            uint32_t targetIndex = apiOrderTargetIndex(condition, i);
             uint32_t previousTarget;
             const char* previousOp;
             const char* previousEventRole;
@@ -387,10 +437,11 @@ static bool runOneApiOrderCondition(
             bool sameDpuAsPrevious;
             bool sameRankAsPrevious;
             bool rankBoundary = i == 0
-                || dpuList[i - 1].rankOrdinal != dpuList[i].rankOrdinal;
+                || dpuList[apiOrderTargetIndex(condition, i - 1)].rankOrdinal
+                   != dpuList[targetIndex].rankOrdinal;
 
             if(condition == VISITED_FRONTIER_PARAMS_PER_DPU) {
-                previousTarget = i;
+                previousTarget = targetIndex;
                 previousOp = "dpu_copy_to";
                 previousEventRole = "visited_control";
                 previousDirection = "TO_DPU";
@@ -411,28 +462,29 @@ static bool runOneApiOrderCondition(
                 directionSwitched =
                     condition == D2H_MERGE_FRONTIER_PARAMS_PER_DPU;
             } else if(condition == CONTIGUOUS_FRONTIER_GROUP) {
-                previousTarget = i - 1;
+                previousTarget = apiOrderTargetIndex(condition, i - 1);
                 previousOp = "dpu_copy_to";
                 previousEventRole = "measured_frontier";
                 previousDirection = "TO_DPU";
                 previousTransferBytes = transferBytes;
                 directionSwitched = false;
             } else {
-                previousTarget = i - 1;
+                previousTarget = apiOrderTargetIndex(condition, i - 1);
                 previousOp = "dpu_copy_to";
                 previousEventRole = "params_control";
                 previousDirection = "TO_DPU";
                 previousTransferBytes = paramsTransferBytes;
                 directionSwitched = false;
             }
-            sameDpuAsPrevious = previousTarget == i;
+            sameDpuAsPrevious = previousTarget == targetIndex;
             sameRankAsPrevious = dpuList[previousTarget].rankOrdinal
-                == dpuList[i].rankOrdinal;
+                == dpuList[targetIndex].rankOrdinal;
 
             fprintf(
                 output,
                 "%s,%" PRIu64 ",%u,%u,%u,%" PRIu64 ",%u,%s,%s,%u,%u,%u,"
-                "%u,%u,%u,%u,dpu_copy_to,TO_DPU,SINGLE_COPY,"
+                "%u,%u,%u,%u,%u,rank:%u/slice:%u/member:%u,%u,%u,"
+                "dpu_copy_to,TO_DPU,SINGLE_COPY,"
                 "SHARED_REPLICATION,MRAM,%u,1,1,1,%u,1,CONTROLLED_API_ORDER_PROBE,"
                 "SHARED_FIXED_BUFFER,1,0x%" PRIxPTR ",0x%016" PRIx64
                 ",%u,ZERO_WRITTEN,%s,%s,%s,%u,%u,%u,%u,%u,%u,"
@@ -442,20 +494,29 @@ static bool runOneApiOrderCondition(
                 config->runId, config->processRepeat, configuredDpus,
                 NR_TASKLETS, actualRanks, sampleIndex, orderIndex,
                 apiOrderConditionName(condition), apiOrderClass(condition), i,
-                configuredDpus, dpuList[i].globalDpuId,
-                dpuList[i].rankOrdinal, dpuList[i].dpuIdInRank,
+                configuredDpus, dpuList[targetIndex].globalDpuId,
+                dpuList[targetIndex].rankOrdinal,
+                dpuList[targetIndex].dpuIdInRank,
+                dpuList[targetIndex].physicalRankId,
+                dpuList[targetIndex].sliceId,
+                dpuList[targetIndex].memberId,
+                dpuList[targetIndex].physicalRankId,
+                dpuList[targetIndex].sliceId,
+                dpuList[targetIndex].memberId,
                 rankBoundary ? 1U : 0U, sameRankAsPrevious ? 1U : 0U,
-                transferBytes, dpuList[i].frontierOffset,
+                transferBytes, dpuList[targetIndex].frontierOffset,
                 (uintptr_t)sourceBuffer, sourceContentHash,
                 API_ORDER_BUFFER_ALIGNMENT, previousOp, previousEventRole,
                 previousDirection, previousTransferBytes, previousTarget,
                 sameDpuAsPrevious ? 1U : 0U,
                 directionSwitched ? 1U : 0U, paramsTransferBytes,
                 interleavedParams ? 1U : 0U, predecessorD2hGroupNs,
-                sourcePretouchEndNs - sourcePretouchStartNs, gapNs[i],
+                sourcePretouchEndNs - sourcePretouchStartNs,
+                gapNs[targetIndex],
                 sequenceStartNs, sequenceEndNs,
-                sequenceEndNs - sequenceStartNs, callStartNs[i], callEndNs[i],
-                callEndNs[i] - callStartNs[i], frontierSumNs
+                sequenceEndNs - sequenceStartNs, callStartNs[targetIndex],
+                callEndNs[targetIndex],
+                callEndNs[targetIndex] - callStartNs[targetIndex], frontierSumNs
             );
         }
     }
@@ -547,6 +608,8 @@ bool bfsRunApiOrderProbe(
         "run_id,process_repeat,configured_dpus,num_tasklets,actual_ranks,"
         "sample_index,order_index,condition,api_order_class,group_index,"
         "group_size,target_global_dpu_id,rank_ordinal,dpu_id_in_rank,"
+        "sdk_physical_rank_id,sdk_slice_id,sdk_member_id,"
+        "physical_dpu_identity,"
         "rank_boundary_before,same_rank_as_previous_sdk_event,op,direction,"
         "sdk_api_kind,logical_distribution_class,target_space,"
         "transfer_bytes_per_dpu,active_dpus,active_ranks,"

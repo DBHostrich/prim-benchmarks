@@ -2,7 +2,7 @@
 
 该实验固定 measured frontier copy 的 transport key，只改变前后 SDK 调用顺序。
 
-四种条件如下：
+五种条件如下：
 
 ```text
 CONTIGUOUS_FRONTIER_GROUP
@@ -15,6 +15,12 @@ VISITED_FRONTIER_PARAMS_PER_DPU
 FRONTIER_PARAMS_PER_DPU
   measured frontier[0] -> params[0]
   measured frontier[1] -> params[1]
+
+PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU
+  measured frontier[1] -> params[1]
+  measured frontier[0] -> params[0]
+  measured frontier[3] -> params[3]
+  measured frontier[2] -> params[2]
 
 D2H_MERGE_FRONTIER_PARAMS_PER_DPU
   完整 D2H frontier readback + CPU OR
@@ -40,6 +46,10 @@ same_source_across_group=1
 同一进程内的 source pointer、内容哈希和 4KB alignment 保持一致。每个 DPU 的
 measured target 固定为 `dpuNextFrontier_m`，每轮开始前写入零值。params 控制传输
 使用 8 B 对齐后的 48 B 物理大小。
+
+CSV 同时记录 physical rank ID、SDK slice ID 和 member ID。pair-reversed 条件要求
+相邻两个 SDK DPU 属于同一 physical rank 和 slice，并且 member ID 构成偶数、奇数
+相邻对。
 
 时间字段分为两个口径：
 
@@ -94,7 +104,7 @@ per_dpu_paired_effects.csv
 analysis.log
 ```
 
-四项 paired effect 使用相同进程、sample 和 DPU 进行配对：
+五项 paired effect 使用相同进程、sample 和 DPU 进行配对：
 
 ```text
 PARAMS_INTERLEAVING_EFFECT
@@ -103,6 +113,9 @@ PARAMS_INTERLEAVING_EFFECT
 VISITED_PREDECESSOR_EFFECT
   VISITED_FRONTIER_PARAMS_PER_DPU - FRONTIER_PARAMS_PER_DPU
 
+PAIR_REVERSED_ORDER_EFFECT
+  PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU - FRONTIER_PARAMS_PER_DPU
+
 D2H_GROUP_HISTORY_EFFECT
   D2H_MERGE_FRONTIER_PARAMS_PER_DPU - FRONTIER_PARAMS_PER_DPU
 
@@ -110,5 +123,6 @@ ITERATIVE_VS_INIT_ORDER_EFFECT
   D2H_MERGE_FRONTIER_PARAMS_PER_DPU - VISITED_FRONTIER_PARAMS_PER_DPU
 ```
 
-前三项分别量化 params 穿插、同 DPU visited 前驱和整组 D2H 加 CPU OR 历史。
-第四项保留真实迭代式顺序与初始化式顺序的直接比较。
+`PAIR_REVERSED_ORDER_EFFECT` 检验加速跟随物理 member 奇偶身份，还是跟随每个
+相邻 pair 中的第一、第二访问位置。其余效应继续量化 params 穿插、visited 前驱、
+D2H 历史以及真实迭代式顺序与初始化式顺序的差值。

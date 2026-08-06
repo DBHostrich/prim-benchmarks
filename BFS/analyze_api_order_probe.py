@@ -16,6 +16,7 @@ CONDITIONS = (
     "CONTIGUOUS_FRONTIER_GROUP",
     "VISITED_FRONTIER_PARAMS_PER_DPU",
     "FRONTIER_PARAMS_PER_DPU",
+    "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU",
     "D2H_MERGE_FRONTIER_PARAMS_PER_DPU",
 )
 COMPARISONS = (
@@ -27,6 +28,11 @@ COMPARISONS = (
     (
         "VISITED_PREDECESSOR_EFFECT",
         "VISITED_FRONTIER_PARAMS_PER_DPU",
+        "FRONTIER_PARAMS_PER_DPU",
+    ),
+    (
+        "PAIR_REVERSED_ORDER_EFFECT",
+        "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU",
         "FRONTIER_PARAMS_PER_DPU",
     ),
     (
@@ -55,6 +61,10 @@ REQUIRED_FIELDS = {
     "target_global_dpu_id",
     "rank_ordinal",
     "dpu_id_in_rank",
+    "sdk_physical_rank_id",
+    "sdk_slice_id",
+    "sdk_member_id",
+    "physical_dpu_identity",
     "rank_boundary_before",
     "same_rank_as_previous_sdk_event",
     "op",
@@ -98,16 +108,23 @@ REQUIRED_FIELDS = {
 }
 
 
+def _expected_target(condition: str, index: int) -> int:
+    if condition == "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU":
+        return index ^ 1
+    return index
+
+
 def _expected_previous(
     condition: str, index: int, group_size: int, transfer_bytes: int
 ) -> tuple[str, str, str, int, int, int, int]:
     if condition == "VISITED_FRONTIER_PARAMS_PER_DPU":
+        target = _expected_target(condition, index)
         return (
             "dpu_copy_to",
             "visited_control",
             "TO_DPU",
             transfer_bytes,
-            index,
+            target,
             1,
             0,
         )
@@ -137,7 +154,7 @@ def _expected_previous(
             "measured_frontier",
             "TO_DPU",
             transfer_bytes,
-            index - 1,
+            _expected_target(condition, index - 1),
             0,
             0,
         )
@@ -146,7 +163,7 @@ def _expected_previous(
         "params_control",
         "TO_DPU",
         48,
-        index - 1,
+        _expected_target(condition, index - 1),
         0,
         0,
     )
@@ -156,7 +173,7 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen_trace_keys: set[tuple[str, str]] = set()
     hashes_by_size: dict[str, set[str]] = defaultdict(set)
-    topology_reference: dict[str, tuple[str, str, str]] = {}
+    topology_reference: dict[str, tuple[str, ...]] = {}
 
     for path in paths:
         with path.open(newline="") as handle:
@@ -252,6 +269,9 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 "CONTIGUOUS_FRONTIER_GROUP": "CONTIGUOUS_CONTROL",
                 "VISITED_FRONTIER_PARAMS_PER_DPU": "INIT_LIKE_ORDER",
                 "FRONTIER_PARAMS_PER_DPU": "PARAMS_INTERLEAVED_CONTROL",
+                "PAIR_REVERSED_FRONTIER_PARAMS_PER_DPU": (
+                    "PAIR_REVERSED_CONTROL"
+                ),
                 "D2H_MERGE_FRONTIER_PARAMS_PER_DPU": "ITERATIVE_LIKE_ORDER",
             }[row["condition"]]
             if row["api_order_class"] != expected_order_class:
@@ -275,11 +295,20 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
             topology = (
                 row["rank_ordinal"],
                 row["dpu_id_in_rank"],
+                row["sdk_physical_rank_id"],
+                row["sdk_slice_id"],
+                row["sdk_member_id"],
                 row["offset_bytes"],
             )
             previous_topology = topology_reference.setdefault(global_id, topology)
             if topology != previous_topology:
                 raise ValueError(f"{path}: topology or frontier offset changed")
+            expected_identity = (
+                f"rank:{row['sdk_physical_rank_id']}/"
+                f"slice:{row['sdk_slice_id']}/member:{row['sdk_member_id']}"
+            )
+            if row["physical_dpu_identity"] != expected_identity:
+                raise ValueError(f"{path}: physical DPU identity changed")
 
             by_group[(sample, row["condition"])].append(row)
             by_sample[sample].add(row["condition"])
@@ -302,10 +331,17 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                 range(group_size)
             ):
                 raise ValueError(f"{path}: group indexes changed")
-            if [int(row["target_global_dpu_id"]) for row in ordered] != list(
-                range(group_size)
+            expected_targets = [
+                _expected_target(condition, index)
+                for index in range(group_size)
+            ]
+            if [int(row["target_global_dpu_id"]) for row in ordered] != (
+                expected_targets
             ):
                 raise ValueError(f"{path}: measured DPU order changed")
+            rows_by_target = {
+                int(row["target_global_dpu_id"]): row for row in ordered
+            }
             common_fields = (
                 "sequence_start_ns",
                 "sequence_end_ns",
@@ -348,7 +384,8 @@ def read_and_validate(paths: list[Path]) -> list[dict[str, str]]:
                     raise ValueError(f"{path}: D2H predecessor label changed")
                 previous_target = int(row["previous_target_global_dpu_id"])
                 expected_same_rank = (
-                    ordered[previous_target]["rank_ordinal"] == row["rank_ordinal"]
+                    rows_by_target[previous_target]["rank_ordinal"]
+                    == row["rank_ordinal"]
                 )
                 if int(row["same_rank_as_previous_sdk_event"]) != int(
                     expected_same_rank
@@ -426,6 +463,9 @@ def summarize_conditions(
                     row["target_global_dpu_id"],
                     row["rank_ordinal"],
                     row["dpu_id_in_rank"],
+                    row["sdk_physical_rank_id"],
+                    row["sdk_slice_id"],
+                    row["sdk_member_id"],
                     row["group_index"],
                 ]
             )
@@ -458,10 +498,13 @@ def summarize_conditions(
                     "target_global_dpu_id": key[cursor],
                     "rank_ordinal": key[cursor + 1],
                     "dpu_id_in_rank": key[cursor + 2],
-                    "group_index": key[cursor + 3],
+                    "sdk_physical_rank_id": key[cursor + 3],
+                    "sdk_slice_id": key[cursor + 4],
+                    "sdk_member_id": key[cursor + 5],
+                    "group_index": key[cursor + 6],
                 }
             )
-            cursor += 4
+            cursor += 7
         else:
             row.update(
                 {
@@ -488,8 +531,9 @@ def summarize_pairs(
 ) -> list[dict[str, object]]:
     measurements = rows if per_dpu else group_measurements(rows)
     value_field = "measured_ns" if per_dpu else "frontier_sum_ns"
-    paired: dict[tuple[str, ...], dict[str, int]] = defaultdict(dict)
-    metadata: dict[tuple[str, ...], dict[str, str]] = {}
+    paired: dict[
+        tuple[str, ...], dict[str, tuple[int, dict[str, str]]]
+    ] = defaultdict(dict)
     for row in measurements:
         key_parts = [
             row["_trace_file"],
@@ -499,17 +543,17 @@ def summarize_pairs(
         if per_dpu:
             key_parts.append(row["target_global_dpu_id"])
         key = tuple(key_parts)
-        paired[key][row["condition"]] = int(row[value_field])
-        metadata[key] = row
+        paired[key][row["condition"]] = (int(row[value_field]), row)
 
     grouped: dict[tuple[str, ...], list[tuple[float, float]]] = defaultdict(list)
     for key, values in paired.items():
         if set(values) != set(CONDITIONS):
             raise ValueError(f"incomplete paired conditions for {key}")
-        row = metadata[key]
         for effect, lhs, rhs in COMPARISONS:
-            delta = float(values[lhs] - values[rhs])
-            delta_pct = 0.0 if values[rhs] == 0 else delta / values[rhs] * 100.0
+            lhs_value = values[lhs][0]
+            rhs_value, row = values[rhs]
+            delta = float(lhs_value - rhs_value)
+            delta_pct = 0.0 if rhs_value == 0 else delta / rhs_value * 100.0
             group_key = [row["configured_dpus"], row["num_tasklets"]]
             if per_dpu:
                 group_key.extend(
@@ -517,6 +561,9 @@ def summarize_pairs(
                         row["target_global_dpu_id"],
                         row["rank_ordinal"],
                         row["dpu_id_in_rank"],
+                        row["sdk_physical_rank_id"],
+                        row["sdk_slice_id"],
+                        row["sdk_member_id"],
                         row["group_index"],
                     ]
                 )
@@ -543,10 +590,13 @@ def summarize_pairs(
                     "target_global_dpu_id": key[cursor],
                     "rank_ordinal": key[cursor + 1],
                     "dpu_id_in_rank": key[cursor + 2],
-                    "group_index": key[cursor + 3],
+                    "sdk_physical_rank_id": key[cursor + 3],
+                    "sdk_slice_id": key[cursor + 4],
+                    "sdk_member_id": key[cursor + 5],
+                    "group_index": key[cursor + 6],
                 }
             )
-            cursor += 4
+            cursor += 7
         else:
             row.update(
                 {
