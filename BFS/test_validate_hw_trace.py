@@ -452,7 +452,7 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v3;op=dpu_copy_to;direction=TO_DPU;"
+                "v4;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
@@ -460,12 +460,8 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 "rank_ordinal=0;dpu_id_in_rank=17;"
                 "same_source_across_group=1;sdk_slice_id=2;sdk_member_id=1;"
                 "previous_dpu_direction=FROM_DPU;"
-                "previous_dpu_transfer_bytes=24576;"
                 "previous_dpu_target_relation=SAME_REGION;"
-                "launches_since_previous_dpu_transfer=0;"
                 "target_region_reuse_class=REUSED_REGION;"
-                "host_buffer_page_offset=0;"
-                "host_buffer_reuse_class=SAME_DIRECTION_REUSE;"
                 "host_numa_node=0",
             )
             self.assertNotIn("phase_class=", row["transport_key"])

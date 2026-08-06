@@ -13,6 +13,7 @@ from pathlib import Path
 from transport_key import (
     TRANSFER_OPS,
     transport_key,
+    transport_key_with_full_context,
     transport_key_with_phase,
     transport_key_without_phase,
 )
@@ -45,6 +46,9 @@ def analyze(
     phase_groups: dict[
         str, list[tuple[Path, dict[str, str]]]
     ] = defaultdict(list)
+    full_context_groups: dict[
+        str, list[tuple[Path, dict[str, str]]]
+    ] = defaultdict(list)
     transfer_rows = 0
 
     for path in paths:
@@ -56,15 +60,17 @@ def analyze(
             if row["op"] not in TRANSFER_OPS:
                 continue
             expected_key = transport_key(row)
-            if row["transport_key"] != expected_key:
+            full_context_key = transport_key_with_full_context(row)
+            if row["transport_key"] not in {expected_key, full_context_key}:
                 raise ValueError(
                     f"{path}: event {row.get('event_id', '?')} has invalid "
                     "transport_key"
                 )
             transfer_rows += 1
-            groups[row["transport_key"]].append((path, row))
+            groups[expected_key].append((path, row))
             baseline_groups[transport_key_without_phase(row)].append((path, row))
             phase_groups[transport_key_with_phase(row)].append((path, row))
+            full_context_groups[full_context_key].append((path, row))
 
     summaries: list[dict[str, object]] = []
     for key, samples in sorted(groups.items()):
@@ -290,16 +296,20 @@ def analyze(
 
     baseline_key_pct, baseline_event_pct = stable_percentages(baseline_groups)
     phase_key_pct, phase_event_pct = stable_percentages(phase_groups)
+    full_context_key_pct, full_context_event_pct = stable_percentages(
+        full_context_groups
+    )
     mixed_phase_hardware_groups = sum(
         len({row["phase_class"] for _, row in samples}) > 1
         for samples in groups.values()
     )
     overview: dict[str, object] = {
-        "transport_key_version": "v3_hardware_context",
+        "transport_key_version": "v4_history_min",
         "trace_files": len(paths),
         "transfer_rows": transfer_rows,
         "transport_key_groups": len(summaries),
         "phase_v2_groups": len(phase_groups),
+        "full_context_v3_groups": len(full_context_groups),
         "baseline_12_field_groups": len(baseline_groups),
         "hardware_groups_mixing_phase_classes": mixed_phase_hardware_groups,
         "stable_groups": status_counts["stable"],
@@ -312,6 +322,12 @@ def analyze(
         "stable_event_pct": f"{stable_event_pct:.3f}",
         "phase_v2_stable_transport_key_pct": f"{phase_key_pct:.3f}",
         "phase_v2_stable_event_pct": f"{phase_event_pct:.3f}",
+        "full_context_v3_stable_transport_key_pct": (
+            f"{full_context_key_pct:.3f}"
+        ),
+        "full_context_v3_stable_event_pct": (
+            f"{full_context_event_pct:.3f}"
+        ),
         "baseline_12_field_stable_transport_key_pct": f"{baseline_key_pct:.3f}",
         "baseline_12_field_stable_event_pct": f"{baseline_event_pct:.3f}",
         "min_samples": min_samples,

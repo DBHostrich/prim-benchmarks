@@ -368,27 +368,21 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v3;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v4;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
         "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
         "sdk_slice_id=%u;sdk_member_id=%u;"
-        "previous_dpu_direction=%s;previous_dpu_transfer_bytes=%" PRIu64
-        ";previous_dpu_target_relation=%s;"
-        "launches_since_previous_dpu_transfer=%" PRIu64
-        ";target_region_reuse_class=%s;host_buffer_page_offset=%" PRIu64
-        ";host_buffer_reuse_class=%s;host_numa_node=%s",
+        "previous_dpu_direction=%s;previous_dpu_target_relation=%s;"
+        "target_region_reuse_class=%s;host_numa_node=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
         event->transferBytes, trace->rankOrdinals[event->globalDpuId],
         trace->dpuIdsInRank[event->globalDpuId], sameSource,
         trace->sdkSliceIds[event->globalDpuId],
         trace->sdkMemberIds[event->globalDpuId],
-        context->previousDpuDirection, context->previousDpuTransferBytes,
-        context->previousDpuTargetRelation,
-        context->launchesSincePreviousDpuTransfer,
-        context->targetRegionReuseClass, context->hostBufferPageOffset,
-        context->hostBufferReuseClass, trace->hostNumaNode
+        context->previousDpuDirection, context->previousDpuTargetRelation,
+        context->targetRegionReuseClass, trace->hostNumaNode
     );
     return result >= 0 && (size_t)result < outputSize;
 }

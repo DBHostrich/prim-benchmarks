@@ -22,7 +22,15 @@ BASE_TRANSPORT_KEY_FIELDS = (
     "same_source_across_group",
 )
 PHASE_TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + ("phase_class",)
-HARDWARE_CONTEXT_FIELDS = (
+HISTORY_MIN_FIELDS = (
+    "sdk_slice_id",
+    "sdk_member_id",
+    "previous_dpu_direction",
+    "previous_dpu_target_relation",
+    "target_region_reuse_class",
+    "host_numa_node",
+)
+FULL_HARDWARE_CONTEXT_FIELDS = (
     "sdk_slice_id",
     "sdk_member_id",
     "previous_dpu_direction",
@@ -34,7 +42,7 @@ HARDWARE_CONTEXT_FIELDS = (
     "host_buffer_reuse_class",
     "host_numa_node",
 )
-TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + HARDWARE_CONTEXT_FIELDS
+TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + HISTORY_MIN_FIELDS
 SHARED_SOURCE_SUBOPS = {
     "visited_init",
     "frontier_init",
@@ -123,9 +131,16 @@ def call_context(row: Mapping[str, str]) -> str:
 def transport_key(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
-    return "v3;" + ";".join(
+    return "v4;" + ";".join(
         f"{name}={row[name]}" for name in TRANSPORT_KEY_FIELDS
     )
+
+
+def transport_key_with_full_context(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    fields = BASE_TRANSPORT_KEY_FIELDS + FULL_HARDWARE_CONTEXT_FIELDS
+    return "v3;" + ";".join(f"{name}={row[name]}" for name in fields)
 
 
 def transport_key_with_phase(row: Mapping[str, str]) -> str:
