@@ -99,7 +99,7 @@ class TransportKeyEvaluationTest(unittest.TestCase):
                 float(mux_domain["p90_abs_pct_error"]),
                 float(base["p90_abs_pct_error"]),
             )
-            self.assertEqual(len(per_trace), 36)
+            self.assertEqual(len(per_trace), 42)
 
     def test_can_hold_out_one_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -124,6 +124,8 @@ class TransportKeyEvaluationTest(unittest.TestCase):
                 ]
                 for row in rows:
                     row["configured_dpus"] = configured_dpus
+                    if configured_dpus == "128":
+                        row["rank_ordinal"] = "1"
                 self.write_rows(path, rows)
                 paths.append(path)
 
@@ -131,13 +133,14 @@ class TransportKeyEvaluationTest(unittest.TestCase):
             domain = next(
                 row
                 for row in summary
-                if row["model"] == "mux_domain_rank_invariant"
+                if row["model"] == "mux_domain_hierarchical"
                 and row["scope"] == "BASE12_PHASE_MIXED"
             )
             self.assertEqual(domain["holdout_unit"], "configuration")
             self.assertEqual(domain["holdout_groups"], 2)
             self.assertEqual(domain["coverage_pct"], "100.000000")
-            self.assertEqual(len(per_holdout), 24)
+            self.assertEqual(domain["fallback_predicted_pct"], "100.000000")
+            self.assertEqual(len(per_holdout), 28)
 
 
 if __name__ == "__main__":

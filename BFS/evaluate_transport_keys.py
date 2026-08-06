@@ -23,14 +23,18 @@ from transport_key import (
 
 
 MODEL_KEYS = {
-    "base12": transport_key_without_phase,
-    "phase_v2": transport_key_with_phase,
-    "mux_relation_min": transport_key_with_mux_relation_min,
-    "mux_domain_min": transport_key_with_mux_domain_min,
+    "base12": (transport_key_without_phase,),
+    "phase_v2": (transport_key_with_phase,),
+    "mux_relation_min": (transport_key_with_mux_relation_min,),
+    "mux_domain_min": (transport_key_with_mux_domain_min,),
     "mux_domain_rank_invariant": (
-        transport_key_with_mux_domain_rank_invariant
+        transport_key_with_mux_domain_rank_invariant,
     ),
-    "v6_full": transport_key,
+    "mux_domain_hierarchical": (
+        transport_key_with_mux_domain_min,
+        transport_key_with_mux_domain_rank_invariant,
+    ),
+    "v6_full": (transport_key,),
 }
 SCOPES = ("ALL_TRANSFER_EVENTS", "BASE12_PHASE_MIXED")
 ERROR_FIELDS = (
@@ -149,26 +153,32 @@ def evaluate(
     }
 
     pooled: dict[
-        tuple[str, str], tuple[list[int], list[float], int]
+        tuple[str, str], tuple[list[int], list[float], int, int]
     ] = {
-        (model, scope): ([], [], 0)
+        (model, scope): ([], [], 0, 0)
         for model in MODEL_KEYS
         for scope in SCOPES
     }
     per_holdout: list[dict[str, object]] = []
 
-    for model, key_function in MODEL_KEYS.items():
+    for model, key_functions in MODEL_KEYS.items():
         for held_out_group, held_out_paths in sorted(holdout_groups.items()):
-            training: dict[str, list[int]] = defaultdict(list)
-            for path, rows in traces.items():
-                if path in held_out_paths:
-                    continue
-                for row in rows:
-                    training[key_function(row)].append(int(row["measured_ns"]))
-            lookup = {
-                key: float(statistics.median(durations))
-                for key, durations in training.items()
-            }
+            lookups = []
+            for key_function in key_functions:
+                training: dict[str, list[int]] = defaultdict(list)
+                for path, rows in traces.items():
+                    if path in held_out_paths:
+                        continue
+                    for row in rows:
+                        training[key_function(row)].append(
+                            int(row["measured_ns"])
+                        )
+                lookups.append(
+                    {
+                        key: float(statistics.median(durations))
+                        for key, durations in training.items()
+                    }
+                )
 
             for scope in SCOPES:
                 test_rows = [
@@ -180,22 +190,36 @@ def evaluate(
                 ]
                 actual = []
                 predicted = []
+                fallback_predictions = 0
                 for row in test_rows:
-                    estimate = lookup.get(key_function(row))
+                    estimate = None
+                    matched_level = 0
+                    for level, (key_function, lookup) in enumerate(
+                        zip(key_functions, lookups)
+                    ):
+                        estimate = lookup.get(key_function(row))
+                        if estimate is not None:
+                            matched_level = level
+                            break
                     if estimate is None:
                         continue
                     actual.append(int(row["measured_ns"]))
                     predicted.append(estimate)
+                    fallback_predictions += int(matched_level > 0)
 
-                pooled_actual, pooled_predicted, pooled_total = pooled[
-                    (model, scope)
-                ]
+                (
+                    pooled_actual,
+                    pooled_predicted,
+                    pooled_total,
+                    pooled_fallback,
+                ) = pooled[(model, scope)]
                 pooled_actual.extend(actual)
                 pooled_predicted.extend(predicted)
                 pooled[(model, scope)] = (
                     pooled_actual,
                     pooled_predicted,
                     pooled_total + len(test_rows),
+                    pooled_fallback + fallback_predictions,
                 )
                 row_summary: dict[str, object] = {
                     "model": model,
@@ -203,9 +227,20 @@ def evaluate(
                     "holdout_unit": holdout_unit,
                     "held_out_group": held_out_group,
                     "held_out_trace_count": len(held_out_paths),
-                    "training_key_count": len(lookup),
+                    "training_primary_key_count": len(lookups[0]),
+                    "training_fallback_key_count": (
+                        len(lookups[1]) if len(lookups) > 1 else 0
+                    ),
                     "evaluation_rows": len(test_rows),
                     "predicted_rows": len(predicted),
+                    "fallback_predicted_rows": fallback_predictions,
+                    "fallback_predicted_pct": (
+                        "0.000000"
+                        if not predicted
+                        else (
+                            f"{100.0 * fallback_predictions / len(predicted):.6f}"
+                        )
+                    ),
                     "coverage_pct": (
                         "0.000000"
                         if not test_rows
@@ -220,7 +255,9 @@ def evaluate(
     summary: list[dict[str, object]] = []
     for model in MODEL_KEYS:
         for scope in SCOPES:
-            actual, predicted, total = pooled[(model, scope)]
+            actual, predicted, total, fallback_predictions = pooled[
+                (model, scope)
+            ]
             row: dict[str, object] = {
                 "model": model,
                 "scope": scope,
@@ -229,6 +266,14 @@ def evaluate(
                 "trace_files": len(paths),
                 "evaluation_rows": total,
                 "predicted_rows": len(predicted),
+                "fallback_predicted_rows": fallback_predictions,
+                "fallback_predicted_pct": (
+                    "0.000000"
+                    if not predicted
+                    else (
+                        f"{100.0 * fallback_predictions / len(predicted):.6f}"
+                    )
+                ),
                 "coverage_pct": (
                     "0.000000"
                     if total == 0
@@ -283,6 +328,7 @@ def main() -> int:
         print(
             f"model={row['model']} scope={row['scope']} "
             f"rows={row['evaluation_rows']} coverage_pct={row['coverage_pct']} "
+            f"fallback_pct={row['fallback_predicted_pct']} "
             f"median_ape_pct={row.get('median_abs_pct_error', '')} "
             f"p90_ape_pct={row.get('p90_abs_pct_error', '')} "
             f"mean_ape_pct={row.get('mean_abs_pct_error', '')} "
