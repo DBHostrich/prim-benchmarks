@@ -44,6 +44,116 @@ static bool isLabelAtom(const char* value) {
     return true;
 }
 
+struct BfsPhysicalRankTopology {
+    uint32_t sysfsRankId;
+    uint32_t sdkRankId;
+    uint32_t numaNode;
+    uint32_t channelId;
+};
+
+static bool lookupPhysicalRankTopology(
+    const char* path,
+    uint32_t sdkRankId,
+    struct BfsPhysicalRankTopology* topology
+) {
+    FILE* fp = fopen(path, "r");
+    char line[1024];
+    uint32_t matches = 0;
+
+    if(fp == NULL) {
+        fprintf(stderr, "Could not open DPU rank topology %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    while(fgets(line, sizeof(line), fp) != NULL) {
+        char rankPath[256];
+        char status[32];
+        uint32_t sysfsRankId;
+        uint32_t rowSdkRankId;
+        uint32_t numaNode;
+        uint32_t channelId;
+        uint32_t ciCount;
+        uint32_t dpusPerCi;
+        uint32_t dpusPerRank;
+        uint64_t mramPerDpu;
+        uint64_t mramPerRank;
+        int parsed;
+
+        if(strncmp(line, "rank_path", strlen("rank_path")) == 0) {
+            continue;
+        }
+        parsed = sscanf(
+            line,
+            "%255s %" SCNu32 " %" SCNu32 " %" SCNu32 " %" SCNu32
+            " %" SCNu32 " %" SCNu32 " %" SCNu32 " %" SCNu64
+            " %" SCNu64 " %31s",
+            rankPath, &sysfsRankId, &rowSdkRankId, &numaNode, &channelId,
+            &ciCount, &dpusPerCi, &dpusPerRank, &mramPerDpu,
+            &mramPerRank, status
+        );
+        if(parsed == EOF || parsed == 0) {
+            continue;
+        }
+        if(parsed != 11) {
+            fprintf(stderr, "Malformed DPU rank topology row: %s", line);
+            fclose(fp);
+            return false;
+        }
+        if(rowSdkRankId != sdkRankId) {
+            continue;
+        }
+        if(strcmp(status, "ok") != 0 || ciCount != 8 || dpusPerCi != 8
+           || dpusPerRank != 64) {
+            fprintf(stderr,
+                    "Unsupported topology for SDK rank %" PRIu32
+                    ": status=%s ci=%" PRIu32 " dpus_per_ci=%" PRIu32
+                    " dpus_per_rank=%" PRIu32 "\n",
+                    sdkRankId, status, ciCount, dpusPerCi, dpusPerRank);
+            fclose(fp);
+            return false;
+        }
+        topology->sysfsRankId = sysfsRankId;
+        topology->sdkRankId = rowSdkRankId;
+        topology->numaNode = numaNode;
+        topology->channelId = channelId;
+        ++matches;
+    }
+    if(ferror(fp)) {
+        fprintf(stderr, "Could not read DPU rank topology %s: %s\n",
+                path, strerror(errno));
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+    if(matches != 1) {
+        fprintf(stderr,
+                "DPU rank topology has %" PRIu32
+                " rows for allocated SDK rank %" PRIu32 "\n",
+                matches, sdkRankId);
+        return false;
+    }
+    return true;
+}
+
+static const char* cpuDpuNumaRelation(
+    const struct BfsHostTrace* trace,
+    uint32_t globalDpuId
+) {
+    char* end = NULL;
+    unsigned long hostNuma;
+
+    if(strcmp(trace->hostNumaNode, "unbound") == 0) {
+        return "UNBOUND";
+    }
+    errno = 0;
+    hostNuma = strtoul(trace->hostNumaNode, &end, 10);
+    if(errno != 0 || end == trace->hostNumaNode || *end != '\0') {
+        return "UNKNOWN";
+    }
+    return hostNuma == trace->dpuRankNumaNodes[globalDpuId]
+        ? "LOCAL" : "REMOTE";
+}
+
 static size_t opSlot(const char* op) {
     if(strcmp(op, "dpu_alloc") == 0) {
         return 0;
@@ -391,16 +501,24 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v7;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v8;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
-        "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
+        "same_source_across_group=%s;host_numa_node=%s;"
+        "dpu_rank_numa_node=%u;cpu_dpu_numa_relation=%s;"
+        "dpu_channel_id=%u;dpu_sysfs_rank_id=%u;"
+        "dpu_ci_id=%u;dpu_member_id=%u;"
         "allocated_dpus=%u;allocated_ranks=%u;"
         "previous_sdk_mux_domain_class=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
-        event->transferBytes, trace->rankOrdinals[event->globalDpuId],
-        trace->dpuIdsInRank[event->globalDpuId], sameSource,
+        event->transferBytes, sameSource, trace->hostNumaNode,
+        trace->dpuRankNumaNodes[event->globalDpuId],
+        cpuDpuNumaRelation(trace, event->globalDpuId),
+        trace->dpuChannelIds[event->globalDpuId],
+        trace->dpuSysfsRankIds[event->globalDpuId],
+        trace->sdkSliceIds[event->globalDpuId],
+        trace->sdkMemberIds[event->globalDpuId],
         trace->configuredDpus, trace->actualRanks,
         muxDomainClass(context->previousSdkTopologyRelation)
     );
@@ -473,12 +591,14 @@ bool bfsHostTraceInit(
     const char* hostNumaNode = getenv("BFS_TRACE_HOST_NUMA_NODE");
     const char* processState = getenv("BFS_TRACE_PROCESS_STATE");
     const char* pretraceWarmupRuns = getenv("BFS_TRACE_PREWARM_RUNS");
+    const char* rankTopologyPath = getenv("BFS_TRACE_DPU_RANK_TOPOLOGY_TSV");
     struct dpu_set_t rank = {0};
     struct dpu_set_t dpu = {0};
     struct dpu_rank_t* sdkRank;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
+    struct BfsPhysicalRankTopology physicalRankTopology;
 
     memset(trace, 0, sizeof(*trace));
     if(!bfsHostTraceRequested()) {
@@ -503,6 +623,11 @@ bool bfsHostTraceInit(
         fprintf(stderr, "BFS trace NUMA/process label contains unsupported characters\n");
         return false;
     }
+    if(rankTopologyPath == NULL || rankTopologyPath[0] == '\0') {
+        fprintf(stderr,
+                "BFS_TRACE_DPU_RANK_TOPOLOGY_TSV is required for physical topology labels\n");
+        return false;
+    }
     if(dpu_get_nr_ranks(dpuSet, &trace->actualRanks) != DPU_OK) {
         fprintf(stderr, "Could not query the allocated rank count\n");
         return false;
@@ -513,6 +638,15 @@ bool bfsHostTraceInit(
     trace->sdkPhysicalRankIds = calloc(
         configuredDpus, sizeof(*trace->sdkPhysicalRankIds)
     );
+    trace->dpuSysfsRankIds = calloc(
+        configuredDpus, sizeof(*trace->dpuSysfsRankIds)
+    );
+    trace->dpuRankNumaNodes = calloc(
+        configuredDpus, sizeof(*trace->dpuRankNumaNodes)
+    );
+    trace->dpuChannelIds = calloc(
+        configuredDpus, sizeof(*trace->dpuChannelIds)
+    );
     trace->sdkSliceIds = calloc(configuredDpus, sizeof(*trace->sdkSliceIds));
     trace->sdkMemberIds = calloc(configuredDpus, sizeof(*trace->sdkMemberIds));
     trace->dpuCopyToCallCounts = calloc(configuredDpus,
@@ -522,6 +656,8 @@ bool bfsHostTraceInit(
     trace->events = calloc(trace->capacity, sizeof(*trace->events));
     if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
        || trace->sdkPhysicalRankIds == NULL
+       || trace->dpuSysfsRankIds == NULL
+       || trace->dpuRankNumaNodes == NULL || trace->dpuChannelIds == NULL
        || trace->sdkSliceIds == NULL || trace->sdkMemberIds == NULL
        || trace->dpuCopyToCallCounts == NULL
        || trace->dpuCopyFromCallCounts == NULL || trace->events == NULL) {
@@ -537,6 +673,12 @@ bool bfsHostTraceInit(
             bfsHostTraceDestroy(trace);
             return false;
         }
+        if(!lookupPhysicalRankTopology(
+               rankTopologyPath, dpu_get_rank_id(sdkRank),
+               &physicalRankTopology)) {
+            bfsHostTraceDestroy(trace);
+            return false;
+        }
         DPU_FOREACH(rank, dpu, dpuIdInRank) {
             if(globalDpuId >= configuredDpus) {
                 fprintf(stderr, "Allocated DPU topology exceeds configured DPU count\n");
@@ -546,6 +688,12 @@ bool bfsHostTraceInit(
             trace->rankOrdinals[globalDpuId] = rankOrdinal;
             trace->dpuIdsInRank[globalDpuId] = dpuIdInRank;
             trace->sdkPhysicalRankIds[globalDpuId] = dpu_get_rank_id(sdkRank);
+            trace->dpuSysfsRankIds[globalDpuId] =
+                physicalRankTopology.sysfsRankId;
+            trace->dpuRankNumaNodes[globalDpuId] =
+                physicalRankTopology.numaNode;
+            trace->dpuChannelIds[globalDpuId] =
+                physicalRankTopology.channelId;
             trace->sdkSliceIds[globalDpuId] = dpu_get_slice_id(dpu.dpu);
             trace->sdkMemberIds[globalDpuId] = dpu_get_member_id(dpu.dpu);
             ++globalDpuId;
@@ -659,7 +807,9 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
           "op,direction,sdk_api_kind,logical_distribution_class,target_space,"
           "transfer_bytes_per_dpu,active_dpus,active_ranks,active_dpus_per_rank,"
           "rank_ordinal,dpu_id_in_rank,sdk_physical_rank_id,"
-          "sdk_slice_id,sdk_member_id,physical_dpu_identity,"
+          "dpu_sysfs_rank_id,dpu_rank_numa_node,dpu_channel_id,"
+          "sdk_slice_id,sdk_member_id,dpu_ci_id,dpu_member_id,"
+          "physical_dpu_identity,cpu_dpu_numa_relation,"
           "same_source_across_group,phase_class,"
           "subop,bfs_level,global_dpu_id,target_symbol,offset_bytes,offset_feature,"
           "logical_bytes,transfer_bytes,host_buffer_address,"
@@ -690,8 +840,10 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         if(event->hasDpu) {
             snprintf(
                 physicalDpuIdentity, sizeof(physicalDpuIdentity),
-                "rank:%u/slice:%u/member:%u",
-                trace->sdkPhysicalRankIds[event->globalDpuId],
+                "numa:%u/channel:%u/rank:%u/ci:%u/member:%u",
+                trace->dpuRankNumaNodes[event->globalDpuId],
+                trace->dpuChannelIds[event->globalDpuId],
+                trace->dpuSysfsRankIds[event->globalDpuId],
                 trace->sdkSliceIds[event->globalDpuId],
                 trace->sdkMemberIds[event->globalDpuId]
             );
@@ -722,18 +874,29 @@ bool bfsHostTraceWrite(const struct BfsHostTrace* trace) {
         writeCsvString(fp, distributionClass);
         fputc(',', fp);
         if(event->hasDpu) {
-            fprintf(fp, "MRAM,%" PRIu64 ",1,1,1,%u,%u,%u,%u,%u,",
+            fprintf(fp,
+                    "MRAM,%" PRIu64
+                    ",1,1,1,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,",
                     event->transferBytes,
                     trace->rankOrdinals[event->globalDpuId],
                     trace->dpuIdsInRank[event->globalDpuId],
                     trace->sdkPhysicalRankIds[event->globalDpuId],
+                    trace->dpuSysfsRankIds[event->globalDpuId],
+                    trace->dpuRankNumaNodes[event->globalDpuId],
+                    trace->dpuChannelIds[event->globalDpuId],
+                    trace->sdkSliceIds[event->globalDpuId],
+                    trace->sdkMemberIds[event->globalDpuId],
                     trace->sdkSliceIds[event->globalDpuId],
                     trace->sdkMemberIds[event->globalDpuId]);
             writeCsvString(fp, physicalDpuIdentity);
             fputc(',', fp);
+            writeCsvString(
+                fp, cpuDpuNumaRelation(trace, event->globalDpuId)
+            );
+            fputc(',', fp);
             writeCsvString(fp, sameSource);
         } else {
-            fputs(",,,,,,,,,,,", fp);
+            fputs(",,,,,,,,,,,,,,,,,", fp);
         }
         fputc(',', fp);
         writeCsvString(fp, eventPhaseClass);
@@ -809,6 +972,9 @@ void bfsHostTraceDestroy(struct BfsHostTrace* trace) {
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
     free(trace->sdkPhysicalRankIds);
+    free(trace->dpuSysfsRankIds);
+    free(trace->dpuRankNumaNodes);
+    free(trace->dpuChannelIds);
     free(trace->sdkSliceIds);
     free(trace->sdkMemberIds);
     free(trace->dpuCopyToCallCounts);

@@ -42,6 +42,9 @@ struct BfsHostTrace {
     uint32_t* rankOrdinals;
     uint32_t* dpuIdsInRank;
     uint32_t* sdkPhysicalRankIds;
+    uint32_t* dpuSysfsRankIds;
+    uint32_t* dpuRankNumaNodes;
+    uint32_t* dpuChannelIds;
     uint32_t* sdkSliceIds;
     uint32_t* sdkMemberIds;
     uint64_t* dpuCopyToCallCounts;

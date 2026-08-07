@@ -20,6 +20,7 @@ from transport_key import (
     same_source_across_group,
     sdk_api_kind,
     transport_key,
+    transport_key_v7_full,
     transport_key_v6_full,
 )
 
@@ -43,9 +44,15 @@ FIELDNAMES = [
     "rank_ordinal",
     "dpu_id_in_rank",
     "sdk_physical_rank_id",
+    "dpu_sysfs_rank_id",
+    "dpu_rank_numa_node",
+    "dpu_channel_id",
     "sdk_slice_id",
     "sdk_member_id",
+    "dpu_ci_id",
+    "dpu_member_id",
     "physical_dpu_identity",
+    "cpu_dpu_numa_relation",
     "same_source_across_group",
     "phase_class",
     "subop",
@@ -159,9 +166,19 @@ class BfsTraceValidatorTest(unittest.TestCase):
                     "sdk_physical_rank_id": (
                         str(12_288 + dpu_id // 64) if has_dpu else ""
                     ),
+                    "dpu_sysfs_rank_id": (
+                        str(dpu_id // 64) if has_dpu else ""
+                    ),
+                    "dpu_rank_numa_node": "0" if has_dpu else "",
+                    "dpu_channel_id": (
+                        str(1 + (dpu_id // 64) // 4) if has_dpu else ""
+                    ),
                     "sdk_slice_id": str((dpu_id % 64) // 8) if has_dpu else "",
                     "sdk_member_id": str(dpu_id % 8) if has_dpu else "",
+                    "dpu_ci_id": str((dpu_id % 64) // 8) if has_dpu else "",
+                    "dpu_member_id": str(dpu_id % 8) if has_dpu else "",
                     "physical_dpu_identity": "",
+                    "cpu_dpu_numa_relation": "LOCAL" if has_dpu else "",
                     "same_source_across_group": same_source_across_group(
                         op, subop
                     ),
@@ -496,10 +513,17 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["active_dpus_per_rank"], "1")
             self.assertEqual(row["phase_class"], "ITERATIVE")
             self.assertEqual(row["sdk_physical_rank_id"], "12288")
+            self.assertEqual(row["dpu_sysfs_rank_id"], "0")
+            self.assertEqual(row["dpu_rank_numa_node"], "0")
+            self.assertEqual(row["dpu_channel_id"], "1")
             self.assertEqual(row["sdk_slice_id"], "2")
             self.assertEqual(row["sdk_member_id"], "1")
+            self.assertEqual(row["dpu_ci_id"], "2")
+            self.assertEqual(row["dpu_member_id"], "1")
+            self.assertEqual(row["cpu_dpu_numa_relation"], "LOCAL")
             self.assertEqual(
-                row["physical_dpu_identity"], "rank:12288/slice:2/member:1"
+                row["physical_dpu_identity"],
+                "numa:0/channel:1/rank:0/ci:2/member:1",
             )
             self.assertEqual(row["previous_dpu_direction"], "FROM_DPU")
             self.assertEqual(
@@ -509,16 +533,20 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v7;op=dpu_copy_to;direction=TO_DPU;"
+                "v8;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
                 "active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
-                "rank_ordinal=0;dpu_id_in_rank=17;"
-                "same_source_across_group=1;allocated_dpus=256;"
+                "same_source_across_group=1;host_numa_node=0;"
+                "dpu_rank_numa_node=0;cpu_dpu_numa_relation=LOCAL;"
+                "dpu_channel_id=1;dpu_sysfs_rank_id=0;"
+                "dpu_ci_id=2;dpu_member_id=1;allocated_dpus=256;"
                 "allocated_ranks=4;"
                 "previous_sdk_mux_domain_class=SAME_MUX_DOMAIN",
             )
+            self.assertNotIn("rank_ordinal=", row["transport_key"])
+            self.assertNotIn("dpu_id_in_rank=", row["transport_key"])
             self.assertNotIn("phase_class=", row["transport_key"])
 
     def test_sdk_topology_relation_distinguishes_mux_pair_layers(self) -> None:

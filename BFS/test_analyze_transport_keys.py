@@ -10,7 +10,9 @@ from pathlib import Path
 from analyze_transport_keys import analyze
 from transport_key import (
     mux_domain_class,
+    sdk_topology_relation,
     transport_key,
+    transport_key_v7_full,
     transport_key_v6_full,
     transport_key_with_full_context,
     transport_key_with_mux_domain_min,
@@ -47,9 +49,15 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             "dpu_id_in_rank": "0",
             "global_dpu_id": "0",
             "sdk_physical_rank_id": "12288",
+            "dpu_sysfs_rank_id": "0",
+            "dpu_rank_numa_node": "0",
+            "dpu_channel_id": "1",
             "sdk_slice_id": "0",
             "sdk_member_id": "0",
-            "physical_dpu_identity": "rank:12288/slice:0/member:0",
+            "dpu_ci_id": "0",
+            "dpu_member_id": "0",
+            "physical_dpu_identity": "numa:0/channel:1/rank:0/ci:0/member:0",
+            "cpu_dpu_numa_relation": "LOCAL",
             "same_source_across_group": "1",
             "phase_class": "ITERATIVE",
             "previous_sdk_op": "dpu_copy_to",
@@ -174,24 +182,53 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 {"INIT", "ITERATIVE"},
             )
 
-    def test_phase_class_is_diagnostic_outside_v7_key(self) -> None:
+    def test_phase_class_is_diagnostic_outside_v8_key(self) -> None:
         iterative = self.sample_row(1, 100)
         initial = dict(iterative)
         initial["phase_class"] = "INIT"
         self.assertEqual(transport_key(initial), transport_key(iterative))
 
-    def test_physical_rank_identity_is_provenance_outside_v7_key(self) -> None:
+    def test_physical_rank_identity_separates_v8_key(self) -> None:
         first = self.sample_row(1, 100)
         second = dict(first)
         second["sdk_physical_rank_id"] = "12289"
-        second["physical_dpu_identity"] = "rank:12289/slice:0/member:0"
-        self.assertEqual(transport_key(first), transport_key(second))
+        second["dpu_sysfs_rank_id"] = "1"
+        second["physical_dpu_identity"] = (
+            "numa:0/channel:1/rank:1/ci:0/member:0"
+        )
+        self.assertNotEqual(transport_key(first), transport_key(second))
         self.assertEqual(
             transport_key_without_physical_rank(first),
             transport_key_without_physical_rank(second),
         )
 
-    def test_mux_domain_relation_separates_v7_key(self) -> None:
+    def test_allocation_local_ordinals_are_outside_v8_key(self) -> None:
+        first = self.sample_row(1, 100)
+        second = dict(first)
+        second["rank_ordinal"] = "7"
+        second["dpu_id_in_rank"] = "63"
+        second["global_dpu_id"] = "511"
+        self.assertEqual(transport_key(first), transport_key(second))
+        self.assertNotEqual(
+            transport_key_v7_full(first), transport_key_v7_full(second)
+        )
+
+    def test_cpu_dpu_numa_relation_separates_v8_key(self) -> None:
+        local = self.sample_row(1, 100)
+        remote = dict(local)
+        remote["host_numa_node"] = "1"
+        remote["cpu_dpu_numa_relation"] = "REMOTE"
+        self.assertNotEqual(transport_key(local), transport_key(remote))
+
+    def test_sdk_relation_uses_physical_rank_identity(self) -> None:
+        previous = self.sample_row(1, 100)
+        current = dict(previous)
+        current["global_dpu_id"] = "64"
+        current["sdk_physical_rank_id"] = "12289"
+        current["dpu_sysfs_rank_id"] = "1"
+        self.assertEqual(sdk_topology_relation(previous, current), "OTHER_RANK")
+
+    def test_mux_domain_relation_separates_v8_key(self) -> None:
         same_pair = self.sample_row(1, 100)
         other_pair = dict(same_pair)
         other_pair["previous_sdk_topology_relation"] = "SAME_SLICE"
@@ -229,7 +266,10 @@ class TransportKeyAnalysisTest(unittest.TestCase):
         second_rank["rank_ordinal"] = "1"
         second_rank["global_dpu_id"] = "64"
         second_rank["sdk_physical_rank_id"] = "12289"
-        second_rank["physical_dpu_identity"] = "rank:12289/slice:0/member:0"
+        second_rank["dpu_sysfs_rank_id"] = "1"
+        second_rank["physical_dpu_identity"] = (
+            "numa:0/channel:1/rank:1/ci:0/member:0"
+        )
 
         self.assertNotEqual(
             transport_key_with_mux_domain_min(first_rank),
@@ -282,7 +322,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 "100.000",
             )
 
-    def test_reanalyzes_stored_v3_trace_with_v7_key(self) -> None:
+    def test_reanalyzes_stored_v3_trace_with_v8_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             row = self.sample_row(1, 100)
@@ -292,12 +332,12 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.write_rows(path, [row])
             summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 1)
-            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v7;"))
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v8;"))
             self.assertEqual(summaries[0]["sdk_physical_rank_id"], "unknown")
             self.assertEqual(overview["full_context_v3_groups"], 1)
             self.assertEqual(overview["physical_identity_v5_groups"], 1)
 
-    def test_reanalyzes_stored_v6_trace_with_v7_key(self) -> None:
+    def test_reanalyzes_stored_v6_trace_with_v8_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             row = self.sample_row(1, 100)
@@ -306,10 +346,10 @@ class TransportKeyAnalysisTest(unittest.TestCase):
 
             summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 1)
-            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v7;"))
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v8;"))
             self.assertEqual(
                 overview["transport_key_version"],
-                "v7_allocated_topology_mux_domain",
+                "v8_physical_cpu_dpu_topology",
             )
 
     def test_reports_same_trace_phase_ab_comparison(self) -> None:

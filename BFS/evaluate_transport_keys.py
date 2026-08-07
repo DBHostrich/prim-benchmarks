@@ -14,6 +14,7 @@ from transport_key import (
     TRANSFER_OPS,
     sdk_topology_relation,
     transport_key,
+    transport_key_v7_full,
     transport_key_v6_full,
     transport_key_with_mux_domain_allocated_topology,
     transport_key_with_mux_domain_min,
@@ -44,7 +45,8 @@ MODEL_KEYS = {
         transport_key_with_mux_domain_rank_invariant,
     ),
     "v6_full": (transport_key_v6_full,),
-    "v7_full": (transport_key,),
+    "v7_full": (transport_key_v7_full,),
+    "v8_physical_topology": (transport_key,),
 }
 SCOPES = ("ALL_TRANSFER_EVENTS", "BASE12_PHASE_MIXED")
 ERROR_FIELDS = (
@@ -81,7 +83,9 @@ def load_traces(paths: list[Path]) -> dict[Path, list[dict[str, str]]]:
             raise ValueError(f"{path}: empty trace")
         if any(
             row["op"] in TRANSFER_OPS
-            and not row.get("transport_key", "").startswith(("v6;", "v7;"))
+            and not row.get("transport_key", "").startswith(
+                ("v6;", "v7;", "v8;")
+            )
             for row in rows
         ):
             for index, row in enumerate(rows):
@@ -96,6 +100,15 @@ def load_traces(paths: list[Path]) -> dict[Path, list[dict[str, str]]]:
                 continue
             row.setdefault("sdk_physical_rank_id", "unknown")
             row.setdefault("physical_dpu_identity", "unknown")
+            for field in (
+                "dpu_sysfs_rank_id",
+                "dpu_rank_numa_node",
+                "dpu_channel_id",
+                "dpu_ci_id",
+                "dpu_member_id",
+                "cpu_dpu_numa_relation",
+            ):
+                row.setdefault(field, "unknown")
             transfers.append(row)
         traces[path] = transfers
     return traces

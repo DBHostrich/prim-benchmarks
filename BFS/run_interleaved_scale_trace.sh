@@ -13,11 +13,17 @@ TRANSPORT_KEY_MIN_TRACES="${TRANSPORT_KEY_MIN_TRACES:-10}"
 TRANSPORT_KEY_SPREAD_THRESHOLD_PCT="${TRANSPORT_KEY_SPREAD_THRESHOLD_PCT:-25}"
 TRANSPORT_KEY_CV_THRESHOLD_PCT="${TRANSPORT_KEY_CV_THRESHOLD_PCT:-25}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-0}"
+DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
 DPUS_LIST="${DPUS_LIST:-64 128 256}"
 TASKLETS_LIST="${TASKLETS_LIST:-1}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
 EXPECTED_GRAPH_SHA256="418c002fd2f70d25d6561465ffc7b4a6f14f7e406856aaba8ddc327ac4de10e6"
-TRANSPORT_KEY_VERSION="v7_allocated_topology_mux_domain"
+TRANSPORT_KEY_VERSION="v8_physical_cpu_dpu_topology"
+
+if [[ -z "$DPU_RANK_TOPOLOGY_TSV" || ! -r "$DPU_RANK_TOPOLOGY_TSV" ]]; then
+    echo "ERROR: set DPU_RANK_TOPOLOGY_TSV to a readable dpu_rank_topology.tsv" >&2
+    exit 1
+fi
 
 mkdir -p "$RESULT_ROOT/artifacts"
 cd "$SCRIPT_DIR"
@@ -43,6 +49,10 @@ dpu-upmem-dpurte-clang --version \
     > "$RESULT_ROOT/dpu_compiler_version.txt" 2>&1 || true
 dpu-pkg-config --cflags --libs dpu \
     > "$RESULT_ROOT/dpu_sdk_flags.txt" 2>&1 || true
+cp "$DPU_RANK_TOPOLOGY_TSV" "$RESULT_ROOT/dpu_rank_topology.tsv"
+sha256sum "$RESULT_ROOT/dpu_rank_topology.tsv" \
+    > "$RESULT_ROOT/dpu_rank_topology.sha256"
+export BFS_TRACE_DPU_RANK_TOPOLOGY_TSV="$RESULT_ROOT/dpu_rank_topology.tsv"
 
 if command -v numactl >/dev/null 2>&1; then
     TRACE_HOST_NUMA_NODE="$NUMA_NODE"
@@ -111,9 +121,10 @@ for config_spec in "${configs[@]}"; do
     cp bin/host_code bin/dpu_code "$artifact_dir/"
     sha256sum "$artifact_dir/host_code" "$artifact_dir/dpu_code" \
         > "$result_dir/binaries.sha256"
-    printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nCOLLECTION_ORDER=LATIN_ROTATION\nGRAPH=%s\n' \
+    printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nDPU_RANK_TOPOLOGY_TSV=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nCOLLECTION_ORDER=LATIN_ROTATION\nGRAPH=%s\n' \
         "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
-        "$N_WARMUP" "$N_REPS" "$TRANSPORT_KEY_VERSION" "$GRAPH_PATH" \
+        "$BFS_TRACE_DPU_RANK_TOPOLOGY_TSV" "$N_WARMUP" "$N_REPS" \
+        "$TRANSPORT_KEY_VERSION" "$GRAPH_PATH" \
         > "$result_dir/config.txt"
 done
 

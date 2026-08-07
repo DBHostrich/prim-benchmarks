@@ -18,6 +18,7 @@ from transport_key import (
     transport_key_with_mux_relation_min,
     sdk_topology_relation,
     transport_key,
+    transport_key_v7_full,
     transport_key_v6_full,
     transport_key_with_full_context,
     transport_key_with_phase,
@@ -88,7 +89,9 @@ def analyze(
             raise ValueError(f"{path}: empty trace")
         if any(
             row["op"] in TRANSFER_OPS
-            and not row.get("transport_key", "").startswith(("v6;", "v7;"))
+            and not row.get("transport_key", "").startswith(
+                ("v6;", "v7;", "v8;")
+            )
             for row in rows
         ):
             for index, row in enumerate(rows):
@@ -104,13 +107,25 @@ def analyze(
                 row["sdk_physical_rank_id"] = "unknown"
             if "physical_dpu_identity" not in row:
                 row["physical_dpu_identity"] = "unknown"
+            for field in (
+                "dpu_sysfs_rank_id",
+                "dpu_rank_numa_node",
+                "dpu_channel_id",
+                "dpu_ci_id",
+                "dpu_member_id",
+                "cpu_dpu_numa_relation",
+            ):
+                if field not in row:
+                    row[field] = "unknown"
             expected_key = transport_key(row)
+            v7_key = transport_key_v7_full(row)
             v6_key = transport_key_v6_full(row)
             physical_identity_key = transport_key_without_mux_pair_context(row)
             history_min_key = transport_key_without_physical_rank(row)
             full_context_key = transport_key_with_full_context(row)
             if row["transport_key"] not in {
                 expected_key,
+                v7_key,
                 v6_key,
                 physical_identity_key,
                 history_min_key,
@@ -215,10 +230,20 @@ def analyze(
                 "sdk_physical_rank_id": representative[
                     "sdk_physical_rank_id"
                 ],
+                "dpu_sysfs_rank_id": representative["dpu_sysfs_rank_id"],
+                "dpu_rank_numa_node": representative[
+                    "dpu_rank_numa_node"
+                ],
+                "dpu_channel_id": representative["dpu_channel_id"],
                 "sdk_slice_id": representative["sdk_slice_id"],
                 "sdk_member_id": representative["sdk_member_id"],
+                "dpu_ci_id": representative["dpu_ci_id"],
+                "dpu_member_id": representative["dpu_member_id"],
                 "physical_dpu_identity": representative[
                     "physical_dpu_identity"
+                ],
+                "cpu_dpu_numa_relation": representative[
+                    "cpu_dpu_numa_relation"
                 ],
                 "same_source_across_group": representative[
                     "same_source_across_group"
@@ -432,7 +457,7 @@ def analyze(
         for samples in mux_domain_allocated_topology_groups.values()
     )
     overview: dict[str, object] = {
-        "transport_key_version": "v7_allocated_topology_mux_domain",
+        "transport_key_version": "v8_physical_cpu_dpu_topology",
         "trace_files": len(paths),
         "transfer_rows": transfer_rows,
         "transport_key_groups": len(summaries),

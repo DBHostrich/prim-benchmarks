@@ -21,6 +21,20 @@ BASE_TRANSPORT_KEY_FIELDS = (
     "dpu_id_in_rank",
     "same_source_across_group",
 )
+PHYSICAL_TRANSPORT_SHAPE_FIELDS = tuple(
+    field
+    for field in BASE_TRANSPORT_KEY_FIELDS
+    if field not in {"rank_ordinal", "dpu_id_in_rank"}
+)
+CPU_DPU_PHYSICAL_TOPOLOGY_FIELDS = (
+    "host_numa_node",
+    "dpu_rank_numa_node",
+    "cpu_dpu_numa_relation",
+    "dpu_channel_id",
+    "dpu_sysfs_rank_id",
+    "dpu_ci_id",
+    "dpu_member_id",
+)
 PHASE_TRANSPORT_KEY_FIELDS = BASE_TRANSPORT_KEY_FIELDS + ("phase_class",)
 MUX_RELATION_MIN_FIELDS = BASE_TRANSPORT_KEY_FIELDS + (
     "previous_sdk_topology_relation",
@@ -153,12 +167,26 @@ def physical_dpu_identity(row: Mapping[str, str]) -> str:
     if row["global_dpu_id"] == "":
         return ""
     return (
-        f"rank:{row['sdk_physical_rank_id']}/"
-        f"slice:{row['sdk_slice_id']}/member:{row['sdk_member_id']}"
+        f"numa:{row['dpu_rank_numa_node']}/"
+        f"channel:{row['dpu_channel_id']}/"
+        f"rank:{row['dpu_sysfs_rank_id']}/"
+        f"ci:{row['dpu_ci_id']}/member:{row['dpu_member_id']}"
     )
 
 
 def transport_key(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    fields = PHYSICAL_TRANSPORT_SHAPE_FIELDS + CPU_DPU_PHYSICAL_TOPOLOGY_FIELDS
+    base = ";".join(f"{name}={row[name]}" for name in fields)
+    domain = mux_domain_class(row["previous_sdk_topology_relation"])
+    return (
+        f"v8;{base};{allocated_topology_context(row)};"
+        f"previous_sdk_mux_domain_class={domain}"
+    )
+
+
+def transport_key_v7_full(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
     candidate = transport_key_with_mux_domain_allocated_topology(row)
@@ -303,7 +331,14 @@ def sdk_topology_relation(
         return "COLLECTION"
     if previous_dpu_id == current["global_dpu_id"]:
         return "SAME_DPU"
-    if previous["rank_ordinal"] != current["rank_ordinal"]:
+    previous_rank = previous.get("sdk_physical_rank_id", "")
+    current_rank = current.get("sdk_physical_rank_id", "")
+    if previous_rank and current_rank and previous_rank != current_rank:
+        return "OTHER_RANK"
+    if (
+        (not previous_rank or not current_rank)
+        and previous["rank_ordinal"] != current["rank_ordinal"]
+    ):
         return "OTHER_RANK"
     if previous["sdk_slice_id"] != current["sdk_slice_id"]:
         return "SAME_RANK"

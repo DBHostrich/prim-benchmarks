@@ -21,6 +21,7 @@ from transport_key import (
     same_source_across_group,
     sdk_api_kind,
     transport_key,
+    transport_key_v7_full,
     transport_key_v6_full,
 )
 
@@ -148,6 +149,15 @@ def expected_metrics(nr_dpus: int) -> dict[str, object]:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def expected_cpu_dpu_numa_relation(row: dict[str, str]) -> str:
+    host_numa = row["host_numa_node"]
+    if host_numa == "unbound":
+        return "UNBOUND"
+    if not host_numa.isdigit():
+        return "UNKNOWN"
+    return "LOCAL" if host_numa == row["dpu_rank_numa_node"] else "REMOTE"
 
 
 def read_trace(path: Path) -> list[dict[str, str]]:
@@ -315,7 +325,9 @@ def validate(
         )
         valid_transport_keys = {transport_key(row)}
         if allow_legacy_transport_key:
-            valid_transport_keys.add(transport_key_v6_full(row))
+            valid_transport_keys.update(
+                {transport_key_v7_full(row), transport_key_v6_full(row)}
+            )
         require(
             row["transport_key"] in valid_transport_keys,
             f"event {row['event_id']} has invalid transport_key",
@@ -380,9 +392,15 @@ def validate(
         "rank_ordinal",
         "dpu_id_in_rank",
         "sdk_physical_rank_id",
+        "dpu_sysfs_rank_id",
+        "dpu_rank_numa_node",
+        "dpu_channel_id",
         "sdk_slice_id",
         "sdk_member_id",
+        "dpu_ci_id",
+        "dpu_member_id",
         "physical_dpu_identity",
+        "cpu_dpu_numa_relation",
         "same_source_across_group",
         "phase_class",
         "target_symbol",
@@ -438,12 +456,40 @@ def validate(
         "copy event has an invalid sdk_physical_rank_id",
     )
     require(
+        all(int(row["dpu_sysfs_rank_id"]) >= 0 for row in copy_rows),
+        "copy event has an invalid dpu_sysfs_rank_id",
+    )
+    require(
+        all(int(row["dpu_rank_numa_node"]) >= 0 for row in copy_rows),
+        "copy event has an invalid dpu_rank_numa_node",
+    )
+    require(
+        all(int(row["dpu_channel_id"]) >= 0 for row in copy_rows),
+        "copy event has an invalid dpu_channel_id",
+    )
+    require(
         all(0 <= int(row["sdk_slice_id"]) < 8 for row in copy_rows),
         "copy event sdk_slice_id is outside 0..7",
     )
     require(
         all(0 <= int(row["sdk_member_id"]) < 8 for row in copy_rows),
         "copy event sdk_member_id is outside 0..7",
+    )
+    require(
+        all(row["dpu_ci_id"] == row["sdk_slice_id"] for row in copy_rows),
+        "copy event dpu_ci_id differs from sdk_slice_id",
+    )
+    require(
+        all(row["dpu_member_id"] == row["sdk_member_id"] for row in copy_rows),
+        "copy event dpu_member_id differs from sdk_member_id",
+    )
+    require(
+        all(
+            row["cpu_dpu_numa_relation"]
+            == expected_cpu_dpu_numa_relation(row)
+            for row in copy_rows
+        ),
+        "copy event has an inconsistent CPU-DPU NUMA relation",
     )
     require(
         all(
@@ -523,6 +569,9 @@ def validate(
             int(row["rank_ordinal"]),
             int(row["dpu_id_in_rank"]),
             int(row["sdk_physical_rank_id"]),
+            int(row["dpu_sysfs_rank_id"]),
+            int(row["dpu_rank_numa_node"]),
+            int(row["dpu_channel_id"]),
             int(row["sdk_slice_id"]),
             int(row["sdk_member_id"]),
         )
@@ -543,7 +592,8 @@ def validate(
     for rank in range(rank_count):
         dpu_ids = {
             dpu_id_in_rank
-            for rank_ordinal, dpu_id_in_rank, _, _, _ in dpu_topology.values()
+            for rank_ordinal, dpu_id_in_rank, _, _, _, _, _, _
+            in dpu_topology.values()
             if rank_ordinal == rank
         }
         require(
@@ -552,7 +602,8 @@ def validate(
         )
         sdk_pairs = {
             (slice_id, member_id)
-            for rank_ordinal, _, _, slice_id, member_id in dpu_topology.values()
+            for rank_ordinal, _, _, _, _, _, slice_id, member_id
+            in dpu_topology.values()
             if rank_ordinal == rank
         }
         require(
@@ -561,11 +612,11 @@ def validate(
         )
     physical_dpu_identities = {
         (
-            physical_rank_id,
+            sysfs_rank_id,
             slice_id,
             member_id,
         )
-        for _, _, physical_rank_id, slice_id, member_id
+        for _, _, _, sysfs_rank_id, _, _, slice_id, member_id
         in dpu_topology.values()
     }
     require(

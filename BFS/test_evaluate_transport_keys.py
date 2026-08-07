@@ -39,9 +39,15 @@ class TransportKeyEvaluationTest(unittest.TestCase):
             "dpu_id_in_rank": "0",
             "global_dpu_id": "0",
             "sdk_physical_rank_id": "12288",
+            "dpu_sysfs_rank_id": "0",
+            "dpu_rank_numa_node": "0",
+            "dpu_channel_id": "1",
             "sdk_slice_id": "0",
             "sdk_member_id": "0",
-            "physical_dpu_identity": "rank:12288/slice:0/member:0",
+            "dpu_ci_id": "0",
+            "dpu_member_id": "0",
+            "physical_dpu_identity": "numa:0/channel:1/rank:0/ci:0/member:0",
+            "cpu_dpu_numa_relation": "LOCAL",
             "same_source_across_group": "1",
             "phase_class": phase,
             "previous_sdk_topology_relation": relation,
@@ -100,7 +106,7 @@ class TransportKeyEvaluationTest(unittest.TestCase):
                 float(mux_domain["p90_abs_pct_error"]),
                 float(base["p90_abs_pct_error"]),
             )
-            self.assertEqual(len(per_trace), 60)
+            self.assertEqual(len(per_trace), 66)
 
     def test_can_hold_out_one_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -144,7 +150,7 @@ class TransportKeyEvaluationTest(unittest.TestCase):
             self.assertEqual(domain["holdout_groups"], 2)
             self.assertEqual(domain["coverage_pct"], "100.000000")
             self.assertEqual(domain["fallback_predicted_pct"], "100.000000")
-            self.assertEqual(len(per_holdout), 40)
+            self.assertEqual(len(per_holdout), 44)
 
             trace_summary, _ = evaluate(paths, "trace")
             allocated = next(
