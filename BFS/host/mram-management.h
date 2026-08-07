@@ -26,14 +26,6 @@ static uint32_t mram_heap_alloc(struct mram_heap_allocator_t* allocator, uint32_
     return ret;
 }
 
-static void copyToDPU(struct dpu_set_t dpu, uint8_t* hostPtr, uint32_t mramIdx, uint32_t size) {
-    DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, ROUND_UP_TO_MULTIPLE_OF_8(size)));
-}
-
-static void copyFromDPU(struct dpu_set_t dpu, uint32_t mramIdx, uint8_t* hostPtr, uint32_t size) {
-    DPU_ASSERT(dpu_copy_from(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, ROUND_UP_TO_MULTIPLE_OF_8(size)));
-}
-
 static void copyToDPUTraced(
     struct BfsHostTrace* trace,
     uint32_t globalDpuId,
@@ -47,13 +39,29 @@ static void copyToDPUTraced(
     uint32_t transferSize = ROUND_UP_TO_MULTIPLE_OF_8(logicalSize);
     uint64_t startNs;
     uint64_t endNs;
+    dpu_error_t status;
 
+    if(bfsHostTraceEnabled(trace)) {
+        startNs = bfsHostTraceNowNs();
+    }
+    status = dpu_copy_to(
+        dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize
+    );
+    if(status != DPU_OK) {
+        fprintf(stderr,
+                "BFS_TRANSFER_ERROR direction=TO_DPU global_dpu_id=%u "
+                "rank_ordinal=%u dpu_id_in_rank=%u subop=%s bfs_level=%d "
+                "offset_bytes=%u logical_bytes=%u transfer_bytes=%u "
+                "status=%s\n",
+                globalDpuId, globalDpuId / 64, globalDpuId % 64,
+                subop, bfsLevel, mramIdx, logicalSize, transferSize,
+                dpu_error_to_string(status));
+        fflush(stderr);
+        DPU_ASSERT(status);
+    }
     if(!bfsHostTraceEnabled(trace)) {
-        copyToDPU(dpu, hostPtr, mramIdx, logicalSize);
         return;
     }
-    startNs = bfsHostTraceNowNs();
-    DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
     endNs = bfsHostTraceNowNs();
     bfsHostTraceRecord(trace, "dpu_copy_to", subop, bfsLevel, "TO_DPU", true,
                        globalDpuId, logicalSize, transferSize, mramIdx,
@@ -74,13 +82,29 @@ static void copyFromDPUTraced(
     uint32_t transferSize = ROUND_UP_TO_MULTIPLE_OF_8(logicalSize);
     uint64_t startNs;
     uint64_t endNs;
+    dpu_error_t status;
 
+    if(bfsHostTraceEnabled(trace)) {
+        startNs = bfsHostTraceNowNs();
+    }
+    status = dpu_copy_from(
+        dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize
+    );
+    if(status != DPU_OK) {
+        fprintf(stderr,
+                "BFS_TRANSFER_ERROR direction=FROM_DPU global_dpu_id=%u "
+                "rank_ordinal=%u dpu_id_in_rank=%u subop=%s bfs_level=%d "
+                "offset_bytes=%u logical_bytes=%u transfer_bytes=%u "
+                "status=%s\n",
+                globalDpuId, globalDpuId / 64, globalDpuId % 64,
+                subop, bfsLevel, mramIdx, logicalSize, transferSize,
+                dpu_error_to_string(status));
+        fflush(stderr);
+        DPU_ASSERT(status);
+    }
     if(!bfsHostTraceEnabled(trace)) {
-        copyFromDPU(dpu, mramIdx, hostPtr, logicalSize);
         return;
     }
-    startNs = bfsHostTraceNowNs();
-    DPU_ASSERT(dpu_copy_from(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
     endNs = bfsHostTraceNowNs();
     bfsHostTraceRecord(trace, "dpu_copy_from", subop, bfsLevel, "FROM_DPU", true,
                        globalDpuId, logicalSize, transferSize, mramIdx,
