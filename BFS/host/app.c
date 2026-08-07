@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 /**
 * app.c
 * BFS Host Application Source File
@@ -58,6 +60,7 @@ static dpu_error_t allocateBfsDpus(
     const char* requestedPaths = getenv("BFS_DPU_RANK_PATHS");
     char* pathsCopy;
     char* path;
+    char* pathSave = NULL;
     uint32_t expectedRanks;
     uint32_t rankIndex = 0;
     dpu_error_t status = DPU_OK;
@@ -88,7 +91,9 @@ static dpu_error_t allocateBfsDpus(
     }
     strcpy(pathsCopy, requestedPaths);
 
-    for(path = strtok(pathsCopy, ","); path != NULL; path = strtok(NULL, ",")) {
+    for(path = strtok_r(pathsCopy, ",", &pathSave);
+        path != NULL;
+        path = strtok_r(NULL, ",", &pathSave)) {
         char profile[512];
         struct dpu_rank_t* rank;
         int profileLength;
