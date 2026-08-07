@@ -58,7 +58,7 @@ V5_TRANSPORT_KEY_FIELDS = (
     + PHYSICAL_DPU_IDENTITY_FIELDS
     + HISTORY_MIN_FIELDS[2:]
 )
-TRANSPORT_KEY_FIELDS = (
+V6_TRANSPORT_KEY_FIELDS = (
     BASE_TRANSPORT_KEY_FIELDS
     + PHYSICAL_DPU_IDENTITY_FIELDS
     + ("previous_sdk_topology_relation",)
@@ -161,8 +161,15 @@ def physical_dpu_identity(row: Mapping[str, str]) -> str:
 def transport_key(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
+    candidate = transport_key_with_mux_domain_allocated_topology(row)
+    return "v7;" + candidate.split(";", 1)[1]
+
+
+def transport_key_v6_full(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
     return "v6;" + ";".join(
-        f"{name}={row[name]}" for name in TRANSPORT_KEY_FIELDS
+        f"{name}={row[name]}" for name in V6_TRANSPORT_KEY_FIELDS
     )
 
 

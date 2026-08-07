@@ -359,6 +359,19 @@ static void formatCallContext(
     }
 }
 
+static const char* muxDomainClass(const char* topologyRelation) {
+    if(strcmp(topologyRelation, "SAME_DPU") == 0
+       || strcmp(topologyRelation, "SAME_MUX_PAIR") == 0) {
+        return "SAME_MUX_DOMAIN";
+    }
+    if(strcmp(topologyRelation, "SAME_SLICE") == 0
+       || strcmp(topologyRelation, "SAME_RANK") == 0
+       || strcmp(topologyRelation, "OTHER_RANK") == 0) {
+        return "DIFFERENT_MUX_DOMAIN";
+    }
+    return topologyRelation;
+}
+
 static bool formatTransportKey(
     const struct BfsHostTrace* trace,
     const struct BfsHostTraceEvent* event,
@@ -378,24 +391,18 @@ static bool formatTransportKey(
     /* Every BFS copy wrapper receives one DPU selected by DPU_FOREACH. */
     result = snprintf(
         output, outputSize,
-        "v6;op=%s;direction=%s;sdk_api_kind=%s;"
+        "v7;op=%s;direction=%s;sdk_api_kind=%s;"
         "logical_distribution_class=%s;target_space=MRAM;"
         "transfer_bytes_per_dpu=%" PRIu64
         ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
         "rank_ordinal=%u;dpu_id_in_rank=%u;same_source_across_group=%s;"
-        "sdk_physical_rank_id=%u;sdk_slice_id=%u;sdk_member_id=%u;"
-        "previous_sdk_topology_relation=%s;"
-        "previous_dpu_direction=%s;previous_dpu_target_relation=%s;"
-        "target_region_reuse_class=%s;host_numa_node=%s",
+        "allocated_dpus=%u;allocated_ranks=%u;"
+        "previous_sdk_mux_domain_class=%s",
         event->op, event->direction, eventSdkApiKind, distributionClass,
         event->transferBytes, trace->rankOrdinals[event->globalDpuId],
         trace->dpuIdsInRank[event->globalDpuId], sameSource,
-        trace->sdkPhysicalRankIds[event->globalDpuId],
-        trace->sdkSliceIds[event->globalDpuId],
-        trace->sdkMemberIds[event->globalDpuId],
-        context->previousSdkTopologyRelation,
-        context->previousDpuDirection, context->previousDpuTargetRelation,
-        context->targetRegionReuseClass, trace->hostNumaNode
+        trace->configuredDpus, trace->actualRanks,
+        muxDomainClass(context->previousSdkTopologyRelation)
     );
     return result >= 0 && (size_t)result < outputSize;
 }

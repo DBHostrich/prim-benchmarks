@@ -17,7 +17,7 @@ DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
 EXPECTED_GRAPH_SHA256="418c002fd2f70d25d6561465ffc7b4a6f14f7e406856aaba8ddc327ac4de10e6"
-TRANSPORT_KEY_VERSION="v6_mux_pair_context"
+TRANSPORT_KEY_VERSION="v7_allocated_topology_mux_domain"
 
 mkdir -p "$RESULT_ROOT"
 cd "$SCRIPT_DIR"

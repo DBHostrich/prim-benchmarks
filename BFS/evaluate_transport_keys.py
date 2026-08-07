@@ -14,6 +14,7 @@ from transport_key import (
     TRANSFER_OPS,
     sdk_topology_relation,
     transport_key,
+    transport_key_v6_full,
     transport_key_with_mux_domain_allocated_topology,
     transport_key_with_mux_domain_min,
     transport_key_with_mux_domain_rank_invariant,
@@ -42,7 +43,8 @@ MODEL_KEYS = {
         transport_key_with_mux_domain_min,
         transport_key_with_mux_domain_rank_invariant,
     ),
-    "v6_full": (transport_key,),
+    "v6_full": (transport_key_v6_full,),
+    "v7_full": (transport_key,),
 }
 SCOPES = ("ALL_TRANSFER_EVENTS", "BASE12_PHASE_MIXED")
 ERROR_FIELDS = (
@@ -79,7 +81,7 @@ def load_traces(paths: list[Path]) -> dict[Path, list[dict[str, str]]]:
             raise ValueError(f"{path}: empty trace")
         if any(
             row["op"] in TRANSFER_OPS
-            and not row.get("transport_key", "").startswith("v6;")
+            and not row.get("transport_key", "").startswith(("v6;", "v7;"))
             for row in rows
         ):
             for index, row in enumerate(rows):

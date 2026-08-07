@@ -21,6 +21,7 @@ from transport_key import (
     same_source_across_group,
     sdk_api_kind,
     transport_key,
+    transport_key_v6_full,
 )
 
 
@@ -195,7 +196,10 @@ def expected_sequence(nr_dpus: int) -> list[tuple[str, str, str, str]]:
     return sequence
 
 
-def validate(path: Path) -> dict[str, object]:
+def validate(
+    path: Path,
+    allow_legacy_transport_key: bool = False,
+) -> dict[str, object]:
     rows = read_trace(path)
     configured = {int(row["configured_dpus"]) for row in rows}
     tasklets = {int(row["num_tasklets"]) for row in rows}
@@ -309,8 +313,11 @@ def validate(path: Path) -> dict[str, object]:
             row["physical_dpu_identity"] == physical_dpu_identity(row),
             f"event {row['event_id']} has invalid physical_dpu_identity",
         )
+        valid_transport_keys = {transport_key(row)}
+        if allow_legacy_transport_key:
+            valid_transport_keys.add(transport_key_v6_full(row))
         require(
-            row["transport_key"] == transport_key(row),
+            row["transport_key"] in valid_transport_keys,
             f"event {row['event_id']} has invalid transport_key",
         )
 
@@ -642,13 +649,14 @@ def validate(path: Path) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("traces", nargs="+", type=Path)
+    parser.add_argument("--allow-legacy-transport-key", action="store_true")
     args = parser.parse_args()
 
     summaries = []
     failed = False
     for path in args.traces:
         try:
-            summary = validate(path)
+            summary = validate(path, args.allow_legacy_transport_key)
         except (OSError, KeyError, TypeError, ValueError) as error:
             print(f"FAIL {path}: {error}", file=sys.stderr)
             failed = True

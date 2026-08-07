@@ -11,6 +11,7 @@ from analyze_transport_keys import analyze
 from transport_key import (
     mux_domain_class,
     transport_key,
+    transport_key_v6_full,
     transport_key_with_full_context,
     transport_key_with_mux_domain_min,
     transport_key_with_mux_domain_allocated_topology,
@@ -99,7 +100,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.assertEqual(overview["stable_transport_key_pct"], "100.000")
             self.assertEqual(overview["stable_event_pct"], "100.000")
 
-    def test_groups_strictly_by_transport_key_across_configurations(self) -> None:
+    def test_allocated_topology_separates_configurations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first = root / "first.csv"
@@ -107,15 +108,19 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.write_rows(first, [self.sample_row(1, 100)])
             second_row = self.sample_row(2, 100)
             second_row["configured_dpus"] = "512"
+            second_row["actual_ranks"] = "8"
             second_row["num_tasklets"] = "2"
+            second_row["transport_key"] = transport_key(second_row)
             self.write_rows(second, [second_row])
             summaries, _ = analyze([first, second], 2, 2, 25.0, 25.0)
-            self.assertEqual(len(summaries), 1)
+            self.assertEqual(len(summaries), 2)
             self.assertEqual(
-                summaries[0]["num_tasklets_values"], "1|2"
+                {row["num_tasklets_values"] for row in summaries},
+                {"1", "2"},
             )
             self.assertEqual(
-                summaries[0]["configured_dpus_values"], "256|512"
+                {row["configured_dpus_values"] for row in summaries},
+                {"256", "512"},
             )
 
     def test_accepts_repeated_key_within_one_trace(self) -> None:
@@ -155,6 +160,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             initial["subop"] = "frontier_init"
             initial["bfs_level"] = ""
             initial["phase_class"] = "INIT"
+            initial["previous_sdk_topology_relation"] = "SAME_SLICE"
             initial["previous_dpu_direction"] = "TO_DPU"
             initial["previous_dpu_target_relation"] = "DIFFERENT_REGION"
             initial["target_region_reuse_class"] = "FIRST_REGION_ACCESS"
@@ -168,24 +174,24 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 {"INIT", "ITERATIVE"},
             )
 
-    def test_phase_class_is_diagnostic_outside_v6_key(self) -> None:
+    def test_phase_class_is_diagnostic_outside_v7_key(self) -> None:
         iterative = self.sample_row(1, 100)
         initial = dict(iterative)
         initial["phase_class"] = "INIT"
         self.assertEqual(transport_key(initial), transport_key(iterative))
 
-    def test_physical_rank_identity_separates_v6_key(self) -> None:
+    def test_physical_rank_identity_is_provenance_outside_v7_key(self) -> None:
         first = self.sample_row(1, 100)
         second = dict(first)
         second["sdk_physical_rank_id"] = "12289"
         second["physical_dpu_identity"] = "rank:12289/slice:0/member:0"
-        self.assertNotEqual(transport_key(first), transport_key(second))
+        self.assertEqual(transport_key(first), transport_key(second))
         self.assertEqual(
             transport_key_without_physical_rank(first),
             transport_key_without_physical_rank(second),
         )
 
-    def test_mux_pair_relation_separates_v6_key(self) -> None:
+    def test_mux_domain_relation_separates_v7_key(self) -> None:
         same_pair = self.sample_row(1, 100)
         other_pair = dict(same_pair)
         other_pair["previous_sdk_topology_relation"] = "SAME_SLICE"
@@ -276,7 +282,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 "100.000",
             )
 
-    def test_reanalyzes_stored_v3_trace_with_v6_key(self) -> None:
+    def test_reanalyzes_stored_v3_trace_with_v7_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
             row = self.sample_row(1, 100)
@@ -286,10 +292,25 @@ class TransportKeyAnalysisTest(unittest.TestCase):
             self.write_rows(path, [row])
             summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
             self.assertEqual(len(summaries), 1)
-            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v6;"))
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v7;"))
             self.assertEqual(summaries[0]["sdk_physical_rank_id"], "unknown")
             self.assertEqual(overview["full_context_v3_groups"], 1)
             self.assertEqual(overview["physical_identity_v5_groups"], 1)
+
+    def test_reanalyzes_stored_v6_trace_with_v7_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            row = self.sample_row(1, 100)
+            row["transport_key"] = transport_key_v6_full(row)
+            self.write_rows(path, [row])
+
+            summaries, overview = analyze([path], 2, 2, 25.0, 25.0)
+            self.assertEqual(len(summaries), 1)
+            self.assertTrue(str(summaries[0]["transport_key"]).startswith("v7;"))
+            self.assertEqual(
+                overview["transport_key_version"],
+                "v7_allocated_topology_mux_domain",
+            )
 
     def test_reports_same_trace_phase_ab_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -301,6 +322,7 @@ class TransportKeyAnalysisTest(unittest.TestCase):
                 initial["subop"] = "frontier_init"
                 initial["bfs_level"] = ""
                 initial["phase_class"] = "INIT"
+                initial["previous_sdk_topology_relation"] = "SAME_SLICE"
                 initial["previous_dpu_direction"] = "TO_DPU"
                 initial["previous_dpu_target_relation"] = "DIFFERENT_REGION"
                 initial["target_region_reuse_class"] = "FIRST_REGION_ACCESS"

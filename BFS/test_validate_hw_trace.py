@@ -20,6 +20,7 @@ from transport_key import (
     same_source_across_group,
     sdk_api_kind,
     transport_key,
+    transport_key_v6_full,
 )
 
 
@@ -413,6 +414,27 @@ class BfsTraceValidatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid transport_key"):
                 validate_hw_trace.validate(path)
 
+    def test_legacy_v6_key_requires_explicit_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 64)
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            for row in rows:
+                if row["op"] in {"dpu_copy_to", "dpu_copy_from"}:
+                    row["transport_key"] = transport_key_v6_full(row)
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=FIELDNAMES)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with self.assertRaisesRegex(ValueError, "invalid transport_key"):
+                validate_hw_trace.validate(path)
+            summary = validate_hw_trace.validate(
+                path, allow_legacy_transport_key=True
+            )
+            self.assertEqual(summary["configured_dpus"], 64)
+
     def test_distribution_and_same_source_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.csv"
@@ -487,19 +509,15 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(row["target_region_reuse_class"], "REUSED_REGION")
             self.assertEqual(
                 row["transport_key"],
-                "v6;op=dpu_copy_to;direction=TO_DPU;"
+                "v7;op=dpu_copy_to;direction=TO_DPU;"
                 "sdk_api_kind=SINGLE_COPY;"
                 "logical_distribution_class=SHARED_REPLICATION;"
                 "target_space=MRAM;transfer_bytes_per_dpu=24576;"
                 "active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
                 "rank_ordinal=0;dpu_id_in_rank=17;"
-                "same_source_across_group=1;sdk_physical_rank_id=12288;"
-                "sdk_slice_id=2;sdk_member_id=1;"
-                "previous_sdk_topology_relation=SAME_MUX_PAIR;"
-                "previous_dpu_direction=FROM_DPU;"
-                "previous_dpu_target_relation=SAME_REGION;"
-                "target_region_reuse_class=REUSED_REGION;"
-                "host_numa_node=0",
+                "same_source_across_group=1;allocated_dpus=256;"
+                "allocated_ranks=4;"
+                "previous_sdk_mux_domain_class=SAME_MUX_DOMAIN",
             )
             self.assertNotIn("phase_class=", row["transport_key"])
 

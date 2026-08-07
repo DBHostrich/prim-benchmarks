@@ -100,7 +100,7 @@ class TransportKeyEvaluationTest(unittest.TestCase):
                 float(mux_domain["p90_abs_pct_error"]),
                 float(base["p90_abs_pct_error"]),
             )
-            self.assertEqual(len(per_trace), 54)
+            self.assertEqual(len(per_trace), 60)
 
     def test_can_hold_out_one_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -144,7 +144,7 @@ class TransportKeyEvaluationTest(unittest.TestCase):
             self.assertEqual(domain["holdout_groups"], 2)
             self.assertEqual(domain["coverage_pct"], "100.000000")
             self.assertEqual(domain["fallback_predicted_pct"], "100.000000")
-            self.assertEqual(len(per_holdout), 36)
+            self.assertEqual(len(per_holdout), 40)
 
             trace_summary, _ = evaluate(paths, "trace")
             allocated = next(
