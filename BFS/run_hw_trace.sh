@@ -14,6 +14,7 @@ TRANSPORT_KEY_SPREAD_THRESHOLD_PCT="${TRANSPORT_KEY_SPREAD_THRESHOLD_PCT:-25}"
 TRANSPORT_KEY_CV_THRESHOLD_PCT="${TRANSPORT_KEY_CV_THRESHOLD_PCT:-25}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
+BFS_DPU_RANK_PATHS="${BFS_DPU_RANK_PATHS:-}"
 EXPECTED_DPU_NUMA_NODE="${EXPECTED_DPU_NUMA_NODE:-}"
 EXPECTED_DPU_SYSFS_RANKS="${EXPECTED_DPU_SYSFS_RANKS:-}"
 EXPECTED_DPU_CHANNELS="${EXPECTED_DPU_CHANNELS:-}"
@@ -52,6 +53,7 @@ cp "$DPU_RANK_TOPOLOGY_TSV" "$RESULT_ROOT/dpu_rank_topology.tsv"
 sha256sum "$RESULT_ROOT/dpu_rank_topology.tsv" \
     > "$RESULT_ROOT/dpu_rank_topology.sha256"
 export BFS_TRACE_DPU_RANK_TOPOLOGY_TSV="$RESULT_ROOT/dpu_rank_topology.tsv"
+export BFS_DPU_RANK_PATHS
 
 run_bfs() {
     local verbosity="$1"
@@ -93,6 +95,21 @@ require_correct_result() {
 
 for nr_dpus in $DPUS_LIST; do
     for tasklets in $TASKLETS_LIST; do
+        if [[ -n "$BFS_DPU_RANK_PATHS" ]]; then
+            IFS=',' read -r -a requested_rank_paths <<< "$BFS_DPU_RANK_PATHS"
+            expected_rank_count=$((nr_dpus / 64))
+            if [[ $((nr_dpus % 64)) -ne 0 \
+                  || ${#requested_rank_paths[@]} -ne $expected_rank_count ]]; then
+                echo "ERROR: BFS_DPU_RANK_PATHS has ${#requested_rank_paths[@]} ranks; NR_DPUS=$nr_dpus requires $expected_rank_count" >&2
+                exit 1
+            fi
+            for rank_path in "${requested_rank_paths[@]}"; do
+                if [[ ! -r "$rank_path" || ! -w "$rank_path" ]]; then
+                    echo "ERROR: requested DPU rank is not readable and writable: $rank_path" >&2
+                    exit 1
+                fi
+            done
+        fi
         config="BFS_${nr_dpus}dpu_${tasklets}tl"
         result_dir="$RESULT_ROOT/$config"
         mkdir -p "$result_dir"
@@ -102,9 +119,10 @@ for nr_dpus in $DPUS_LIST; do
         make NR_DPUS="$nr_dpus" NR_TASKLETS="$tasklets" all \
             > "$result_dir/build.log" 2>&1
         sha256sum bin/host_code bin/dpu_code > "$result_dir/binaries.sha256"
-        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nDPU_RANK_TOPOLOGY_TSV=%s\nEXPECTED_DPU_NUMA_NODE=%s\nEXPECTED_DPU_SYSFS_RANKS=%s\nEXPECTED_DPU_CHANNELS=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
+        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nDPU_RANK_TOPOLOGY_TSV=%s\nBFS_DPU_RANK_PATHS=%s\nEXPECTED_DPU_NUMA_NODE=%s\nEXPECTED_DPU_SYSFS_RANKS=%s\nEXPECTED_DPU_CHANNELS=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
             "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
             "$BFS_TRACE_DPU_RANK_TOPOLOGY_TSV" \
+            "$BFS_DPU_RANK_PATHS" \
             "$EXPECTED_DPU_NUMA_NODE" "$EXPECTED_DPU_SYSFS_RANKS" \
             "$EXPECTED_DPU_CHANNELS" "$N_WARMUP" "$N_REPS" \
             "$TRANSPORT_KEY_VERSION" \

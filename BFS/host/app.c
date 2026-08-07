@@ -5,6 +5,7 @@
 */
 #include <dpu.h>
 #include <dpu_log.h>
+#include <dpu_management.h>
 
 #include <assert.h>
 #include <getopt.h>
@@ -32,6 +33,140 @@
 
 #define DPU_BINARY "./bin/dpu_code"
 
+struct BfsDpuAllocation {
+    bool usesPinnedRanks;
+    uint32_t nrRankSets;
+    struct dpu_set_t* rankSets;
+    struct dpu_rank_t** combinedRanks;
+};
+
+static void destroyPinnedAllocationStorage(
+    struct BfsDpuAllocation* allocation
+) {
+    free(allocation->rankSets);
+    free(allocation->combinedRanks);
+    allocation->rankSets = NULL;
+    allocation->combinedRanks = NULL;
+    allocation->nrRankSets = 0;
+    allocation->usesPinnedRanks = false;
+}
+
+static dpu_error_t allocateBfsDpus(
+    struct BfsDpuAllocation* allocation,
+    struct dpu_set_t* dpuSet
+) {
+    const char* requestedPaths = getenv("BFS_DPU_RANK_PATHS");
+    char* pathsCopy;
+    char* path;
+    uint32_t expectedRanks;
+    uint32_t rankIndex = 0;
+    dpu_error_t status = DPU_OK;
+
+    memset(allocation, 0, sizeof(*allocation));
+    if(requestedPaths == NULL || requestedPaths[0] == '\0') {
+        return dpu_alloc(NR_DPUS, NULL, dpuSet);
+    }
+    if(NR_DPUS % 64 != 0) {
+        fprintf(stderr,
+                "BFS_DPU_RANK_PATHS requires a whole number of 64-DPU ranks\n");
+        return DPU_ERR_ALLOCATION;
+    }
+
+    expectedRanks = NR_DPUS / 64;
+    allocation->rankSets = calloc(
+        expectedRanks, sizeof(*allocation->rankSets)
+    );
+    allocation->combinedRanks = calloc(
+        expectedRanks, sizeof(*allocation->combinedRanks)
+    );
+    pathsCopy = malloc(strlen(requestedPaths) + 1);
+    if(allocation->rankSets == NULL || allocation->combinedRanks == NULL
+       || pathsCopy == NULL) {
+        free(pathsCopy);
+        destroyPinnedAllocationStorage(allocation);
+        return DPU_ERR_SYSTEM;
+    }
+    strcpy(pathsCopy, requestedPaths);
+
+    for(path = strtok(pathsCopy, ","); path != NULL; path = strtok(NULL, ",")) {
+        char profile[512];
+        struct dpu_rank_t* rank;
+        int profileLength;
+
+        if(rankIndex >= expectedRanks || path[0] == '\0') {
+            status = DPU_ERR_INVALID_PROFILE;
+            break;
+        }
+        profileLength = snprintf(
+            profile, sizeof(profile), "backend=hw,rankPath=%s", path
+        );
+        if(profileLength < 0 || (size_t)profileLength >= sizeof(profile)) {
+            status = DPU_ERR_INVALID_PROFILE;
+            break;
+        }
+        status = dpu_alloc_ranks(
+            1, profile, &allocation->rankSets[rankIndex]
+        );
+        if(status != DPU_OK) {
+            fprintf(stderr, "Could not allocate requested DPU rank %s: %s\n",
+                    path, dpu_error_to_string(status));
+            break;
+        }
+        rank = dpu_rank_from_set(allocation->rankSets[rankIndex]);
+        if(rank == NULL) {
+            status = DPU_ERR_INVALID_DPU_SET;
+            ++rankIndex;
+            break;
+        }
+        allocation->combinedRanks[rankIndex] = rank;
+        ++rankIndex;
+    }
+    free(pathsCopy);
+
+    if(status == DPU_OK && rankIndex != expectedRanks) {
+        fprintf(stderr,
+                "BFS_DPU_RANK_PATHS contains %u ranks, expected %u\n",
+                rankIndex, expectedRanks);
+        status = DPU_ERR_ALLOCATION;
+    }
+    if(status != DPU_OK) {
+        while(rankIndex > 0) {
+            --rankIndex;
+            dpu_free(allocation->rankSets[rankIndex]);
+        }
+        destroyPinnedAllocationStorage(allocation);
+        return status;
+    }
+
+    allocation->usesPinnedRanks = true;
+    allocation->nrRankSets = expectedRanks;
+    memset(dpuSet, 0, sizeof(*dpuSet));
+    dpuSet->kind = DPU_SET_RANKS;
+    dpuSet->list.nr_ranks = expectedRanks;
+    dpuSet->list.ranks = allocation->combinedRanks;
+    return DPU_OK;
+}
+
+static dpu_error_t freeBfsDpus(
+    struct BfsDpuAllocation* allocation,
+    struct dpu_set_t dpuSet
+) {
+    dpu_error_t status = DPU_OK;
+    uint32_t rankIndex;
+
+    if(!allocation->usesPinnedRanks) {
+        return dpu_free(dpuSet);
+    }
+    for(rankIndex = 0; rankIndex < allocation->nrRankSets; ++rankIndex) {
+        dpu_error_t rankStatus = dpu_free(allocation->rankSets[rankIndex]);
+        if(rankStatus != DPU_OK) {
+            status = rankStatus;
+        }
+    }
+    destroyPinnedAllocationStorage(allocation);
+    return status;
+}
+
 // Main of the Host Application
 int main(int argc, char** argv) {
 
@@ -49,6 +184,7 @@ int main(int argc, char** argv) {
 
     // Allocate DPUs and load binary
     struct dpu_set_t dpu_set, dpu;
+    struct BfsDpuAllocation dpuAllocation;
     uint32_t numDPUs;
     bool traceRequested = bfsHostTraceRequested();
     bool contextProbeRequested = bfsContextProbeRequested();
@@ -69,7 +205,7 @@ int main(int argc, char** argv) {
     if(traceRequested) {
         allocStartNs = bfsHostTraceNowNs();
     }
-    DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    DPU_ASSERT(allocateBfsDpus(&dpuAllocation, &dpu_set));
     if(traceRequested) {
         allocEndNs = bfsHostTraceNowNs();
         loadStartNs = bfsHostTraceNowNs();
@@ -82,7 +218,7 @@ int main(int argc, char** argv) {
     PRINT_INFO(p.verbosity >= 1, "Allocated %d DPU(s)", numDPUs);
     struct BfsHostTrace hostTrace;
     if(!bfsHostTraceInit(&hostTrace, dpu_set, numDPUs, NR_TASKLETS)) {
-        DPU_ASSERT(dpu_free(dpu_set));
+        DPU_ASSERT(freeBfsDpus(&dpuAllocation, dpu_set));
         return EXIT_FAILURE;
     }
     if(bfsHostTraceEnabled(&hostTrace)) {
@@ -235,7 +371,7 @@ int main(int argc, char** argv) {
         free(visited);
         free(currentFrontier);
         free(nextFrontier);
-        DPU_ASSERT(dpu_free(dpu_set));
+        DPU_ASSERT(freeBfsDpus(&dpuAllocation, dpu_set));
         bfsHostTraceDestroy(&hostTrace);
         return probeOk ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -444,7 +580,7 @@ int main(int argc, char** argv) {
     if(bfsHostTraceEnabled(&hostTrace)) {
         freeStartNs = bfsHostTraceNowNs();
     }
-    DPU_ASSERT(dpu_free(dpu_set));
+    DPU_ASSERT(freeBfsDpus(&dpuAllocation, dpu_set));
     if(bfsHostTraceEnabled(&hostTrace)) {
         freeEndNs = bfsHostTraceNowNs();
         bfsHostTraceRecord(&hostTrace, "dpu_free", "", -1, "", false, 0,
