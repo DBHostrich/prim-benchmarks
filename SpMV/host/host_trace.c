@@ -2,6 +2,9 @@
 
 #include "host_trace.h"
 
+#include <dpu_management.h>
+
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -9,23 +12,496 @@
 #include <string.h>
 #include <time.h>
 
-static bool parseRepeatId(const char* value, uint64_t* repeatId) {
+static bool parseUnsignedEnv(
+    const char* name,
+    const char* value,
+    uint64_t* parsedValue
+) {
     char* end = NULL;
     unsigned long long parsed;
 
     if(value == NULL || value[0] == '\0') {
-        *repeatId = 0;
+        *parsedValue = 0;
         return true;
     }
 
     errno = 0;
     parsed = strtoull(value, &end, 10);
     if(errno != 0 || end == value || *end != '\0') {
-        fprintf(stderr, "Invalid SPMV_TRACE_REPEAT_ID: %s\n", value);
+        fprintf(stderr, "Invalid %s: %s\n", name, value);
         return false;
     }
-    *repeatId = (uint64_t)parsed;
+    *parsedValue = (uint64_t)parsed;
     return true;
+}
+
+static bool isLabelAtom(const char* value) {
+    const unsigned char* p = (const unsigned char*)value;
+    if(value == NULL || value[0] == '\0') {
+        return false;
+    }
+    for(; *p != '\0'; ++p) {
+        if(!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct SpmvPhysicalRankTopology {
+    uint32_t sysfsRankId;
+    uint32_t sdkRankId;
+    uint32_t numaNode;
+    uint32_t channelId;
+};
+
+static bool lookupPhysicalRankTopology(
+    const char* path,
+    uint32_t sdkRankId,
+    struct SpmvPhysicalRankTopology* topology
+) {
+    FILE* fp = fopen(path, "r");
+    char line[1024];
+    uint32_t matches = 0;
+
+    if(fp == NULL) {
+        fprintf(stderr, "Could not open DPU rank topology %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    while(fgets(line, sizeof(line), fp) != NULL) {
+        char rankPath[256];
+        char status[32];
+        uint32_t sysfsRankId;
+        uint32_t rowSdkRankId;
+        uint32_t numaNode;
+        uint32_t channelId;
+        uint32_t ciCount;
+        uint32_t dpusPerCi;
+        uint32_t dpusPerRank;
+        uint64_t mramPerDpu;
+        uint64_t mramPerRank;
+        int parsed;
+
+        if(strncmp(line, "rank_path", strlen("rank_path")) == 0) {
+            continue;
+        }
+        parsed = sscanf(
+            line,
+            "%255s %" SCNu32 " %" SCNu32 " %" SCNu32 " %" SCNu32
+            " %" SCNu32 " %" SCNu32 " %" SCNu32 " %" SCNu64
+            " %" SCNu64 " %31s",
+            rankPath, &sysfsRankId, &rowSdkRankId, &numaNode, &channelId,
+            &ciCount, &dpusPerCi, &dpusPerRank, &mramPerDpu,
+            &mramPerRank, status
+        );
+        if(parsed == EOF || parsed == 0) {
+            continue;
+        }
+        if(parsed != 11) {
+            fprintf(stderr, "Malformed DPU rank topology row: %s", line);
+            fclose(fp);
+            return false;
+        }
+        if(rowSdkRankId != sdkRankId) {
+            continue;
+        }
+        if(strcmp(status, "ok") != 0 || ciCount != 8 || dpusPerCi != 8
+           || dpusPerRank != 64) {
+            fprintf(stderr,
+                    "Unsupported topology for SDK rank %" PRIu32
+                    ": status=%s ci=%" PRIu32 " dpus_per_ci=%" PRIu32
+                    " dpus_per_rank=%" PRIu32 "\n",
+                    sdkRankId, status, ciCount, dpusPerCi, dpusPerRank);
+            fclose(fp);
+            return false;
+        }
+        topology->sysfsRankId = sysfsRankId;
+        topology->sdkRankId = rowSdkRankId;
+        topology->numaNode = numaNode;
+        topology->channelId = channelId;
+        ++matches;
+    }
+    if(ferror(fp)) {
+        fprintf(stderr, "Could not read DPU rank topology %s: %s\n",
+                path, strerror(errno));
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+    if(matches != 1) {
+        fprintf(stderr,
+                "DPU rank topology has %" PRIu32
+                " rows for allocated SDK rank %" PRIu32 "\n",
+                matches, sdkRankId);
+        return false;
+    }
+    return true;
+}
+
+static const char* cpuDpuNumaRelation(
+    const struct SpmvHostTrace* trace,
+    uint32_t globalDpuId
+) {
+    char* end = NULL;
+    unsigned long hostNuma;
+
+    if(strcmp(trace->hostNumaNode, "unbound") == 0) {
+        return "UNBOUND";
+    }
+    errno = 0;
+    hostNuma = strtoul(trace->hostNumaNode, &end, 10);
+    if(errno != 0 || end == trace->hostNumaNode || *end != '\0') {
+        return "UNKNOWN";
+    }
+    return hostNuma == trace->dpuRankNumaNodes[globalDpuId]
+        ? "LOCAL" : "REMOTE";
+}
+
+static size_t opSlot(const char* op) {
+    if(strcmp(op, "dpu_alloc") == 0) {
+        return 0;
+    }
+    if(strcmp(op, "dpu_load") == 0) {
+        return 1;
+    }
+    if(strcmp(op, "dpu_copy_to") == 0) {
+        return 2;
+    }
+    if(strcmp(op, "dpu_copy_from") == 0) {
+        return 3;
+    }
+    if(strcmp(op, "dpu_launch") == 0) {
+        return 4;
+    }
+    if(strcmp(op, "dpu_free") == 0) {
+        return 5;
+    }
+    return 6;
+}
+
+static bool isTransferEvent(const struct SpmvHostTraceEvent* event) {
+    return strcmp(event->op, "dpu_copy_to") == 0
+        || strcmp(event->op, "dpu_copy_from") == 0;
+}
+
+static const char* sdkApiKind(const struct SpmvHostTraceEvent* event) {
+    return isTransferEvent(event) ? "SINGLE_COPY" : "";
+}
+
+static const char* logicalDistributionClass(
+    const struct SpmvHostTraceEvent* event
+) {
+    if(strcmp(event->op, "dpu_copy_to") == 0) {
+        if(strcmp(event->subop, "input_vector") == 0) {
+            return "SHARED_REPLICATION";
+        }
+        return "PARTITIONED_SCATTER";
+    }
+    if(strcmp(event->op, "dpu_copy_from") == 0) {
+        return "PARTITIONED_GATHER";
+    }
+    return "";
+}
+
+static const char* sameSourceAcrossGroup(
+    const struct SpmvHostTraceEvent* event
+) {
+    if(strcmp(event->op, "dpu_copy_to") == 0) {
+        return strcmp(event->subop, "input_vector") == 0 ? "1" : "0";
+    }
+    if(strcmp(event->op, "dpu_copy_from") == 0) {
+        return "0";
+    }
+    return "";
+}
+
+static const char* phaseClass(const struct SpmvHostTraceEvent* event) {
+    if(!isTransferEvent(event)) {
+        return "";
+    }
+    if(strcmp(event->subop, "row_ptrs") == 0
+       || strcmp(event->subop, "nonzeros") == 0
+       || strcmp(event->subop, "input_vector") == 0
+       || strcmp(event->subop, "params") == 0) {
+        return "INIT";
+    }
+    if(strcmp(event->subop, "output_vector") == 0) {
+        return "FINALIZE";
+    }
+    return "UNKNOWN";
+}
+
+struct SpmvDerivedTransferContext {
+    const char* previousSdkOp;
+    const char* previousSdkDirection;
+    uint64_t previousSdkTransferBytes;
+    const char* previousSdkTopologyRelation;
+    uint64_t nsSincePreviousSdkEvent;
+    const char* previousDpuDirection;
+    uint64_t previousDpuTransferBytes;
+    const char* previousDpuTargetRelation;
+    uint64_t launchesSincePreviousDpuTransfer;
+    const char* targetRegionReuseClass;
+    uint64_t hostBufferPageOffset;
+    const char* hostBufferReuseClass;
+};
+
+struct SpmvHostBufferState {
+    uintptr_t address;
+    uint64_t transferBytes;
+    const char* direction;
+};
+
+static const char* sdkTopologyRelation(
+    const struct SpmvHostTrace* trace,
+    const struct SpmvHostTraceEvent* previous,
+    const struct SpmvHostTraceEvent* current
+) {
+    if(previous == NULL) {
+        return "NONE";
+    }
+    if(!previous->hasDpu) {
+        return "COLLECTION";
+    }
+    if(previous->globalDpuId == current->globalDpuId) {
+        return "SAME_DPU";
+    }
+    if(trace->sdkPhysicalRankIds[previous->globalDpuId]
+       != trace->sdkPhysicalRankIds[current->globalDpuId]) {
+        return "OTHER_RANK";
+    }
+    if(trace->sdkSliceIds[previous->globalDpuId]
+       != trace->sdkSliceIds[current->globalDpuId]) {
+        return "SAME_RANK";
+    }
+    if(trace->sdkMemberIds[previous->globalDpuId] / 2
+       == trace->sdkMemberIds[current->globalDpuId] / 2) {
+        return "SAME_MUX_PAIR";
+    }
+    return "SAME_SLICE";
+}
+
+static bool deriveTransferContexts(
+    const struct SpmvHostTrace* trace,
+    struct SpmvDerivedTransferContext* contexts
+) {
+    size_t* previousDpuEvent;
+    size_t* lastDpuEvent;
+    uint64_t* lastDpuTransferLaunchCount;
+    struct SpmvHostBufferState* hostBuffers;
+    size_t hostBufferCount = 0;
+    uint64_t launchCount = 0;
+    size_t i;
+
+    previousDpuEvent = malloc(trace->numEvents * sizeof(*previousDpuEvent));
+    lastDpuEvent = malloc(trace->configuredDpus * sizeof(*lastDpuEvent));
+    lastDpuTransferLaunchCount = calloc(
+        trace->configuredDpus, sizeof(*lastDpuTransferLaunchCount)
+    );
+    hostBuffers = malloc(trace->numEvents * sizeof(*hostBuffers));
+    if(previousDpuEvent == NULL || lastDpuEvent == NULL
+       || lastDpuTransferLaunchCount == NULL || hostBuffers == NULL) {
+        free(previousDpuEvent);
+        free(lastDpuEvent);
+        free(lastDpuTransferLaunchCount);
+        free(hostBuffers);
+        return false;
+    }
+    for(i = 0; i < trace->configuredDpus; ++i) {
+        lastDpuEvent[i] = SIZE_MAX;
+    }
+
+    for(i = 0; i < trace->numEvents; ++i) {
+        const struct SpmvHostTraceEvent* event = &trace->events[i];
+        struct SpmvDerivedTransferContext* context = &contexts[i];
+        const struct SpmvHostTraceEvent* previousSdk = i == 0
+            ? NULL : &trace->events[i - 1];
+        size_t previousIndex;
+        size_t cursor;
+        size_t hostIndex;
+        bool targetSeen = false;
+
+        previousDpuEvent[i] = SIZE_MAX;
+        if(strcmp(event->op, "dpu_launch") == 0) {
+            ++launchCount;
+        }
+        if(!isTransferEvent(event)) {
+            continue;
+        }
+
+        context->previousSdkOp = previousSdk == NULL
+            ? "NONE" : previousSdk->op;
+        context->previousSdkDirection = previousSdk == NULL
+            || previousSdk->direction[0] == '\0'
+            ? "NONE" : previousSdk->direction;
+        context->previousSdkTransferBytes = previousSdk != NULL
+            && isTransferEvent(previousSdk)
+            ? previousSdk->transferBytes : 0;
+        context->previousSdkTopologyRelation = sdkTopologyRelation(
+            trace, previousSdk, event
+        );
+        context->nsSincePreviousSdkEvent = previousSdk == NULL
+            || event->startNs < previousSdk->endNs
+            ? 0 : event->startNs - previousSdk->endNs;
+
+        previousIndex = lastDpuEvent[event->globalDpuId];
+        previousDpuEvent[i] = previousIndex;
+        if(previousIndex == SIZE_MAX) {
+            context->previousDpuDirection = "NONE";
+            context->previousDpuTransferBytes = 0;
+            context->previousDpuTargetRelation = "NONE";
+        } else {
+            const struct SpmvHostTraceEvent* previousDpu =
+                &trace->events[previousIndex];
+            context->previousDpuDirection = previousDpu->direction;
+            context->previousDpuTransferBytes = previousDpu->transferBytes;
+            context->previousDpuTargetRelation =
+                previousDpu->offsetBytes == event->offsetBytes
+                && previousDpu->transferBytes == event->transferBytes
+                ? "SAME_REGION" : "DIFFERENT_REGION";
+        }
+        context->launchesSincePreviousDpuTransfer =
+            launchCount - lastDpuTransferLaunchCount[event->globalDpuId];
+
+        cursor = previousIndex;
+        while(cursor != SIZE_MAX) {
+            const struct SpmvHostTraceEvent* prior = &trace->events[cursor];
+            if(prior->offsetBytes == event->offsetBytes
+               && prior->transferBytes == event->transferBytes) {
+                targetSeen = true;
+                break;
+            }
+            cursor = previousDpuEvent[cursor];
+        }
+        context->targetRegionReuseClass = targetSeen
+            ? "REUSED_REGION" : "FIRST_REGION_ACCESS";
+
+        context->hostBufferPageOffset =
+            (uint64_t)(event->hostBufferAddress % (uintptr_t)4096);
+        context->hostBufferReuseClass = "FIRST_SDK_USE";
+        for(hostIndex = 0; hostIndex < hostBufferCount; ++hostIndex) {
+            if(hostBuffers[hostIndex].address == event->hostBufferAddress
+               && hostBuffers[hostIndex].transferBytes == event->transferBytes) {
+                context->hostBufferReuseClass =
+                    strcmp(hostBuffers[hostIndex].direction, event->direction) == 0
+                    ? "SAME_DIRECTION_REUSE" : "DIRECTION_SWITCH_REUSE";
+                hostBuffers[hostIndex].direction = event->direction;
+                break;
+            }
+        }
+        if(hostIndex == hostBufferCount) {
+            hostBuffers[hostBufferCount].address = event->hostBufferAddress;
+            hostBuffers[hostBufferCount].transferBytes = event->transferBytes;
+            hostBuffers[hostBufferCount].direction = event->direction;
+            ++hostBufferCount;
+        }
+
+        lastDpuEvent[event->globalDpuId] = i;
+        lastDpuTransferLaunchCount[event->globalDpuId] = launchCount;
+    }
+
+    free(previousDpuEvent);
+    free(lastDpuEvent);
+    free(lastDpuTransferLaunchCount);
+    free(hostBuffers);
+    return true;
+}
+
+static void formatOffsetFeature(
+    const struct SpmvHostTraceEvent* event,
+    char* output,
+    size_t outputSize
+) {
+    uint64_t page;
+    uint64_t pages;
+
+    if(!event->hasDpu) {
+        snprintf(output, outputSize, "none");
+        return;
+    }
+    page = event->offsetBytes / UINT64_C(4096);
+    pages = event->transferBytes == 0 ? 0
+        : ((event->offsetBytes % UINT64_C(4096)) + event->transferBytes
+           + UINT64_C(4095)) / UINT64_C(4096);
+    snprintf(output, outputSize,
+             "off=%" PRIu64 ":a8=%u:a64=%u:p4k=%" PRIu64 ":pages=%" PRIu64,
+             event->offsetBytes, event->offsetBytes % 8 == 0,
+             event->offsetBytes % 64 == 0, page, pages);
+}
+
+static void formatCallContext(
+    const struct SpmvHostTrace* trace,
+    const struct SpmvHostTraceEvent* event,
+    char* output,
+    size_t outputSize
+) {
+    if(event->hasDpuOpCallIndex) {
+        snprintf(output, outputSize,
+                 "opidx=%" PRIu64 ":dpuopidx=%" PRIu64
+                 ":process=%s:prewarm=%" PRIu64,
+                 event->opCallIndex, event->dpuOpCallIndex,
+                 trace->processState, trace->pretraceWarmupRuns);
+    } else {
+        snprintf(output, outputSize,
+                 "opidx=%" PRIu64 ":dpuopidx=none"
+                 ":process=%s:prewarm=%" PRIu64,
+                 event->opCallIndex, trace->processState,
+                 trace->pretraceWarmupRuns);
+    }
+}
+
+static const char* muxDomainClass(const char* topologyRelation) {
+    if(strcmp(topologyRelation, "SAME_DPU") == 0
+       || strcmp(topologyRelation, "SAME_MUX_PAIR") == 0) {
+        return "SAME_MUX_DOMAIN";
+    }
+    if(strcmp(topologyRelation, "SAME_SLICE") == 0
+       || strcmp(topologyRelation, "SAME_RANK") == 0
+       || strcmp(topologyRelation, "OTHER_RANK") == 0) {
+        return "DIFFERENT_MUX_DOMAIN";
+    }
+    return topologyRelation;
+}
+
+static bool formatTransportKey(
+    const struct SpmvHostTrace* trace,
+    const struct SpmvHostTraceEvent* event,
+    const struct SpmvDerivedTransferContext* context,
+    const char* eventSdkApiKind,
+    const char* distributionClass,
+    const char* sameSource,
+    char* output,
+    size_t outputSize
+) {
+    int result;
+    if(!event->hasDpu || !isTransferEvent(event)) {
+        output[0] = '\0';
+        return true;
+    }
+    result = snprintf(
+        output, outputSize,
+        "v8;op=%s;direction=%s;sdk_api_kind=%s;"
+        "logical_distribution_class=%s;target_space=MRAM;"
+        "transfer_bytes_per_dpu=%" PRIu64
+        ";active_dpus=1;active_ranks=1;active_dpus_per_rank=1;"
+        "same_source_across_group=%s;host_numa_node=%s;"
+        "dpu_rank_numa_node=%u;cpu_dpu_numa_relation=%s;"
+        "dpu_channel_id=%u;dpu_sysfs_rank_id=%u;dpu_ci_id=%u;"
+        "dpu_member_id=%u;allocated_dpus=%u;allocated_ranks=%u;"
+        "previous_sdk_mux_domain_class=%s",
+        event->op, event->direction, eventSdkApiKind, distributionClass,
+        event->transferBytes, sameSource, trace->hostNumaNode,
+        trace->dpuRankNumaNodes[event->globalDpuId],
+        cpuDpuNumaRelation(trace, event->globalDpuId),
+        trace->dpuChannelIds[event->globalDpuId],
+        trace->dpuSysfsRankIds[event->globalDpuId],
+        trace->sdkSliceIds[event->globalDpuId],
+        trace->sdkMemberIds[event->globalDpuId], trace->configuredDpus,
+        trace->actualRanks,
+        muxDomainClass(context->previousSdkTopologyRelation)
+    );
+    return result >= 0 && (size_t)result < outputSize;
 }
 
 static void writeCsvString(FILE* fp, const char* value) {
@@ -56,6 +532,28 @@ static void writeCsvString(FILE* fp, const char* value) {
     fputc('"', fp);
 }
 
+static void growEvents(struct SpmvHostTrace* trace) {
+    size_t newCapacity;
+    struct SpmvHostTraceEvent* newEvents;
+
+    if(trace->capacity > SIZE_MAX / (2u * sizeof(*trace->events))) {
+        fprintf(stderr, "SpMV host trace capacity overflow\n");
+        exit(EXIT_FAILURE);
+    }
+    newCapacity = trace->capacity == 0 ? 64u : trace->capacity * 2u;
+    newEvents = realloc(trace->events, newCapacity * sizeof(*trace->events));
+    if(newEvents == NULL) {
+        fprintf(stderr,
+                "Could not grow the SpMV host trace buffer to %zu events\n",
+                newCapacity);
+        exit(EXIT_FAILURE);
+    }
+    memset(newEvents + trace->capacity, 0,
+           (newCapacity - trace->capacity) * sizeof(*newEvents));
+    trace->events = newEvents;
+    trace->capacity = newCapacity;
+}
+
 bool spmvHostTraceRequested(void) {
     const char* outputPath = getenv("SPMV_TRACE_CSV");
     return outputPath != NULL && outputPath[0] != '\0';
@@ -70,11 +568,17 @@ bool spmvHostTraceInit(
     const char* outputPath = getenv("SPMV_TRACE_CSV");
     const char* runId = getenv("SPMV_TRACE_RUN_ID");
     const char* repeatId = getenv("SPMV_TRACE_REPEAT_ID");
-    struct dpu_set_t rank;
-    struct dpu_set_t dpu;
+    const char* hostNumaNode = getenv("SPMV_TRACE_HOST_NUMA_NODE");
+    const char* processState = getenv("SPMV_TRACE_PROCESS_STATE");
+    const char* pretraceWarmupRuns = getenv("SPMV_TRACE_PREWARM_RUNS");
+    const char* rankTopologyPath = getenv("SPMV_TRACE_DPU_RANK_TOPOLOGY_TSV");
+    struct dpu_set_t rank = {0};
+    struct dpu_set_t dpu = {0};
+    struct dpu_rank_t* sdkRank;
     uint32_t rankOrdinal;
     uint32_t dpuIdInRank;
     uint32_t globalDpuId = 0;
+    struct SpmvPhysicalRankTopology physicalRankTopology;
 
     memset(trace, 0, sizeof(*trace));
     if(!spmvHostTraceRequested()) {
@@ -85,25 +589,83 @@ bool spmvHostTraceInit(
     trace->runId = (runId == NULL || runId[0] == '\0') ? "spmv" : runId;
     trace->configuredDpus = configuredDpus;
     trace->numTasklets = numTasklets;
+    trace->hostNumaNode = (hostNumaNode == NULL || hostNumaNode[0] == '\0')
+        ? "unknown" : hostNumaNode;
+    trace->processState = (processState == NULL || processState[0] == '\0')
+        ? "fresh_process" : processState;
     trace->capacity = (size_t)configuredDpus * 5u + 4u;
-    if(!parseRepeatId(repeatId, &trace->repeatId)) {
+    if(!parseUnsignedEnv("SPMV_TRACE_REPEAT_ID", repeatId, &trace->repeatId)
+       || !parseUnsignedEnv("SPMV_TRACE_PREWARM_RUNS", pretraceWarmupRuns,
+                            &trace->pretraceWarmupRuns)) {
+        return false;
+    }
+    if(!isLabelAtom(trace->hostNumaNode) || !isLabelAtom(trace->processState)) {
+        fprintf(stderr,
+                "SpMV trace NUMA/process label contains unsupported characters\n");
+        return false;
+    }
+    if(rankTopologyPath == NULL || rankTopologyPath[0] == '\0') {
+        fprintf(stderr,
+                "SPMV_TRACE_DPU_RANK_TOPOLOGY_TSV is required for physical topology labels\n");
         return false;
     }
     if(dpu_get_nr_ranks(dpuSet, &trace->actualRanks) != DPU_OK) {
         fprintf(stderr, "Could not query the allocated rank count\n");
         return false;
     }
+    if(configuredDpus == 0 || trace->actualRanks == 0) {
+        fprintf(stderr, "SpMV tracing requires at least one DPU and one rank\n");
+        return false;
+    }
 
     trace->rankOrdinals = calloc(configuredDpus, sizeof(*trace->rankOrdinals));
     trace->dpuIdsInRank = calloc(configuredDpus, sizeof(*trace->dpuIdsInRank));
+    trace->sdkPhysicalRankIds = calloc(
+        configuredDpus, sizeof(*trace->sdkPhysicalRankIds)
+    );
+    trace->dpuSysfsRankIds = calloc(
+        configuredDpus, sizeof(*trace->dpuSysfsRankIds)
+    );
+    trace->dpuRankNumaNodes = calloc(
+        configuredDpus, sizeof(*trace->dpuRankNumaNodes)
+    );
+    trace->dpuChannelIds = calloc(
+        configuredDpus, sizeof(*trace->dpuChannelIds)
+    );
+    trace->sdkSliceIds = calloc(configuredDpus, sizeof(*trace->sdkSliceIds));
+    trace->sdkMemberIds = calloc(configuredDpus, sizeof(*trace->sdkMemberIds));
+    trace->dpuCopyToCallCounts = calloc(
+        configuredDpus, sizeof(*trace->dpuCopyToCallCounts)
+    );
+    trace->dpuCopyFromCallCounts = calloc(
+        configuredDpus, sizeof(*trace->dpuCopyFromCallCounts)
+    );
     trace->events = calloc(trace->capacity, sizeof(*trace->events));
-    if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL || trace->events == NULL) {
+    if(trace->rankOrdinals == NULL || trace->dpuIdsInRank == NULL
+       || trace->sdkPhysicalRankIds == NULL
+       || trace->dpuSysfsRankIds == NULL
+       || trace->dpuRankNumaNodes == NULL || trace->dpuChannelIds == NULL
+       || trace->sdkSliceIds == NULL || trace->sdkMemberIds == NULL
+       || trace->dpuCopyToCallCounts == NULL
+       || trace->dpuCopyFromCallCounts == NULL || trace->events == NULL) {
         fprintf(stderr, "Could not allocate the SpMV host trace buffers\n");
         spmvHostTraceDestroy(trace);
         return false;
     }
 
     DPU_RANK_FOREACH(dpuSet, rank, rankOrdinal) {
+        sdkRank = dpu_rank_from_set(rank);
+        if(sdkRank == NULL) {
+            fprintf(stderr, "Could not resolve SDK rank %u\n", rankOrdinal);
+            spmvHostTraceDestroy(trace);
+            return false;
+        }
+        if(!lookupPhysicalRankTopology(
+               rankTopologyPath, dpu_get_rank_id(sdkRank),
+               &physicalRankTopology)) {
+            spmvHostTraceDestroy(trace);
+            return false;
+        }
         DPU_FOREACH(rank, dpu, dpuIdInRank) {
             if(globalDpuId >= configuredDpus) {
                 fprintf(stderr, "Allocated DPU topology exceeds configured DPU count\n");
@@ -112,6 +674,15 @@ bool spmvHostTraceInit(
             }
             trace->rankOrdinals[globalDpuId] = rankOrdinal;
             trace->dpuIdsInRank[globalDpuId] = dpuIdInRank;
+            trace->sdkPhysicalRankIds[globalDpuId] = dpu_get_rank_id(sdkRank);
+            trace->dpuSysfsRankIds[globalDpuId] =
+                physicalRankTopology.sysfsRankId;
+            trace->dpuRankNumaNodes[globalDpuId] =
+                physicalRankTopology.numaNode;
+            trace->dpuChannelIds[globalDpuId] =
+                physicalRankTopology.channelId;
+            trace->sdkSliceIds[globalDpuId] = dpu_get_slice_id(dpu.dpu);
+            trace->sdkMemberIds[globalDpuId] = dpu_get_member_id(dpu.dpu);
             ++globalDpuId;
         }
     }
@@ -149,6 +720,7 @@ void spmvHostTraceRecord(
     uint64_t logicalBytes,
     uint64_t transferBytes,
     uint64_t offsetBytes,
+    const void* hostBuffer,
     uint64_t startNs,
     uint64_t endNs
 ) {
@@ -158,8 +730,7 @@ void spmvHostTraceRecord(
         return;
     }
     if(trace->numEvents >= trace->capacity) {
-        fprintf(stderr, "SpMV host trace capacity exceeded (%zu events)\n", trace->capacity);
-        exit(EXIT_FAILURE);
+        growEvents(trace);
     }
     if(hasDpu && globalDpuId >= trace->configuredDpus) {
         fprintf(stderr, "SpMV host trace DPU ID %u is out of range\n", globalDpuId);
@@ -180,6 +751,15 @@ void spmvHostTraceRecord(
     event->logicalBytes = logicalBytes;
     event->transferBytes = transferBytes;
     event->offsetBytes = offsetBytes;
+    event->hostBufferAddress = (uintptr_t)hostBuffer;
+    event->opCallIndex = trace->opCallCounts[opSlot(op)]++;
+    if(hasDpu && strcmp(op, "dpu_copy_to") == 0) {
+        event->hasDpuOpCallIndex = true;
+        event->dpuOpCallIndex = trace->dpuCopyToCallCounts[globalDpuId]++;
+    } else if(hasDpu && strcmp(op, "dpu_copy_from") == 0) {
+        event->hasDpuOpCallIndex = true;
+        event->dpuOpCallIndex = trace->dpuCopyFromCallCounts[globalDpuId]++;
+    }
     event->startNs = startNs;
     event->endNs = endNs;
     ++trace->numEvents;
@@ -187,6 +767,7 @@ void spmvHostTraceRecord(
 
 bool spmvHostTraceWrite(const struct SpmvHostTrace* trace) {
     FILE* fp;
+    struct SpmvDerivedTransferContext* contexts;
     size_t i;
 
     if(!spmvHostTraceEnabled(trace)) {
@@ -199,13 +780,70 @@ bool spmvHostTraceWrite(const struct SpmvHostTrace* trace) {
         return false;
     }
 
+    contexts = calloc(trace->numEvents, sizeof(*contexts));
+    if(contexts == NULL || !deriveTransferContexts(trace, contexts)) {
+        fprintf(stderr, "Could not derive SpMV transfer hardware contexts\n");
+        free(contexts);
+        fclose(fp);
+        return false;
+    }
+
     fputs("run_id,repeat_id,event_id,configured_dpus,actual_ranks,num_tasklets,"
-          "op,subop,direction,global_dpu_id,rank_ordinal,dpu_id_in_rank,"
-          "target_space,target_symbol,offset_bytes,logical_bytes,transfer_bytes,"
-          "host_start_ns,host_end_ns,measured_ns\n", fp);
+          "op,direction,sdk_api_kind,logical_distribution_class,target_space,"
+          "transfer_bytes_per_dpu,active_dpus,active_ranks,active_dpus_per_rank,"
+          "rank_ordinal,dpu_id_in_rank,sdk_physical_rank_id,"
+          "dpu_sysfs_rank_id,dpu_rank_numa_node,dpu_channel_id,"
+          "sdk_slice_id,sdk_member_id,dpu_ci_id,dpu_member_id,"
+          "physical_dpu_identity,cpu_dpu_numa_relation,"
+          "same_source_across_group,phase_class,"
+          "subop,global_dpu_id,target_symbol,offset_bytes,offset_feature,"
+          "logical_bytes,transfer_bytes,host_buffer_address,"
+          "host_buffer_page_offset,host_buffer_reuse_class,"
+          "previous_sdk_op,previous_sdk_direction,previous_sdk_transfer_bytes,"
+          "previous_sdk_topology_relation,ns_since_previous_sdk_event,"
+          "previous_dpu_direction,previous_dpu_transfer_bytes,"
+          "previous_dpu_target_relation,launches_since_previous_dpu_transfer,"
+          "target_region_reuse_class,op_call_index,dpu_op_call_index,"
+          "process_state,pretrace_warmup_runs,host_numa_node,call_context,"
+          "transport_key,host_start_ns,host_end_ns,measured_ns\n", fp);
 
     for(i = 0; i < trace->numEvents; ++i) {
         const struct SpmvHostTraceEvent* event = &trace->events[i];
+        const struct SpmvDerivedTransferContext* context = &contexts[i];
+        const char* eventSdkApiKind = sdkApiKind(event);
+        const char* distributionClass = logicalDistributionClass(event);
+        const char* sameSource = sameSourceAcrossGroup(event);
+        const char* eventPhaseClass = phaseClass(event);
+        char offsetFeature[160];
+        char callContext[256];
+        char physicalDpuIdentity[128];
+        char transportKey[1024];
+
+        formatOffsetFeature(event, offsetFeature, sizeof(offsetFeature));
+        formatCallContext(trace, event, callContext, sizeof(callContext));
+        if(event->hasDpu) {
+            snprintf(
+                physicalDpuIdentity, sizeof(physicalDpuIdentity),
+                "numa:%u/channel:%u/rank:%u/ci:%u/member:%u",
+                trace->dpuRankNumaNodes[event->globalDpuId],
+                trace->dpuChannelIds[event->globalDpuId],
+                trace->dpuSysfsRankIds[event->globalDpuId],
+                trace->sdkSliceIds[event->globalDpuId],
+                trace->sdkMemberIds[event->globalDpuId]
+            );
+        } else {
+            physicalDpuIdentity[0] = '\0';
+        }
+        if(!formatTransportKey(trace, event, context, eventSdkApiKind,
+                               distributionClass, sameSource, transportKey,
+                               sizeof(transportKey))) {
+            fprintf(stderr,
+                    "SpMV transport key is too long for event %" PRIu64 "\n",
+                    event->eventId);
+            free(contexts);
+            fclose(fp);
+            return false;
+        }
 
         writeCsvString(fp, trace->runId);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%u,%u,%u,",
@@ -213,24 +851,81 @@ bool spmvHostTraceWrite(const struct SpmvHostTrace* trace) {
                 trace->actualRanks, trace->numTasklets);
         writeCsvString(fp, event->op);
         fputc(',', fp);
-        writeCsvString(fp, event->subop);
-        fputc(',', fp);
         writeCsvString(fp, event->direction);
         fputc(',', fp);
+        writeCsvString(fp, eventSdkApiKind);
+        fputc(',', fp);
+        writeCsvString(fp, distributionClass);
+        fputc(',', fp);
         if(event->hasDpu) {
-            fprintf(fp, "%u,%u,%u", event->globalDpuId,
+            fprintf(fp,
+                    "MRAM,%" PRIu64
+                    ",1,1,1,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,",
+                    event->transferBytes,
                     trace->rankOrdinals[event->globalDpuId],
-                    trace->dpuIdsInRank[event->globalDpuId]);
+                    trace->dpuIdsInRank[event->globalDpuId],
+                    trace->sdkPhysicalRankIds[event->globalDpuId],
+                    trace->dpuSysfsRankIds[event->globalDpuId],
+                    trace->dpuRankNumaNodes[event->globalDpuId],
+                    trace->dpuChannelIds[event->globalDpuId],
+                    trace->sdkSliceIds[event->globalDpuId],
+                    trace->sdkMemberIds[event->globalDpuId],
+                    trace->sdkSliceIds[event->globalDpuId],
+                    trace->sdkMemberIds[event->globalDpuId]);
+            writeCsvString(fp, physicalDpuIdentity);
+            fputc(',', fp);
+            writeCsvString(fp, cpuDpuNumaRelation(trace, event->globalDpuId));
+            fputc(',', fp);
+            writeCsvString(fp, sameSource);
         } else {
-            fputs(",,", fp);
+            fputs(",,,,,,,,,,,,,,,,,", fp);
         }
+        fputc(',', fp);
+        writeCsvString(fp, eventPhaseClass);
+        fputc(',', fp);
+        writeCsvString(fp, event->subop);
+        fputc(',', fp);
         if(event->hasDpu) {
-            fputs(",MRAM,DPU_MRAM_HEAP_POINTER_NAME,", fp);
-            fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%" PRIu64,
-                    event->offsetBytes, event->logicalBytes, event->transferBytes);
+            fprintf(fp, "%u,DPU_MRAM_HEAP_POINTER_NAME,%" PRIu64 ",",
+                    event->globalDpuId, event->offsetBytes);
+            writeCsvString(fp, offsetFeature);
+            fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIuPTR
+                    ",%" PRIu64 ",",
+                    event->logicalBytes, event->transferBytes,
+                    event->hostBufferAddress, context->hostBufferPageOffset);
+            writeCsvString(fp, context->hostBufferReuseClass);
+            fputc(',', fp);
+            writeCsvString(fp, context->previousSdkOp);
+            fputc(',', fp);
+            writeCsvString(fp, context->previousSdkDirection);
+            fprintf(fp, ",%" PRIu64 ",", context->previousSdkTransferBytes);
+            writeCsvString(fp, context->previousSdkTopologyRelation);
+            fprintf(fp, ",%" PRIu64 ",", context->nsSincePreviousSdkEvent);
+            writeCsvString(fp, context->previousDpuDirection);
+            fprintf(fp, ",%" PRIu64 ",", context->previousDpuTransferBytes);
+            writeCsvString(fp, context->previousDpuTargetRelation);
+            fprintf(fp, ",%" PRIu64 ",",
+                    context->launchesSincePreviousDpuTransfer);
+            writeCsvString(fp, context->targetRegionReuseClass);
         } else {
-            fputs(",,,,,", fp);
+            size_t emptyField;
+            fputs(",,,none", fp);
+            for(emptyField = 0; emptyField < 15; ++emptyField) {
+                fputc(',', fp);
+            }
         }
+        fprintf(fp, ",%" PRIu64 ",", event->opCallIndex);
+        if(event->hasDpuOpCallIndex) {
+            fprintf(fp, "%" PRIu64, event->dpuOpCallIndex);
+        }
+        fputc(',', fp);
+        writeCsvString(fp, trace->processState);
+        fprintf(fp, ",%" PRIu64 ",", trace->pretraceWarmupRuns);
+        writeCsvString(fp, trace->hostNumaNode);
+        fputc(',', fp);
+        writeCsvString(fp, callContext);
+        fputc(',', fp);
+        writeCsvString(fp, transportKey);
         fprintf(fp, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                 event->startNs, event->endNs, event->endNs - event->startNs);
     }
@@ -238,8 +933,10 @@ bool spmvHostTraceWrite(const struct SpmvHostTrace* trace) {
     if(fclose(fp) != 0) {
         fprintf(stderr, "Could not close SpMV trace %s: %s\n",
                 trace->outputPath, strerror(errno));
+        free(contexts);
         return false;
     }
+    free(contexts);
     return true;
 }
 
@@ -249,6 +946,14 @@ void spmvHostTraceDestroy(struct SpmvHostTrace* trace) {
     }
     free(trace->rankOrdinals);
     free(trace->dpuIdsInRank);
+    free(trace->sdkPhysicalRankIds);
+    free(trace->dpuSysfsRankIds);
+    free(trace->dpuRankNumaNodes);
+    free(trace->dpuChannelIds);
+    free(trace->sdkSliceIds);
+    free(trace->sdkMemberIds);
+    free(trace->dpuCopyToCallCounts);
+    free(trace->dpuCopyFromCallCounts);
     free(trace->events);
     memset(trace, 0, sizeof(*trace));
 }

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 /**
 * app.c
 * SpMV Host Application Source File
@@ -5,6 +7,7 @@
 */
 #include <dpu.h>
 #include <dpu_log.h>
+#include <dpu_management.h>
 
 #include <assert.h>
 #include <getopt.h>
@@ -29,6 +32,143 @@
 #include <dpu_probe.h>
 #endif
 
+struct SpmvDpuAllocation {
+    bool usesPinnedRanks;
+    uint32_t nrRankSets;
+    struct dpu_set_t* rankSets;
+    struct dpu_rank_t** combinedRanks;
+};
+
+static void destroyPinnedAllocationStorage(
+    struct SpmvDpuAllocation* allocation
+) {
+    free(allocation->rankSets);
+    free(allocation->combinedRanks);
+    allocation->rankSets = NULL;
+    allocation->combinedRanks = NULL;
+    allocation->nrRankSets = 0;
+    allocation->usesPinnedRanks = false;
+}
+
+static dpu_error_t allocateSpmvDpus(
+    struct SpmvDpuAllocation* allocation,
+    struct dpu_set_t* dpuSet
+) {
+    const char* requestedPaths = getenv("SPMV_DPU_RANK_PATHS");
+    char* pathsCopy;
+    char* path;
+    char* pathSave = NULL;
+    uint32_t expectedRanks;
+    uint32_t rankIndex = 0;
+    dpu_error_t status = DPU_OK;
+
+    memset(allocation, 0, sizeof(*allocation));
+    if(requestedPaths == NULL || requestedPaths[0] == '\0') {
+        return dpu_alloc(NR_DPUS, NULL, dpuSet);
+    }
+    if(NR_DPUS % 64 != 0) {
+        fprintf(stderr,
+                "SPMV_DPU_RANK_PATHS requires a whole number of 64-DPU ranks\n");
+        return DPU_ERR_ALLOCATION;
+    }
+
+    expectedRanks = NR_DPUS / 64;
+    allocation->rankSets = calloc(expectedRanks, sizeof(*allocation->rankSets));
+    allocation->combinedRanks = calloc(
+        expectedRanks, sizeof(*allocation->combinedRanks)
+    );
+    pathsCopy = malloc(strlen(requestedPaths) + 1);
+    if(allocation->rankSets == NULL || allocation->combinedRanks == NULL
+       || pathsCopy == NULL) {
+        free(pathsCopy);
+        destroyPinnedAllocationStorage(allocation);
+        return DPU_ERR_SYSTEM;
+    }
+    strcpy(pathsCopy, requestedPaths);
+
+    for(path = strtok_r(pathsCopy, ",", &pathSave);
+        path != NULL;
+        path = strtok_r(NULL, ",", &pathSave)) {
+        char profile[512];
+        struct dpu_rank_t* rank;
+        int profileLength;
+
+        if(rankIndex >= expectedRanks || path[0] == '\0') {
+            status = DPU_ERR_INVALID_PROFILE;
+            break;
+        }
+        profileLength = snprintf(
+            profile, sizeof(profile), "backend=hw,rankPath=%s", path
+        );
+        if(profileLength < 0 || (size_t)profileLength >= sizeof(profile)) {
+            status = DPU_ERR_INVALID_PROFILE;
+            break;
+        }
+        status = dpu_alloc_ranks(1, profile, &allocation->rankSets[rankIndex]);
+        if(status != DPU_OK) {
+            fprintf(stderr, "Could not allocate requested DPU rank %s: %s\n",
+                    path, dpu_error_to_string(status));
+            break;
+        }
+        rank = dpu_rank_from_set(allocation->rankSets[rankIndex]);
+        if(rank == NULL) {
+            status = DPU_ERR_INVALID_DPU_SET;
+            ++rankIndex;
+            break;
+        }
+        allocation->combinedRanks[rankIndex] = rank;
+        ++rankIndex;
+    }
+    free(pathsCopy);
+
+    if(status == DPU_OK && rankIndex != expectedRanks) {
+        fprintf(stderr,
+                "SPMV_DPU_RANK_PATHS contains %u ranks, expected %u\n",
+                rankIndex, expectedRanks);
+        status = DPU_ERR_ALLOCATION;
+    }
+    if(status != DPU_OK) {
+        while(rankIndex > 0) {
+            --rankIndex;
+            dpu_free(allocation->rankSets[rankIndex]);
+        }
+        destroyPinnedAllocationStorage(allocation);
+        return status;
+    }
+
+    allocation->usesPinnedRanks = true;
+    allocation->nrRankSets = expectedRanks;
+    if(expectedRanks == 1) {
+        *dpuSet = allocation->rankSets[0];
+        return DPU_OK;
+    }
+    memset(dpuSet, 0, sizeof(*dpuSet));
+    dpuSet->kind = DPU_SET_RANKS;
+    dpuSet->list.nr_ranks = expectedRanks;
+    dpuSet->list.ranks = allocation->combinedRanks;
+    return DPU_OK;
+}
+
+static dpu_error_t freeSpmvDpus(
+    struct SpmvDpuAllocation* allocation,
+    struct dpu_set_t dpuSet
+) {
+    dpu_error_t status = DPU_OK;
+    uint32_t rankIndex;
+
+    if(!allocation->usesPinnedRanks) {
+        return dpu_free(dpuSet);
+    }
+    for(rankIndex = 0; rankIndex < allocation->nrRankSets; ++rankIndex) {
+        dpu_error_t rankStatus = dpu_free(allocation->rankSets[rankIndex]);
+        if(rankStatus != DPU_OK) {
+            status = rankStatus;
+        }
+    }
+    destroyPinnedAllocationStorage(allocation);
+    return status;
+}
+
 // Main of the Host Application
 int main(int argc, char** argv) {
 
@@ -45,6 +185,7 @@ int main(int argc, char** argv) {
 
     // Allocate DPUs and load binary
     struct dpu_set_t dpu_set, dpu;
+    struct SpmvDpuAllocation dpuAllocation;
     uint32_t numDPUs;
     bool traceRequested = spmvHostTraceRequested();
     uint64_t allocStartNs = 0;
@@ -54,7 +195,7 @@ int main(int argc, char** argv) {
     if(traceRequested) {
         allocStartNs = spmvHostTraceNowNs();
     }
-    DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    DPU_ASSERT(allocateSpmvDpus(&dpuAllocation, &dpu_set));
     if(traceRequested) {
         allocEndNs = spmvHostTraceNowNs();
         loadStartNs = spmvHostTraceNowNs();
@@ -67,14 +208,14 @@ int main(int argc, char** argv) {
     PRINT_INFO(p.verbosity >= 1, "Allocated %d DPU(s)", numDPUs);
     struct SpmvHostTrace hostTrace;
     if(!spmvHostTraceInit(&hostTrace, dpu_set, numDPUs, NR_TASKLETS)) {
-        DPU_ASSERT(dpu_free(dpu_set));
+        DPU_ASSERT(freeSpmvDpus(&dpuAllocation, dpu_set));
         return EXIT_FAILURE;
     }
     if(spmvHostTraceEnabled(&hostTrace)) {
         spmvHostTraceRecord(&hostTrace, "dpu_alloc", "", "", false, 0,
-                            0, 0, 0, allocStartNs, allocEndNs);
+                            0, 0, 0, NULL, allocStartNs, allocEndNs);
         spmvHostTraceRecord(&hostTrace, "dpu_load", "", "", false, 0,
-                            0, 0, 0, loadStartNs, loadEndNs);
+                            0, 0, 0, NULL, loadStartNs, loadEndNs);
     }
 
     // Initialize SpMV data structures
@@ -186,7 +327,7 @@ int main(int argc, char** argv) {
     if(spmvHostTraceEnabled(&hostTrace)) {
         launchEndNs = spmvHostTraceNowNs();
         spmvHostTraceRecord(&hostTrace, "dpu_launch", "sync", "", false, 0,
-                            0, 0, 0, launchStartNs, launchEndNs);
+                            0, 0, 0, NULL, launchStartNs, launchEndNs);
     }
     #if ENERGY
     DPU_ASSERT(dpu_probe_stop(&probe));
@@ -264,11 +405,11 @@ int main(int argc, char** argv) {
     if(spmvHostTraceEnabled(&hostTrace)) {
         freeStartNs = spmvHostTraceNowNs();
     }
-    DPU_ASSERT(dpu_free(dpu_set));
+    DPU_ASSERT(freeSpmvDpus(&dpuAllocation, dpu_set));
     if(spmvHostTraceEnabled(&hostTrace)) {
         freeEndNs = spmvHostTraceNowNs();
         spmvHostTraceRecord(&hostTrace, "dpu_free", "", "", false, 0,
-                            0, 0, 0, freeStartNs, freeEndNs);
+                            0, 0, 0, NULL, freeStartNs, freeEndNs);
     }
 
     if(!spmvHostTraceWrite(&hostTrace)) {

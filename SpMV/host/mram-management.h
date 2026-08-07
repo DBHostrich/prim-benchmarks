@@ -55,7 +55,8 @@ static void copyToDPUTraced(
     DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
     endNs = spmvHostTraceNowNs();
     spmvHostTraceRecord(trace, "dpu_copy_to", subop, "TO_DPU", true, globalDpuId,
-                        logicalSize, transferSize, mramIdx, startNs, endNs);
+                        logicalSize, transferSize, mramIdx, hostPtr,
+                        startNs, endNs);
 }
 
 static void copyFromDPUTraced(
@@ -79,7 +80,8 @@ static void copyFromDPUTraced(
     DPU_ASSERT(dpu_copy_from(dpu, DPU_MRAM_HEAP_POINTER_NAME, mramIdx, hostPtr, transferSize));
     endNs = spmvHostTraceNowNs();
     spmvHostTraceRecord(trace, "dpu_copy_from", subop, "FROM_DPU", true, globalDpuId,
-                        logicalSize, transferSize, mramIdx, startNs, endNs);
+                        logicalSize, transferSize, mramIdx, hostPtr,
+                        startNs, endNs);
 }
 
 #endif
