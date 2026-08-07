@@ -108,10 +108,19 @@ int main(int argc, char** argv) {
     uint32_t level = 1;
 
     // Partition data structure across DPUs
-    uint32_t numNodesPerDPU = ROUND_UP_TO_MULTIPLE_OF_64((numNodes - 1)/numDPUs + 1);
-    PRINT_INFO(p.verbosity >= 1, "Assigning %u nodes per DPU", numNodesPerDPU);
+    assert(numNodes % 64 == 0);
+    uint32_t numNodeTiles = numNodes / 64;
+    uint32_t baseTilesPerDPU = numNodeTiles / numDPUs;
+    uint32_t extraTileDPUs = numNodeTiles % numDPUs;
+    PRINT_INFO(
+        p.verbosity >= 1,
+        "Assigning %u 64-node tiles across %u DPUs (%u or %u tiles per DPU)",
+        numNodeTiles, numDPUs, baseTilesPerDPU,
+        baseTilesPerDPU + (extraTileDPUs > 0 ? 1 : 0)
+    );
     struct DPUParams dpuParams[numDPUs];
     uint32_t dpuParams_m[numDPUs];
+    memset(dpuParams, 0, sizeof(dpuParams));
     unsigned int dpuIdx = 0;
     DPU_FOREACH (dpu_set, dpu) {
 
@@ -121,15 +130,12 @@ int main(int argc, char** argv) {
         dpuParams_m[dpuIdx] = mram_heap_alloc(&allocator, sizeof(struct DPUParams));
 
         // Find DPU's nodes
-        uint32_t dpuStartNodeIdx = dpuIdx*numNodesPerDPU;
-        uint32_t dpuNumNodes;
-        if(dpuStartNodeIdx > numNodes) {
-            dpuNumNodes = 0;
-        } else if(dpuStartNodeIdx + numNodesPerDPU > numNodes) {
-            dpuNumNodes = numNodes - dpuStartNodeIdx;
-        } else {
-            dpuNumNodes = numNodesPerDPU;
-        }
+        uint32_t dpuTileCount = baseTilesPerDPU
+            + (dpuIdx < extraTileDPUs ? 1 : 0);
+        uint32_t dpuStartTile = dpuIdx * baseTilesPerDPU
+            + (dpuIdx < extraTileDPUs ? dpuIdx : extraTileDPUs);
+        uint32_t dpuStartNodeIdx = dpuStartTile * 64;
+        uint32_t dpuNumNodes = dpuTileCount * 64;
         dpuParams[dpuIdx].dpuNumNodes = dpuNumNodes;
         PRINT_INFO(p.verbosity >= 2, "    DPU %u:", dpuIdx);
         PRINT_INFO(p.verbosity >= 2, "        Receives %u nodes", dpuNumNodes);
@@ -293,8 +299,8 @@ int main(int argc, char** argv) {
                         currentFrontier[i] |= nextFrontier[i];
                     }
                 }
-                ++dpuIdx;
             }
+            ++dpuIdx;
         }
 
         // Check if the next frontier is empty, and copy data to DPU if not empty
@@ -323,8 +329,8 @@ int main(int argc, char** argv) {
                                     (uint8_t*)&dpuParams[dpuIdx],
                                     dpuParams_m[dpuIdx],
                                     sizeof(struct DPUParams));
-                    ++dpuIdx;
                 }
+                ++dpuIdx;
             }
         }
         stopTimer(&timer);
@@ -345,7 +351,7 @@ int main(int argc, char** argv) {
     DPU_FOREACH (dpu_set, dpu) {
         uint32_t dpuNumNodes = dpuParams[dpuIdx].dpuNumNodes;
         if(dpuNumNodes > 0) {
-            uint32_t dpuStartNodeIdx = dpuIdx*numNodesPerDPU;
+            uint32_t dpuStartNodeIdx = dpuParams[dpuIdx].dpuStartNodeIdx;
             copyFromDPUTraced(&hostTrace, dpuIdx, "node_level_result", -1,
                               dpu, dpuParams[dpuIdx].dpuNodeLevel_m,
                               (uint8_t*)(nodeLevel + dpuStartNodeIdx),

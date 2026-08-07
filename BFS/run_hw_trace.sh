@@ -14,6 +14,9 @@ TRANSPORT_KEY_SPREAD_THRESHOLD_PCT="${TRANSPORT_KEY_SPREAD_THRESHOLD_PCT:-25}"
 TRANSPORT_KEY_CV_THRESHOLD_PCT="${TRANSPORT_KEY_CV_THRESHOLD_PCT:-25}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
+EXPECTED_DPU_NUMA_NODE="${EXPECTED_DPU_NUMA_NODE:-}"
+EXPECTED_DPU_SYSFS_RANKS="${EXPECTED_DPU_SYSFS_RANKS:-}"
+EXPECTED_DPU_CHANNELS="${EXPECTED_DPU_CHANNELS:-}"
 DPUS_LIST="${DPUS_LIST:-256 512}"
 TASKLETS_LIST="${TASKLETS_LIST:-1 2 4 8 16}"
 GRAPH_PATH="data/loc-gowalla_edges.txt"
@@ -66,6 +69,20 @@ else
     TRACE_HOST_NUMA_NODE="unbound"
 fi
 
+validation_args=()
+if [[ "$TRACE_HOST_NUMA_NODE" != "unbound" ]]; then
+    validation_args+=(--expected-host-numa-node "$TRACE_HOST_NUMA_NODE")
+fi
+if [[ -n "$EXPECTED_DPU_NUMA_NODE" ]]; then
+    validation_args+=(--expected-dpu-numa-node "$EXPECTED_DPU_NUMA_NODE")
+fi
+if [[ -n "$EXPECTED_DPU_SYSFS_RANKS" ]]; then
+    validation_args+=(--expected-sysfs-ranks "$EXPECTED_DPU_SYSFS_RANKS")
+fi
+if [[ -n "$EXPECTED_DPU_CHANNELS" ]]; then
+    validation_args+=(--expected-channels "$EXPECTED_DPU_CHANNELS")
+fi
+
 require_correct_result() {
     local log_path="$1"
     if grep -q "Mismatch at node" "$log_path"; then
@@ -85,9 +102,11 @@ for nr_dpus in $DPUS_LIST; do
         make NR_DPUS="$nr_dpus" NR_TASKLETS="$tasklets" all \
             > "$result_dir/build.log" 2>&1
         sha256sum bin/host_code bin/dpu_code > "$result_dir/binaries.sha256"
-        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nDPU_RANK_TOPOLOGY_TSV=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
+        printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nNUMA_NODE=%s\nTRACE_HOST_NUMA_NODE=%s\nDPU_RANK_TOPOLOGY_TSV=%s\nEXPECTED_DPU_NUMA_NODE=%s\nEXPECTED_DPU_SYSFS_RANKS=%s\nEXPECTED_DPU_CHANNELS=%s\nN_WARMUP=%s\nN_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nTRANSPORT_KEY_MIN_SAMPLES=%s\nTRANSPORT_KEY_MIN_TRACES=%s\nTRANSPORT_KEY_SPREAD_THRESHOLD_PCT=%s\nTRANSPORT_KEY_CV_THRESHOLD_PCT=%s\nCREATE_ARCHIVE=%s\nGRAPH=%s\n' \
             "$nr_dpus" "$tasklets" "$NUMA_NODE" "$TRACE_HOST_NUMA_NODE" \
-            "$BFS_TRACE_DPU_RANK_TOPOLOGY_TSV" "$N_WARMUP" "$N_REPS" \
+            "$BFS_TRACE_DPU_RANK_TOPOLOGY_TSV" \
+            "$EXPECTED_DPU_NUMA_NODE" "$EXPECTED_DPU_SYSFS_RANKS" \
+            "$EXPECTED_DPU_CHANNELS" "$N_WARMUP" "$N_REPS" \
             "$TRANSPORT_KEY_VERSION" \
             "$TRANSPORT_KEY_MIN_SAMPLES" \
             "$TRANSPORT_KEY_MIN_TRACES" \
@@ -122,12 +141,16 @@ for nr_dpus in $DPUS_LIST; do
             run_log="$result_dir/run_${rep_id}.log"
             run_bfs 0 > "$run_log" 2>&1
             require_correct_result "$run_log"
+            python3 "$SCRIPT_DIR/validate_hw_trace.py" \
+                "${validation_args[@]}" "$BFS_TRACE_CSV" \
+                > "$result_dir/trace_${rep_id}_validation.log"
         done
         unset BFS_TRACE_CSV BFS_TRACE_RUN_ID BFS_TRACE_REPEAT_ID \
             BFS_TRACE_HOST_NUMA_NODE BFS_TRACE_PROCESS_STATE \
             BFS_TRACE_PREWARM_RUNS || true
 
-        python3 "$SCRIPT_DIR/validate_hw_trace.py" "$result_dir"/trace_*.csv \
+        python3 "$SCRIPT_DIR/validate_hw_trace.py" \
+            "${validation_args[@]}" "$result_dir"/trace_*.csv \
             > "$result_dir/validation.log"
         python3 "$SCRIPT_DIR/analyze_transport_keys.py" \
             --min-samples "$TRANSPORT_KEY_MIN_SAMPLES" \

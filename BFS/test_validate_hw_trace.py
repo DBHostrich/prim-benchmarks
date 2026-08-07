@@ -263,48 +263,48 @@ class BfsTraceValidatorTest(unittest.TestCase):
         append("dpu_alloc")
         append("dpu_load")
 
-        nodes_per_dpu = self.num_nodes // nr_dpus
+        partitions = validate_hw_trace.dpu_partitions(self.num_nodes, nr_dpus)
         frontier_bytes = self.num_nodes // 64 * 8
-        for dpu_id in range(nr_dpus):
-            start_node = dpu_id * nodes_per_dpu
+        for dpu_id, (start_node, dpu_nodes) in enumerate(partitions):
             dpu_edges = sum(
-                self.degrees[start_node : start_node + nodes_per_dpu]
+                self.degrees[start_node : start_node + dpu_nodes]
             )
-            append(
-                "dpu_copy_to",
-                "node_ptrs",
-                direction="TO_DPU",
-                dpu_id=dpu_id,
-                logical_bytes=(nodes_per_dpu + 1) * 4,
-            )
-            append(
-                "dpu_copy_to",
-                "neighbor_idxs",
-                direction="TO_DPU",
-                dpu_id=dpu_id,
-                logical_bytes=dpu_edges * 4,
-            )
-            append(
-                "dpu_copy_to",
-                "node_level_init",
-                direction="TO_DPU",
-                dpu_id=dpu_id,
-                logical_bytes=nodes_per_dpu * 4,
-            )
-            append(
-                "dpu_copy_to",
-                "visited_init",
-                direction="TO_DPU",
-                dpu_id=dpu_id,
-                logical_bytes=frontier_bytes,
-            )
-            append(
-                "dpu_copy_to",
-                "frontier_init",
-                direction="TO_DPU",
-                dpu_id=dpu_id,
-                logical_bytes=frontier_bytes,
-            )
+            if dpu_nodes > 0:
+                append(
+                    "dpu_copy_to",
+                    "node_ptrs",
+                    direction="TO_DPU",
+                    dpu_id=dpu_id,
+                    logical_bytes=(dpu_nodes + 1) * 4,
+                )
+                append(
+                    "dpu_copy_to",
+                    "neighbor_idxs",
+                    direction="TO_DPU",
+                    dpu_id=dpu_id,
+                    logical_bytes=dpu_edges * 4,
+                )
+                append(
+                    "dpu_copy_to",
+                    "node_level_init",
+                    direction="TO_DPU",
+                    dpu_id=dpu_id,
+                    logical_bytes=dpu_nodes * 4,
+                )
+                append(
+                    "dpu_copy_to",
+                    "visited_init",
+                    direction="TO_DPU",
+                    dpu_id=dpu_id,
+                    logical_bytes=frontier_bytes,
+                )
+                append(
+                    "dpu_copy_to",
+                    "frontier_init",
+                    direction="TO_DPU",
+                    dpu_id=dpu_id,
+                    logical_bytes=frontier_bytes,
+                )
             append(
                 "dpu_copy_to",
                 "params_init",
@@ -315,7 +315,9 @@ class BfsTraceValidatorTest(unittest.TestCase):
 
         for level in range(1, validate_hw_trace.EXPECTED_LEVELS + 1):
             append("dpu_launch", "bfs_level", str(level))
-            for dpu_id in range(nr_dpus):
+            for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+                if dpu_nodes == 0:
+                    continue
                 append(
                     "dpu_copy_from",
                     "frontier_result",
@@ -326,7 +328,9 @@ class BfsTraceValidatorTest(unittest.TestCase):
                 )
             if level < validate_hw_trace.EXPECTED_LEVELS:
                 next_level = str(level + 1)
-                for dpu_id in range(nr_dpus):
+                for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+                    if dpu_nodes == 0:
+                        continue
                     append(
                         "dpu_copy_to",
                         "frontier_broadcast",
@@ -344,13 +348,15 @@ class BfsTraceValidatorTest(unittest.TestCase):
                         44,
                     )
 
-        for dpu_id in range(nr_dpus):
+        for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+            if dpu_nodes == 0:
+                continue
             append(
                 "dpu_copy_from",
                 "node_level_result",
                 direction="FROM_DPU",
                 dpu_id=dpu_id,
-                logical_bytes=nodes_per_dpu * 4,
+                logical_bytes=dpu_nodes * 4,
             )
         append("dpu_free")
 
@@ -400,6 +406,56 @@ class BfsTraceValidatorTest(unittest.TestCase):
             self.assertEqual(summary["events"], 17_933)
             self.assertEqual(summary["h2d_transfer_bytes"], 147_838_376)
             self.assertEqual(summary["d2h_transfer_bytes"], 126_615_552)
+
+    def test_balances_loc_gowalla_across_1280_dpus(self) -> None:
+        partitions = validate_hw_trace.dpu_partitions(self.num_nodes, 1280)
+        self.assertEqual(len(partitions), 1280)
+        self.assertEqual(partitions[0], (0, 192))
+        self.assertEqual(partitions[511], (511 * 192, 192))
+        self.assertEqual(partitions[512], (512 * 192, 128))
+        self.assertEqual(partitions[-1][0] + partitions[-1][1], self.num_nodes)
+        self.assertEqual(sum(nodes for _, nodes in partitions), self.num_nodes)
+        self.assertTrue(all(nodes > 0 and nodes % 64 == 0 for _, nodes in partitions))
+
+        metrics = validate_hw_trace.expected_metrics(1280)
+        self.assertEqual(metrics["active_dpus"], 1280)
+        self.assertEqual(metrics["actual_ranks"], 20)
+        self.assertEqual(metrics["events"], 44_813)
+
+    def test_valid_1280_dpu_trace_with_numa0_full_capacity_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 1280)
+            summary = validate_hw_trace.validate(
+                path,
+                expected_host_numa_node=0,
+                expected_dpu_numa_node=0,
+                expected_sysfs_ranks=set(range(20)),
+                expected_channels={1, 2, 3, 4, 5},
+            )
+            self.assertEqual(summary["actual_ranks"], 20)
+            self.assertEqual(summary["events"], 44_813)
+
+    def test_enforces_expected_numa_rank_and_channel_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.csv"
+            self.write_trace(path, 64)
+            summary = validate_hw_trace.validate(
+                path,
+                expected_host_numa_node=0,
+                expected_dpu_numa_node=0,
+                expected_sysfs_ranks={0},
+                expected_channels={1},
+            )
+            self.assertEqual(summary["configured_dpus"], 64)
+            with self.assertRaisesRegex(ValueError, "DPU sysfs ranks"):
+                validate_hw_trace.validate(path, expected_sysfs_ranks={1})
+
+    def test_parses_integer_set_ranges(self) -> None:
+        self.assertEqual(
+            validate_hw_trace.parse_int_set("0-3,7,9-10"),
+            {0, 1, 2, 3, 7, 9, 10},
+        )
 
     def test_rejects_wrong_level(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

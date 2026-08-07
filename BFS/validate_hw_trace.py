@@ -34,6 +34,20 @@ def round_up_to_8(value: int) -> int:
     return ((value + 7) // 8) * 8
 
 
+def dpu_partitions(num_nodes: int, nr_dpus: int) -> list[tuple[int, int]]:
+    require(num_nodes % 64 == 0, f"num_nodes={num_nodes} is not tile aligned")
+    tile_count = num_nodes // 64
+    base_tiles, extra_tile_dpus = divmod(tile_count, nr_dpus)
+    partitions = []
+    for dpu_id in range(nr_dpus):
+        dpu_tiles = base_tiles + int(dpu_id < extra_tile_dpus)
+        start_tile = (
+            dpu_id * base_tiles + min(dpu_id, extra_tile_dpus)
+        )
+        partitions.append((start_tile * 64, dpu_tiles * 64))
+    return partitions
+
+
 @lru_cache(maxsize=1)
 def graph_degrees() -> list[int]:
     with GRAPH_PATH.open() as stream:
@@ -62,54 +76,59 @@ def expected_metrics(nr_dpus: int) -> dict[str, object]:
         nr_dpus % 64 == 0,
         f"configured_dpus={nr_dpus} is not a whole number of 64-DPU ranks",
     )
-    require(
-        num_nodes % nr_dpus == 0,
-        f"configured_dpus={nr_dpus} does not divide {num_nodes} nodes",
-    )
-    nodes_per_dpu = num_nodes // nr_dpus
+    partitions = dpu_partitions(num_nodes, nr_dpus)
+    active_partitions = [
+        (start_node, dpu_nodes)
+        for start_node, dpu_nodes in partitions
+        if dpu_nodes > 0
+    ]
+    active_dpus = len(active_partitions)
     frontier_bytes = num_nodes // 64 * 8
-    node_ptrs_logical = num_nodes * 4 + nr_dpus * 4
+    node_ptrs_logical = sum(
+        (dpu_nodes + 1) * 4 for _, dpu_nodes in active_partitions
+    )
     neighbor_logical = sum(degrees) * 4
     neighbor_transfer = sum(
         round_up_to_8(
-            sum(degrees[index : index + nodes_per_dpu]) * 4
+            sum(degrees[start_node : start_node + dpu_nodes]) * 4
         )
-        for index in range(0, num_nodes, nodes_per_dpu)
+        for start_node, dpu_nodes in active_partitions
     )
     logical_by_subop = {
         "node_ptrs": node_ptrs_logical,
         "neighbor_idxs": neighbor_logical,
         "node_level_init": num_nodes * 4,
-        "visited_init": nr_dpus * frontier_bytes,
-        "frontier_init": nr_dpus * frontier_bytes,
+        "visited_init": active_dpus * frontier_bytes,
+        "frontier_init": active_dpus * frontier_bytes,
         "params_init": nr_dpus * 44,
-        "frontier_broadcast": 9 * nr_dpus * frontier_bytes,
-        "params_level": 9 * nr_dpus * 44,
-        "frontier_result": 10 * nr_dpus * frontier_bytes,
+        "frontier_broadcast": 9 * active_dpus * frontier_bytes,
+        "params_level": 9 * active_dpus * 44,
+        "frontier_result": 10 * active_dpus * frontier_bytes,
         "node_level_result": num_nodes * 4,
     }
     transfer_by_subop = dict(logical_by_subop)
     transfer_by_subop.update(
         {
-            "node_ptrs": nr_dpus * round_up_to_8(
-                (nodes_per_dpu + 1) * 4
+            "node_ptrs": sum(
+                round_up_to_8((dpu_nodes + 1) * 4)
+                for _, dpu_nodes in active_partitions
             ),
             "neighbor_idxs": neighbor_transfer,
             "params_init": nr_dpus * 48,
-            "params_level": 9 * nr_dpus * 48,
+            "params_level": 9 * active_dpus * 48,
         }
     )
     subop_counts = {
-        "node_ptrs": nr_dpus,
-        "neighbor_idxs": nr_dpus,
-        "node_level_init": nr_dpus,
-        "visited_init": nr_dpus,
-        "frontier_init": nr_dpus,
+        "node_ptrs": active_dpus,
+        "neighbor_idxs": active_dpus,
+        "node_level_init": active_dpus,
+        "visited_init": active_dpus,
+        "frontier_init": active_dpus,
         "params_init": nr_dpus,
-        "frontier_broadcast": 9 * nr_dpus,
-        "params_level": 9 * nr_dpus,
-        "frontier_result": 10 * nr_dpus,
-        "node_level_result": nr_dpus,
+        "frontier_broadcast": 9 * active_dpus,
+        "params_level": 9 * active_dpus,
+        "frontier_result": 10 * active_dpus,
+        "node_level_result": active_dpus,
         "bfs_level": EXPECTED_LEVELS,
     }
     h2d_subops = {
@@ -125,9 +144,11 @@ def expected_metrics(nr_dpus: int) -> dict[str, object]:
     d2h_subops = {"frontier_result", "node_level_result"}
     return {
         "actual_ranks": nr_dpus // 64,
-        "events": 35 * nr_dpus + 13,
-        "copy_to": 24 * nr_dpus,
-        "copy_from": 11 * nr_dpus,
+        "active_dpus": active_dpus,
+        "partitions": partitions,
+        "events": 23 * active_dpus + nr_dpus + 11 * active_dpus + 13,
+        "copy_to": 23 * active_dpus + nr_dpus,
+        "copy_from": 11 * active_dpus,
         "h2d_logical_bytes": sum(
             logical_by_subop[subop] for subop in h2d_subops
         ),
@@ -149,6 +170,28 @@ def expected_metrics(nr_dpus: int) -> dict[str, object]:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def parse_int_set(value: str) -> set[int]:
+    result: set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if end < start:
+                raise argparse.ArgumentTypeError(
+                    f"invalid descending range: {token}"
+                )
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(token))
+    if not result:
+        raise argparse.ArgumentTypeError("expected a non-empty integer set")
+    return result
 
 
 def expected_cpu_dpu_numa_relation(row: dict[str, str]) -> str:
@@ -180,19 +223,27 @@ def expected_sequence(nr_dpus: int) -> list[tuple[str, str, str, str]]:
         "frontier_init",
         "params_init",
     )
-    for dpu_id in range(nr_dpus):
-        for subop in initial_subops:
+    partitions = dpu_partitions(len(graph_degrees()), nr_dpus)
+    for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+        dpu_initial_subops = (
+            initial_subops if dpu_nodes > 0 else ("params_init",)
+        )
+        for subop in dpu_initial_subops:
             sequence.append(("dpu_copy_to", subop, "", str(dpu_id)))
 
     for level in range(1, EXPECTED_LEVELS + 1):
         sequence.append(("dpu_launch", "bfs_level", str(level), ""))
-        for dpu_id in range(nr_dpus):
+        for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+            if dpu_nodes == 0:
+                continue
             sequence.append(
                 ("dpu_copy_from", "frontier_result", str(level), str(dpu_id))
             )
         if level < EXPECTED_LEVELS:
             next_level = str(level + 1)
-            for dpu_id in range(nr_dpus):
+            for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+                if dpu_nodes == 0:
+                    continue
                 sequence.append(
                     ("dpu_copy_to", "frontier_broadcast", next_level, str(dpu_id))
                 )
@@ -200,7 +251,9 @@ def expected_sequence(nr_dpus: int) -> list[tuple[str, str, str, str]]:
                     ("dpu_copy_to", "params_level", next_level, str(dpu_id))
                 )
 
-    for dpu_id in range(nr_dpus):
+    for dpu_id, (_, dpu_nodes) in enumerate(partitions):
+        if dpu_nodes == 0:
+            continue
         sequence.append(("dpu_copy_from", "node_level_result", "", str(dpu_id)))
     sequence.append(("dpu_free", "", "", ""))
     return sequence
@@ -209,6 +262,10 @@ def expected_sequence(nr_dpus: int) -> list[tuple[str, str, str, str]]:
 def validate(
     path: Path,
     allow_legacy_transport_key: bool = False,
+    expected_host_numa_node: int | None = None,
+    expected_dpu_numa_node: int | None = None,
+    expected_sysfs_ranks: set[int] | None = None,
+    expected_channels: set[int] | None = None,
 ) -> dict[str, object]:
     rows = read_trace(path)
     configured = {int(row["configured_dpus"]) for row in rows}
@@ -258,6 +315,12 @@ def validate(
             f"invalid pretrace_warmup_runs values: {warmup_counts}")
     require(len(host_numa_nodes) == 1 and "" not in host_numa_nodes,
             f"invalid host_numa_node values: {host_numa_nodes}")
+    if expected_host_numa_node is not None:
+        require(
+            host_numa_nodes == {str(expected_host_numa_node)},
+            f"host_numa_node values={host_numa_nodes}, expected "
+            f"{expected_host_numa_node}",
+        )
 
     op_call_counts = Counter()
     dpu_op_call_counts = Counter()
@@ -467,6 +530,31 @@ def validate(
         all(int(row["dpu_channel_id"]) >= 0 for row in copy_rows),
         "copy event has an invalid dpu_channel_id",
     )
+    observed_dpu_numa_nodes = {
+        int(row["dpu_rank_numa_node"]) for row in copy_rows
+    }
+    observed_sysfs_ranks = {
+        int(row["dpu_sysfs_rank_id"]) for row in copy_rows
+    }
+    observed_channels = {int(row["dpu_channel_id"]) for row in copy_rows}
+    if expected_dpu_numa_node is not None:
+        require(
+            observed_dpu_numa_nodes == {expected_dpu_numa_node},
+            f"DPU NUMA nodes={observed_dpu_numa_nodes}, expected "
+            f"{expected_dpu_numa_node}",
+        )
+    if expected_sysfs_ranks is not None:
+        require(
+            observed_sysfs_ranks == expected_sysfs_ranks,
+            f"DPU sysfs ranks={sorted(observed_sysfs_ranks)}, expected "
+            f"{sorted(expected_sysfs_ranks)}",
+        )
+    if expected_channels is not None:
+        require(
+            observed_channels == expected_channels,
+            f"DPU channels={sorted(observed_channels)}, expected "
+            f"{sorted(expected_channels)}",
+        )
     require(
         all(0 <= int(row["sdk_slice_id"]) < 8 for row in copy_rows),
         "copy event sdk_slice_id is outside 0..7",
@@ -610,6 +698,22 @@ def validate(
             len(sdk_pairs) == 64,
             f"rank {rank} SDK slice/member pairs are not unique",
         )
+    rank_physical_locations: dict[int, set[tuple[int, int, int]]] = {}
+    sysfs_rank_members = Counter()
+    for topology in dpu_topology.values():
+        rank_ordinal, _, _, sysfs_rank_id, numa_node, channel, _, _ = topology
+        rank_physical_locations.setdefault(rank_ordinal, set()).add(
+            (sysfs_rank_id, numa_node, channel)
+        )
+        sysfs_rank_members[sysfs_rank_id] += 1
+    require(
+        all(len(locations) == 1 for locations in rank_physical_locations.values()),
+        "an allocation-local rank maps to multiple physical rank locations",
+    )
+    require(
+        all(count == 64 for count in sysfs_rank_members.values()),
+        f"physical rank membership={dict(sysfs_rank_members)}",
+    )
     physical_dpu_identities = {
         (
             sysfs_rank_id,
@@ -701,13 +805,24 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("traces", nargs="+", type=Path)
     parser.add_argument("--allow-legacy-transport-key", action="store_true")
+    parser.add_argument("--expected-host-numa-node", type=int)
+    parser.add_argument("--expected-dpu-numa-node", type=int)
+    parser.add_argument("--expected-sysfs-ranks", type=parse_int_set)
+    parser.add_argument("--expected-channels", type=parse_int_set)
     args = parser.parse_args()
 
     summaries = []
     failed = False
     for path in args.traces:
         try:
-            summary = validate(path, args.allow_legacy_transport_key)
+            summary = validate(
+                path,
+                args.allow_legacy_transport_key,
+                expected_host_numa_node=args.expected_host_numa_node,
+                expected_dpu_numa_node=args.expected_dpu_numa_node,
+                expected_sysfs_ranks=args.expected_sysfs_ranks,
+                expected_channels=args.expected_channels,
+            )
         except (OSError, KeyError, TypeError, ValueError) as error:
             print(f"FAIL {path}: {error}", file=sys.stderr)
             failed = True
