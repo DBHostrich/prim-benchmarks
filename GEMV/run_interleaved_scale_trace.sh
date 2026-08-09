@@ -254,6 +254,14 @@ python3 "$SCRIPT_DIR/analyze_transport_keys.py" \
 python3 "$SCRIPT_DIR/summarize_scale_stability.py" \
     "$RESULT_ROOT/transport_key_summary_all.csv" \
     --output "$RESULT_ROOT/scale_stability_summary.csv"
+python3 "$SCRIPT_DIR/analyze_context_keys.py" \
+    --min-samples "$TRANSPORT_KEY_MIN_SAMPLES" \
+    --min-traces "$TRANSPORT_KEY_MIN_TRACES" \
+    --spread-threshold-pct "$TRANSPORT_KEY_SPREAD_THRESHOLD_PCT" \
+    --cv-threshold-pct "$TRANSPORT_KEY_CV_THRESHOLD_PCT" \
+    --schedule "$RESULT_ROOT/schedule.csv" \
+    --output-dir "$RESULT_ROOT/context_analysis" \
+    "${all_traces[@]}" > "$RESULT_ROOT/context_analysis.log"
 
 archive=""
 if [[ "$CREATE_ARCHIVE" == "1" ]]; then
@@ -265,6 +273,7 @@ mkdir -p "$(dirname "$LATEST_RESULT_POINTER")"
 printf '%s\n' "$RESULT_ROOT" | tee "$LATEST_RESULT_POINTER"
 echo "Trace results:    $RESULT_ROOT"
 echo "Scale summary:    $RESULT_ROOT/scale_stability_summary.csv"
+echo "Context analysis: $RESULT_ROOT/context_analysis"
 if [[ -n "$archive" ]]; then
     echo "Archive:          $archive"
 else

@@ -82,6 +82,16 @@ Important files include:
 | `GEMV_*dpu_16tl/transport_key_summary.csv` | per-key stability plus warmup and iterative medians |
 | `transport_key_summary_all.csv` | all six scales in one table |
 | `scale_stability_summary.csv` | one final status row per DPU scale |
+| `context_analysis/context_group_summary.csv` | stability after grouping by the base key, warmup, and predecessor class |
+| `context_analysis/holdout_summary.csv` | pooled leave-one-trace-out coverage and prediction error by transfer class |
+| `context_analysis/holdout_per_trace.csv` | per-trace held-out error for batch and drift diagnosis |
+| `context_analysis/anomaly_events.csv` | ranked events for `input_vector@256` and `output_vector@1024`, joined to schedule slots |
+| `context_analysis/anomaly_trace_summary.csv` | per-trace summaries for the two targeted anomaly groups |
+
+The context analysis is diagnostic: it does not change the canonical v8 key.
+`previous_sdk_op_class` maps `dpu_load`, `dpu_push_xfer`, and `dpu_launch`
+to `LOAD`, `TRANSFER`, and `LAUNCH`. Promotion into a production lookup key
+requires the split groups to pass the stability gate and improve held-out error.
 
 The default stability gate requires at least twenty samples from at least
 twenty trace files. A key is stable when `(P90-P10)/median` and CV are each at
