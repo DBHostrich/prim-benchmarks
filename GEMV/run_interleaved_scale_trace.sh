@@ -23,6 +23,14 @@ CREATE_ARCHIVE="${CREATE_ARCHIVE:-0}"
 DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
 TRANSPORT_KEY_VERSION="v9_predecessor_and_endpoint_reuse_context"
 
+report_failed_result_root() {
+    local status="$?"
+    if (( status != 0 )); then
+        echo "FAILED result root retained at: $RESULT_ROOT" >&2
+    fi
+}
+trap report_failed_result_root EXIT
+
 if [[ -z "$DPU_RANK_TOPOLOGY_TSV" || ! -r "$DPU_RANK_TOPOLOGY_TSV" ]]; then
     echo "ERROR: set DPU_RANK_TOPOLOGY_TSV to a readable dpu_rank_topology.tsv" >&2
     exit 1

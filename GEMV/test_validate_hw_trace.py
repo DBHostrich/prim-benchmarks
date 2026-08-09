@@ -187,6 +187,21 @@ class ValidateHardwareTraceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sysfs ranks"):
                 validate(path, expected_sysfs_ranks={1})
 
+    def test_rejects_empty_lifecycle_predecessor_subop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.create_trace(Path(directory))
+            with path.open(newline="") as stream:
+                reader = csv.DictReader(stream)
+                fields = list(reader.fieldnames or [])
+                rows = list(reader)
+            rows[2]["previous_sdk_subop"] = ""
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "predecessor subop"):
+                validate(path, expected_sysfs_ranks={0})
+
 
 if __name__ == "__main__":
     unittest.main()

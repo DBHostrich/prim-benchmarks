@@ -774,10 +774,12 @@ static bool write_events(const struct GemvHostTrace *trace) {
 					? previous->size_per_dpu_bytes : UINT64_C(0));
 			write_csv_string(stream,
 				previous == NULL || previous->subop == NULL
+					|| previous->subop[0] == '\0'
 					? "NONE" : previous->subop);
 			fputc(',', stream);
 			write_csv_string(stream,
 				previous == NULL || previous->target_space == NULL
+					|| previous->target_space[0] == '\0'
 					? "NONE" : previous->target_space);
 			fputc(',', stream);
 			write_csv_string(stream, previous_sdk_op_class(previous));
