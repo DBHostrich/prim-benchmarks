@@ -8,14 +8,14 @@ import csv
 import statistics
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Dict, Tuple
 
 from analyze_transport_keys import group_statistics, percentile
 from transport_key import TRANSFER_OPS, transport_key
 
 
-Row = dict[str, str]
-Sample = tuple[Path, Row]
+Row = Dict[str, str]
+Sample = Tuple[Path, Row]
 KeyFunction = Callable[[Row], str]
 
 
