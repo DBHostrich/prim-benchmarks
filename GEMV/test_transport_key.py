@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from transport_key import phase_class, transport_key
+from transport_key import phase_class, transport_key, transport_key_v8
 
 
 def transfer_row() -> dict[str, str]:
@@ -29,17 +29,29 @@ def transfer_row() -> dict[str, str]:
         "allocated_dpus": "128",
         "allocated_ranks": "2",
         "previous_sdk_mux_domain_class": "COLLECTION",
+        "previous_sdk_op_class": "PUSH_XFER_TO_DPU_MRAM",
+        "source_buffer_reuse_class": "FIRST_USE",
+        "target_region_reuse_class": "FIRST_ACCESS",
     }
 
 
 class TransportKeyTests(unittest.TestCase):
     def test_collection_key_contains_physical_allocation(self) -> None:
         key = transport_key(transfer_row())
-        self.assertTrue(key.startswith("v8;op=dpu_push_xfer;"))
+        self.assertTrue(key.startswith("v9;op=dpu_push_xfer;"))
         self.assertIn("timing_scope=PUSH_ONLY", key)
         self.assertIn("dpu_sysfs_rank_ids=0|4", key)
         self.assertIn("allocated_dpus=128", key)
         self.assertIn("previous_sdk_mux_domain_class=COLLECTION", key)
+        self.assertIn(
+            "previous_sdk_op_class=PUSH_XFER_TO_DPU_MRAM", key
+        )
+        self.assertIn("source_buffer_reuse_class=FIRST_USE", key)
+
+    def test_v8_key_can_be_reconstructed_for_comparison(self) -> None:
+        key = transport_key_v8(transfer_row())
+        self.assertTrue(key.startswith("v8;op=dpu_push_xfer;"))
+        self.assertNotIn("previous_sdk_op_class", key)
 
     def test_warmup_is_diagnostic_outside_v8_key(self) -> None:
         row = transfer_row()

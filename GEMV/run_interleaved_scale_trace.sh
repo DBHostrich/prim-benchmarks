@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-RESULT_ROOT="${RESULT_ROOT:-/tmp/bdang/gemv_v8_numa0_$(date +%Y%m%d_%H%M%S)}"
-LATEST_RESULT_POINTER="${LATEST_RESULT_POINTER:-/tmp/bdang/latest_gemv_v8_numa0_path.txt}"
+RESULT_ROOT="${RESULT_ROOT:-/tmp/bdang/gemv_v9_numa0_$(date +%Y%m%d_%H%M%S)}"
+LATEST_RESULT_POINTER="${LATEST_RESULT_POINTER:-/tmp/bdang/latest_gemv_v9_numa0_path.txt}"
 NUMA_NODE="${NUMA_NODE:-0}"
 EXCLUDED_SYSFS_RANKS="${EXCLUDED_SYSFS_RANKS:-5}"
 DPUS_LIST="${DPUS_LIST:-64 128 256 512 1024 1216}"
@@ -21,7 +21,7 @@ TRANSPORT_KEY_SPREAD_THRESHOLD_PCT="${TRANSPORT_KEY_SPREAD_THRESHOLD_PCT:-25}"
 TRANSPORT_KEY_CV_THRESHOLD_PCT="${TRANSPORT_KEY_CV_THRESHOLD_PCT:-25}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-0}"
 DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
-TRANSPORT_KEY_VERSION="v8_collection_physical_cpu_dpu_topology"
+TRANSPORT_KEY_VERSION="v9_predecessor_and_endpoint_reuse_context"
 
 if [[ -z "$DPU_RANK_TOPOLOGY_TSV" || ! -r "$DPU_RANK_TOPOLOGY_TSV" ]]; then
     echo "ERROR: set DPU_RANK_TOPOLOGY_TSV to a readable dpu_rank_topology.tsv" >&2

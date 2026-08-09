@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical v8 keys for GEMV collection transfers."""
+"""Canonical v9 keys for GEMV collection transfers."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ V8_FIELDS = (
     "allocated_ranks",
     "previous_sdk_mux_domain_class",
 )
+V9_CONTEXT_FIELDS = (
+    "previous_sdk_op_class",
+    "source_buffer_reuse_class",
+    "target_region_reuse_class",
+)
+V9_FIELDS = V8_FIELDS + V9_CONTEXT_FIELDS
 
 
 def sdk_api_kind(op: str) -> str:
@@ -61,7 +67,46 @@ def phase_class(op: str, warmup: str) -> str:
     return "WARMUP" if warmup == "1" else "ITERATIVE"
 
 
-def transport_key(row: Mapping[str, str]) -> str:
+def previous_sdk_op_class(row: Mapping[str, str]) -> str:
+    operation = row.get("previous_sdk_op", "")
+    direction = row.get("previous_sdk_direction", "")
+    target_space = row.get("previous_sdk_target_space", "")
+    if not operation or operation == "NONE":
+        return "NONE"
+    if operation == "dpu_alloc":
+        return "ALLOC"
+    if operation == "dpu_load":
+        return "LOAD"
+    if operation == "dpu_launch":
+        return "LAUNCH_SYNC"
+    if operation == "dpu_free":
+        return "FREE"
+    if operation == "dpu_push_xfer":
+        if direction == "TO_DPU" and target_space == "WRAM":
+            return "PUSH_XFER_TO_DPU_WRAM"
+        if direction == "TO_DPU" and target_space == "MRAM":
+            return "PUSH_XFER_TO_DPU_MRAM"
+        if direction == "FROM_DPU" and target_space == "MRAM":
+            return "PUSH_XFER_FROM_DPU_MRAM"
+        return "PUSH_XFER_OTHER"
+    return "OTHER"
+
+
+def source_buffer_reuse_class(use_count_before: int) -> str:
+    return "FIRST_USE" if use_count_before == 0 else "REUSED"
+
+
+def target_region_reuse_class(access_count_before: int) -> str:
+    return "FIRST_ACCESS" if access_count_before == 0 else "REUSED"
+
+
+def transport_key_v8(row: Mapping[str, str]) -> str:
     if row["op"] not in TRANSFER_OPS:
         return ""
     return "v8;" + ";".join(f"{field}={row[field]}" for field in V8_FIELDS)
+
+
+def transport_key(row: Mapping[str, str]) -> str:
+    if row["op"] not in TRANSFER_OPS:
+        return ""
+    return "v9;" + ";".join(f"{field}={row[field]}" for field in V9_FIELDS)

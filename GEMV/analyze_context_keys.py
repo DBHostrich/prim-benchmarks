@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 from analyze_transport_keys import group_statistics, percentile
-from transport_key import TRANSFER_OPS, transport_key
+from transport_key import (
+    TRANSFER_OPS,
+    previous_sdk_op_class,
+    transport_key,
+    transport_key_v8,
+)
 
 
 Row = Dict[str, str]
@@ -19,38 +24,35 @@ Sample = Tuple[Path, Row]
 KeyFunction = Callable[[Row], str]
 
 
-def previous_sdk_op_class(row: Row) -> str:
-    operation = row.get("previous_sdk_op", "")
-    if operation == "dpu_load":
-        return "LOAD"
-    if operation == "dpu_launch":
-        return "LAUNCH"
-    if operation == "dpu_push_xfer":
-        return "TRANSFER"
-    if not operation or operation == "NONE":
-        return "NONE"
-    return "OTHER"
-
-
 def base_key(row: Row) -> str:
-    return row["transport_key"]
+    return transport_key_v8(row)
 
 
 def warmup_key(row: Row) -> str:
-    return f"{row['transport_key']};warmup={row['warmup']}"
+    return f"{transport_key_v8(row)};warmup={row['warmup']}"
 
 
 def predecessor_key(row: Row) -> str:
     return (
-        f"{row['transport_key']};"
+        f"{transport_key_v8(row)};"
         f"previous_sdk_op_class={previous_sdk_op_class(row)}"
+    )
+
+
+def reuse_key(row: Row) -> str:
+    return (
+        f"{transport_key_v8(row)};"
+        f"source_buffer_reuse_class={row['source_buffer_reuse_class']};"
+        f"target_region_reuse_class={row['target_region_reuse_class']}"
     )
 
 
 MODEL_KEYS: dict[str, KeyFunction] = {
     "base_v8": base_key,
-    "warmup": warmup_key,
-    "previous_sdk_op_class": predecessor_key,
+    "warmup_v8": warmup_key,
+    "previous_sdk_op_class_v8": predecessor_key,
+    "reuse_context_v8": reuse_key,
+    "base_v9": lambda row: row["transport_key"],
 }
 
 
@@ -86,10 +88,21 @@ def load_samples(paths: list[Path]) -> list[Sample]:
 
 
 def context_value(model: str, row: Row) -> str:
-    if model == "warmup":
+    if model == "warmup_v8":
         return "WARMUP" if row["warmup"] == "1" else "ITERATIVE"
-    if model == "previous_sdk_op_class":
+    if model == "previous_sdk_op_class_v8":
         return previous_sdk_op_class(row)
+    if model == "reuse_context_v8":
+        return (
+            f"{row['source_buffer_reuse_class']}|"
+            f"{row['target_region_reuse_class']}"
+        )
+    if model == "base_v9":
+        return (
+            f"{previous_sdk_op_class(row)}|"
+            f"{row['source_buffer_reuse_class']}|"
+            f"{row['target_region_reuse_class']}"
+        )
     return "POOLED"
 
 
@@ -101,7 +114,7 @@ def summarize_context_groups(
     cv_threshold_pct: float,
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
-    base_group_count = len({row["transport_key"] for _, row in samples})
+    base_group_count = len({transport_key_v8(row) for _, row in samples})
     for model, key_function in MODEL_KEYS.items():
         groups: dict[str, list[Sample]] = defaultdict(list)
         for sample in samples:
@@ -171,7 +184,7 @@ def evaluate_leave_one_trace_out(
     if len(samples_by_path) < 2:
         raise ValueError("leave-one-trace-out evaluation requires at least 2 traces")
 
-    base_group_count = len({row["transport_key"] for _, row in samples})
+    base_group_count = len({transport_key_v8(row) for _, row in samples})
     pooled: dict[tuple[str, str], tuple[list[int], list[float], int]] = {}
     per_trace: list[dict[str, object]] = []
 
@@ -281,7 +294,13 @@ def load_schedule(path: Path | None) -> dict[tuple[str, str], Row]:
 def anomaly_diagnostics(
     samples: list[Sample], schedule_path: Path | None
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    targets = {("input_vector", "256"), ("output_vector", "1024")}
+    targets = {
+        ("input_arguments", "256"),
+        ("input_arguments", "512"),
+        ("input_arguments", "1024"),
+        ("input_vector", "128"),
+        ("input_vector", "256"),
+    }
     groups: dict[tuple[str, str], list[Sample]] = defaultdict(list)
     for sample in samples:
         row = sample[1]

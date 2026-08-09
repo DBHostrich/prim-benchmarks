@@ -189,6 +189,52 @@ static const char *phase_class(const struct GemvHostTraceEvent *event) {
 	return event->warmup == 1 ? "WARMUP" : "ITERATIVE";
 }
 
+static const char *source_buffer_reuse_class(
+	const struct GemvHostTraceEvent *event
+) {
+	if (!event->has_transfer)
+		return "";
+	return event->source_buffer_use_count_before == 0
+		? "FIRST_USE" : "REUSED";
+}
+
+static const char *target_region_reuse_class(
+	const struct GemvHostTraceEvent *event
+) {
+	if (!event->has_transfer)
+		return "";
+	return event->target_region_access_count_before == 0
+		? "FIRST_ACCESS" : "REUSED";
+}
+
+static const char *previous_sdk_op_class(
+	const struct GemvHostTraceEvent *previous
+) {
+	if (previous == NULL)
+		return "NONE";
+	if (strcmp(previous->op, "dpu_alloc") == 0)
+		return "ALLOC";
+	if (strcmp(previous->op, "dpu_load") == 0)
+		return "LOAD";
+	if (strcmp(previous->op, "dpu_launch") == 0)
+		return "LAUNCH_SYNC";
+	if (strcmp(previous->op, "dpu_free") == 0)
+		return "FREE";
+	if (strcmp(previous->op, "dpu_push_xfer") == 0) {
+		if (strcmp(previous->direction, "TO_DPU") == 0
+			&& strcmp(previous->target_space, "WRAM") == 0)
+			return "PUSH_XFER_TO_DPU_WRAM";
+		if (strcmp(previous->direction, "TO_DPU") == 0
+			&& strcmp(previous->target_space, "MRAM") == 0)
+			return "PUSH_XFER_TO_DPU_MRAM";
+		if (strcmp(previous->direction, "FROM_DPU") == 0
+			&& strcmp(previous->target_space, "MRAM") == 0)
+			return "PUSH_XFER_FROM_DPU_MRAM";
+		return "PUSH_XFER_OTHER";
+	}
+	return "OTHER";
+}
+
 static void write_csv_string(FILE *stream, const char *value) {
 	const char *cursor;
 	bool quote = false;
@@ -323,7 +369,7 @@ bool gemv_host_trace_init(
 	}
 	if (topology_path == NULL || topology_path[0] == '\0') {
 		fprintf(stderr,
-			"GEMV_TRACE_DPU_RANK_TOPOLOGY_TSV is required for v8 labels\n");
+			"GEMV_TRACE_DPU_RANK_TOPOLOGY_TSV is required for v9 labels\n");
 		return false;
 	}
 
@@ -531,6 +577,8 @@ void gemv_host_trace_record_transfer(
 	const uint64_t *logical_bytes_per_dpu,
 	uint64_t uniform_logical_bytes,
 	uint64_t size_per_dpu_bytes,
+	uint64_t source_buffer_use_count_before,
+	uint64_t target_region_access_count_before,
 	uint64_t start_ns,
 	uint64_t end_ns
 ) {
@@ -573,6 +621,8 @@ void gemv_host_trace_record_transfer(
 	event->target_space = target_space;
 	event->target_symbol = target_symbol;
 	event->offset_bytes = offset_bytes;
+	event->source_buffer_use_count_before = source_buffer_use_count_before;
+	event->target_region_access_count_before = target_region_access_count_before;
 	event->start_ns = start_ns;
 	event->end_ns = end_ns;
 	++trace->num_events;
@@ -608,7 +658,7 @@ static bool format_transport_key(
 	}
 	result = snprintf(
 		output, output_size,
-		"v8;op=%s;direction=%s;sdk_api_kind=PUSH_XFER;timing_scope=PUSH_ONLY;"
+		"v9;op=%s;direction=%s;sdk_api_kind=PUSH_XFER;timing_scope=PUSH_ONLY;"
 		"logical_distribution_class=%s;target_space=%s;"
 		"transfer_bytes_per_dpu=%" PRIu64 ";active_dpus=%u;"
 		"active_ranks=%u;active_dpus_per_rank=%s;"
@@ -617,7 +667,9 @@ static bool format_transport_key(
 		"dpu_channel_ids=%s;dpu_sysfs_rank_ids=%s;"
 		"dpu_ci_ids=0-7;dpu_member_ids=0-7;"
 		"allocated_topology_signature=%s;allocated_dpus=%u;"
-		"allocated_ranks=%u;previous_sdk_mux_domain_class=COLLECTION",
+		"allocated_ranks=%u;previous_sdk_mux_domain_class=COLLECTION;"
+		"previous_sdk_op_class=%s;source_buffer_reuse_class=%s;"
+		"target_region_reuse_class=%s",
 		event->op, event->direction, logical_distribution_class(event),
 		event->target_space, event->size_per_dpu_bytes,
 		trace->configured_dpus, trace->actual_ranks,
@@ -625,7 +677,11 @@ static bool format_transport_key(
 		trace->host_numa_node, trace->dpu_rank_numa_nodes_text,
 		trace->cpu_dpu_numa_relation, trace->dpu_channel_ids_text,
 		trace->dpu_sysfs_rank_ids_text, trace->allocated_topology_signature,
-		trace->configured_dpus, trace->actual_ranks
+		trace->configured_dpus, trace->actual_ranks,
+		previous_sdk_op_class(
+			event->event_id == 0 ? NULL : &trace->events[event->event_id - 1]
+		),
+		source_buffer_reuse_class(event), target_region_reuse_class(event)
 	);
 	return result >= 0 && (size_t)result < output_size;
 }
@@ -648,7 +704,11 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		"dpu_sysfs_rank_ids,sdk_physical_rank_ids,dpu_ci_ids,dpu_member_ids,"
 		"allocated_topology_signature,allocated_dpus,allocated_ranks,"
 		"previous_sdk_op,previous_sdk_direction,previous_sdk_transfer_bytes,"
-		"previous_sdk_mux_domain_class,phase_class,subop,iteration,warmup,"
+		"previous_sdk_mux_domain_class,previous_sdk_subop,"
+		"previous_sdk_target_space,previous_sdk_op_class,"
+		"source_buffer_reuse_class,target_region_reuse_class,"
+		"source_buffer_use_count_before,target_region_access_count_before,"
+		"phase_class,subop,iteration,warmup,"
 		"size_per_dpu_bytes,total_logical_bytes,total_transfer_bytes,"
 		"target_symbol,offset_bytes,process_state,pretrace_warmup_runs,"
 		"transport_key,host_start_ns,host_end_ns,measured_ns\n",
@@ -662,7 +722,7 @@ static bool write_events(const struct GemvHostTrace *trace) {
 
 		if (!format_transport_key(trace, event, transport_key,
 				sizeof(transport_key))) {
-			fprintf(stderr, "GEMV v8 transport key is too long\n");
+			fprintf(stderr, "GEMV v9 transport key is too long\n");
 			fclose(stream);
 			return false;
 		}
@@ -712,11 +772,27 @@ static bool write_events(const struct GemvHostTrace *trace) {
 			fprintf(stream, ",%" PRIu64 ",COLLECTION,",
 				previous != NULL && previous->has_transfer
 					? previous->size_per_dpu_bytes : UINT64_C(0));
+			write_csv_string(stream,
+				previous == NULL || previous->subop == NULL
+					? "NONE" : previous->subop);
+			fputc(',', stream);
+			write_csv_string(stream,
+				previous == NULL || previous->target_space == NULL
+					? "NONE" : previous->target_space);
+			fputc(',', stream);
+			write_csv_string(stream, previous_sdk_op_class(previous));
+			fputc(',', stream);
+			write_csv_string(stream, source_buffer_reuse_class(event));
+			fputc(',', stream);
+			write_csv_string(stream, target_region_reuse_class(event));
+			fprintf(stream, ",%" PRIu64 ",%" PRIu64 ",",
+				event->source_buffer_use_count_before,
+				event->target_region_access_count_before);
 			write_csv_string(stream, phase_class(event));
 		} else {
 			fputs(",,,,,,,,,,", stream);
 			write_csv_string(stream, trace->host_numa_node);
-			fputs(",,,,,,,,,,,,,,,", stream);
+			fputs(",,,,,,,,,,,,,,,,,,,,,,", stream);
 		}
 		fputc(',', stream);
 		write_csv_string(stream, event->subop);

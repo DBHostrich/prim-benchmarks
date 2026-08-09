@@ -372,6 +372,7 @@ int main(int argc, char **argv) {
 				&host_trace, "input_arguments", "TO_DPU", rep, warmup,
 				"WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,
 				sizeof(dpu_arguments_t), sizeof(dpu_arguments_t),
+				rep, rep,
 				operation_start_ns, operation_end_ns
 			);
 		}
@@ -391,6 +392,7 @@ int main(int argc, char **argv) {
 				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,
 				matrix_logical_bytes, 0,
 				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
+				rep, rep,
 				operation_start_ns, operation_end_ns
 			);
 		}
@@ -408,6 +410,7 @@ int main(int argc, char **argv) {
 				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
 				NULL, (uint64_t)n_size * sizeof(T),
 				(uint64_t)n_size_pad * sizeof(T),
+				rep, rep,
 				operation_start_ns, operation_end_ns
 			);
 		}
@@ -468,6 +471,7 @@ int main(int argc, char **argv) {
 					+ (uint64_t)n_size_pad * sizeof(T),
 				result_logical_bytes, 0,
 				(uint64_t)max_rows_per_dpu * sizeof(T),
+				rep, rep,
 				operation_start_ns, operation_end_ns
 			);
 		}

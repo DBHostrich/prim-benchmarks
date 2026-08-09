@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize repeated GEMV transfer costs by v8 key."""
+"""Summarize repeated GEMV transfer costs by v9 key."""
 
 from __future__ import annotations
 
@@ -157,6 +157,13 @@ def analyze(
                 "allocated_ranks": row["allocated_ranks"],
                 "previous_sdk_mux_domain_class": row[
                     "previous_sdk_mux_domain_class"
+                ],
+                "previous_sdk_op_class": row["previous_sdk_op_class"],
+                "source_buffer_reuse_class": row[
+                    "source_buffer_reuse_class"
+                ],
+                "target_region_reuse_class": row[
+                    "target_region_reuse_class"
                 ],
                 "configured_dpus_values": joined_values(
                     samples, "configured_dpus", numeric=True

@@ -33,8 +33,25 @@ class AnalyzeContextKeysTests(unittest.TestCase):
                 "active_dpus": str(active_dpus),
                 "allocated_dpus": str(active_dpus),
                 "previous_sdk_op": previous_sdk_op,
+                "previous_sdk_direction": (
+                    "FROM_DPU"
+                    if previous_sdk_op == "dpu_push_xfer"
+                    and subop == "input_arguments"
+                    else "TO_DPU"
+                    if previous_sdk_op == "dpu_push_xfer"
+                    else "NONE"
+                ),
+                "previous_sdk_target_space": (
+                    "MRAM" if previous_sdk_op == "dpu_push_xfer" else "NONE"
+                ),
                 "warmup": str(warmup),
                 "iteration": "0" if warmup else "1",
+                "source_buffer_reuse_class": (
+                    "FIRST_USE" if warmup else "REUSED"
+                ),
+                "target_region_reuse_class": (
+                    "FIRST_ACCESS" if warmup else "REUSED"
+                ),
                 "measured_ns": str(measured_ns),
             }
         )
@@ -56,6 +73,7 @@ class AnalyzeContextKeysTests(unittest.TestCase):
                     "same_source_across_group": "0",
                 }
             )
+        row["previous_sdk_op_class"] = previous_sdk_op_class(row)
         row["transport_key"] = transport_key(row)
         return row
 
@@ -87,12 +105,18 @@ class AnalyzeContextKeysTests(unittest.TestCase):
     def test_previous_sdk_operation_classes(self) -> None:
         self.assertEqual(previous_sdk_op_class({"previous_sdk_op": "dpu_load"}), "LOAD")
         self.assertEqual(
-            previous_sdk_op_class({"previous_sdk_op": "dpu_push_xfer"}),
-            "TRANSFER",
+            previous_sdk_op_class(
+                {
+                    "previous_sdk_op": "dpu_push_xfer",
+                    "previous_sdk_direction": "FROM_DPU",
+                    "previous_sdk_target_space": "MRAM",
+                }
+            ),
+            "PUSH_XFER_FROM_DPU_MRAM",
         )
         self.assertEqual(
             previous_sdk_op_class({"previous_sdk_op": "dpu_launch"}),
-            "LAUNCH",
+            "LAUNCH_SYNC",
         )
 
     def test_context_candidate_holdout_and_anomaly_outputs(self) -> None:
@@ -113,11 +137,12 @@ class AnalyzeContextKeysTests(unittest.TestCase):
                     ),
                     self.sample_row(
                         repeat_id, "input_vector", 256,
-                        "dpu_push_xfer", 0, 300 + repeat_id * 5, 3,
+                        "dpu_push_xfer", 0,
+                        2600 if repeat_id == 5 else 300 + repeat_id * 5, 3,
                     ),
                     self.sample_row(
                         repeat_id, "output_vector", 1024, "dpu_launch", 0,
-                        2600 if repeat_id == 5 else 250 + repeat_id, 4,
+                        250 + repeat_id, 4,
                     ),
                 ]
                 self.write_trace(path, rows)
@@ -132,8 +157,10 @@ class AnalyzeContextKeysTests(unittest.TestCase):
             row["model"]: row["table_key_count"] for row in groups
         }
         self.assertEqual(key_counts["base_v8"], 3)
-        self.assertEqual(key_counts["warmup"], 4)
-        self.assertEqual(key_counts["previous_sdk_op_class"], 4)
+        self.assertEqual(key_counts["warmup_v8"], 4)
+        self.assertEqual(key_counts["previous_sdk_op_class_v8"], 4)
+        self.assertEqual(key_counts["reuse_context_v8"], 4)
+        self.assertEqual(key_counts["base_v9"], 4)
 
         holdout = outputs["holdout_summary"]
         by_model_scope = {
@@ -141,7 +168,7 @@ class AnalyzeContextKeysTests(unittest.TestCase):
         }
         base_load = by_model_scope[("base_v8", "input_arguments:LOAD")]
         context_load = by_model_scope[
-            ("previous_sdk_op_class", "input_arguments:LOAD")
+            ("previous_sdk_op_class_v8", "input_arguments:LOAD")
         ]
         self.assertEqual(context_load["coverage_pct"], "100.000000")
         self.assertLess(
@@ -149,14 +176,14 @@ class AnalyzeContextKeysTests(unittest.TestCase):
             float(base_load["p90_abs_pct_error"]),
         )
 
-        output_events = [
+        vector_events = [
             row
             for row in outputs["anomaly_events"]
-            if row["subop"] == "output_vector"
+            if row["subop"] == "input_vector"
         ]
-        self.assertEqual(output_events[0]["repeat_id"], "5")
-        self.assertEqual(output_events[0]["extreme_tukey_outlier"], 1)
-        self.assertEqual(output_events[0]["schedule_slot"], "1")
+        self.assertEqual(vector_events[0]["repeat_id"], "5")
+        self.assertEqual(vector_events[0]["extreme_tukey_outlier"], 1)
+        self.assertEqual(vector_events[0]["schedule_slot"], "0")
 
 
 if __name__ == "__main__":

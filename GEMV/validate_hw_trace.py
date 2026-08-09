@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate GEMV v8 event traces and their per-DPU detail files."""
+"""Validate GEMV v9 event traces and their per-DPU detail files."""
 
 from __future__ import annotations
 
@@ -13,8 +13,11 @@ from pathlib import Path
 from transport_key import (
     logical_distribution_class,
     phase_class,
+    previous_sdk_op_class,
     same_source_across_group,
     sdk_api_kind,
+    source_buffer_reuse_class,
+    target_region_reuse_class,
     transport_key,
 )
 
@@ -64,6 +67,13 @@ EVENT_FIELDS = {
     "previous_sdk_direction",
     "previous_sdk_transfer_bytes",
     "previous_sdk_mux_domain_class",
+    "previous_sdk_subop",
+    "previous_sdk_target_space",
+    "previous_sdk_op_class",
+    "source_buffer_reuse_class",
+    "target_region_reuse_class",
+    "source_buffer_use_count_before",
+    "target_region_access_count_before",
     "phase_class",
     "subop",
     "iteration",
@@ -391,7 +401,7 @@ def validate(
         )
         require(
             row["transport_key"] == transport_key(row),
-            f"event {event_id} v8 transport key differs from raw fields",
+            f"event {event_id} v9 transport key differs from raw fields",
         )
 
     transfer_only_fields = (
@@ -420,6 +430,13 @@ def validate(
         "previous_sdk_direction",
         "previous_sdk_transfer_bytes",
         "previous_sdk_mux_domain_class",
+        "previous_sdk_subop",
+        "previous_sdk_target_space",
+        "previous_sdk_op_class",
+        "source_buffer_reuse_class",
+        "target_region_reuse_class",
+        "source_buffer_use_count_before",
+        "target_region_access_count_before",
         "phase_class",
         "size_per_dpu_bytes",
         "total_logical_bytes",
@@ -436,6 +453,8 @@ def validate(
     durations_by_subop: dict[str, list[int]] = defaultdict(list)
     for row in transfer_rows:
         event_id = int(row["event_id"])
+        iteration = int(row["iteration"])
+        previous = events[event_id - 1] if event_id > 0 else None
         expectation = expected_transfer(row["subop"], nr_dpus, max_rows, n_size_pad)
         size = int(expectation["size"])
         logical = list(expectation["logical"])
@@ -454,6 +473,42 @@ def validate(
         require(
             row["previous_sdk_mux_domain_class"] == "COLLECTION",
             f"event {event_id} predecessor MUX class differs",
+        )
+        require(
+            row["previous_sdk_op_class"] == previous_sdk_op_class(row),
+            f"event {event_id} predecessor operation class differs",
+        )
+        require(
+            row["previous_sdk_subop"]
+            == ("NONE" if previous is None or not previous["subop"] else previous["subop"]),
+            f"event {event_id} predecessor subop differs",
+        )
+        require(
+            row["previous_sdk_target_space"]
+            == (
+                "NONE"
+                if previous is None or not previous["target_space"]
+                else previous["target_space"]
+            ),
+            f"event {event_id} predecessor target space differs",
+        )
+        require(
+            int(row["source_buffer_use_count_before"]) == iteration,
+            f"event {event_id} source buffer use count differs",
+        )
+        require(
+            int(row["target_region_access_count_before"]) == iteration,
+            f"event {event_id} target region access count differs",
+        )
+        require(
+            row["source_buffer_reuse_class"]
+            == source_buffer_reuse_class(iteration),
+            f"event {event_id} source buffer reuse class differs",
+        )
+        require(
+            row["target_region_reuse_class"]
+            == target_region_reuse_class(iteration),
+            f"event {event_id} target region reuse class differs",
         )
         for field, expected in topology.items():
             require(row[field] == expected, f"event {event_id} {field} differs")

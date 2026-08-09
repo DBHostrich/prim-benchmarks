@@ -21,6 +21,8 @@ struct GemvHostTraceEvent {
 	const char *target_space;
 	const char *target_symbol;
 	uint64_t offset_bytes;
+	uint64_t source_buffer_use_count_before;
+	uint64_t target_region_access_count_before;
 	uint64_t start_ns;
 	uint64_t end_ns;
 };
@@ -113,6 +115,8 @@ void gemv_host_trace_record_transfer(
 	const uint64_t *logical_bytes_per_dpu,
 	uint64_t uniform_logical_bytes,
 	uint64_t size_per_dpu_bytes,
+	uint64_t source_buffer_use_count_before,
+	uint64_t target_region_access_count_before,
 	uint64_t start_ns,
 	uint64_t end_ns
 );

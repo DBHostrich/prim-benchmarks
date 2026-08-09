@@ -8,8 +8,11 @@ from pathlib import Path
 from transport_key import (
     logical_distribution_class,
     phase_class,
+    previous_sdk_op_class,
     same_source_across_group,
     sdk_api_kind,
+    source_buffer_reuse_class,
+    target_region_reuse_class,
     transport_key,
 )
 from validate_hw_trace import (
@@ -100,7 +103,26 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                             else "0"
                         ),
                         "previous_sdk_mux_domain_class": "COLLECTION",
+                        "previous_sdk_subop": (
+                            "NONE"
+                            if previous is None or previous["subop"] == ""
+                            else previous["subop"]
+                        ),
+                        "previous_sdk_target_space": (
+                            "NONE"
+                            if previous is None
+                            or previous["target_space"] == ""
+                            else previous["target_space"]
+                        ),
                         "phase_class": phase_class(op, warmup),
+                        "source_buffer_reuse_class": source_buffer_reuse_class(
+                            int(iteration)
+                        ),
+                        "target_region_reuse_class": target_region_reuse_class(
+                            int(iteration)
+                        ),
+                        "source_buffer_use_count_before": iteration,
+                        "target_region_access_count_before": iteration,
                         "size_per_dpu_bytes": str(size),
                         "total_logical_bytes": str(sum(logical)),
                         "total_transfer_bytes": str(size * 64),
@@ -108,6 +130,7 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                         "offset_bytes": str(expectation["offset"]),
                     }
                 )
+                row["previous_sdk_op_class"] = previous_sdk_op_class(row)
                 row["transport_key"] = transport_key(row)
                 for dpu_id in range(64):
                     detail = {field: "" for field in DPU_FIELDS}
@@ -151,7 +174,7 @@ class ValidateHardwareTraceTests(unittest.TestCase):
             writer.writerows(details)
         return event_path
 
-    def test_accepts_complete_v8_collection_trace(self) -> None:
+    def test_accepts_complete_v9_collection_trace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.create_trace(Path(directory))
             summary = validate(path, expected_sysfs_ranks={0})
