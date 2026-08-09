@@ -192,7 +192,8 @@ run_rounds() {
 
             unset GEMV_TRACE_CSV GEMV_TRACE_DPUS_CSV GEMV_TRACE_RUN_ID \
                 GEMV_TRACE_REPEAT_ID GEMV_TRACE_HOST_NUMA_NODE \
-                GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS || true
+                GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS \
+                GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST || true
             if [[ "$phase" == "trace" ]]; then
                 export GEMV_TRACE_CSV="$result_dir/trace_${rep_id}.csv"
                 export GEMV_TRACE_DPUS_CSV="$result_dir/trace_${rep_id}_dpus.csv"
@@ -200,6 +201,8 @@ run_rounds() {
                 export GEMV_TRACE_REPEAT_ID="$rep"
                 export GEMV_TRACE_HOST_NUMA_NODE="$NUMA_NODE"
                 export GEMV_TRACE_PROCESS_STATE="interleaved_fresh_process"
+                export GEMV_TRACE_HOST_BINDING_MODE="NODE_ONLY"
+                export GEMV_TRACE_HOST_CPU_LIST="numa_node_${NUMA_NODE}"
                 export GEMV_TRACE_PREWARM_RUNS="$PROCESS_WARMUP_RUNS"
                 log_path="$result_dir/run_${rep_id}.log"
             else
@@ -219,7 +222,8 @@ run_rounds() {
     done
     unset GEMV_DPU_RANK_PATHS GEMV_TRACE_CSV GEMV_TRACE_DPUS_CSV \
         GEMV_TRACE_RUN_ID GEMV_TRACE_REPEAT_ID GEMV_TRACE_HOST_NUMA_NODE \
-        GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS || true
+        GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS \
+        GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST || true
 }
 
 run_rounds warmup "$PROCESS_WARMUP_RUNS"

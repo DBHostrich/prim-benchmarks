@@ -7,6 +7,23 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct GemvHostTraceMeasurement {
+	uint64_t wall_start_ns;
+	uint64_t wall_end_ns;
+	uint64_t thread_cpu_start_ns;
+	uint64_t thread_cpu_end_ns;
+	int32_t cpu_id_start;
+	int32_t cpu_id_end;
+	uint64_t voluntary_context_switches_start;
+	uint64_t voluntary_context_switches_end;
+	uint64_t involuntary_context_switches_start;
+	uint64_t involuntary_context_switches_end;
+	uint64_t minor_faults_start;
+	uint64_t minor_faults_end;
+	uint64_t major_faults_start;
+	uint64_t major_faults_end;
+};
+
 struct GemvHostTraceEvent {
 	uint64_t event_id;
 	const char *op;
@@ -25,6 +42,14 @@ struct GemvHostTraceEvent {
 	uint64_t target_region_access_count_before;
 	uint64_t start_ns;
 	uint64_t end_ns;
+	uint64_t thread_cpu_ns;
+	uint64_t wall_minus_thread_cpu_ns;
+	int32_t cpu_id_start;
+	int32_t cpu_id_end;
+	uint64_t voluntary_context_switch_delta;
+	uint64_t involuntary_context_switch_delta;
+	uint64_t minor_fault_delta;
+	uint64_t major_fault_delta;
 };
 
 struct GemvHostTraceDpu {
@@ -54,6 +79,8 @@ struct GemvHostTrace {
 	uint32_t max_rows_per_dpu;
 	const char *host_numa_node;
 	const char *process_state;
+	const char *host_binding_mode;
+	const char *host_cpu_list;
 	uint64_t pretrace_warmup_runs;
 	uint32_t *rank_ordinals;
 	uint32_t *dpu_ids_in_rank;
@@ -81,6 +108,8 @@ struct GemvHostTrace {
 bool gemv_host_trace_requested(void);
 bool gemv_host_trace_enabled(const struct GemvHostTrace *trace);
 uint64_t gemv_host_trace_now_ns(void);
+void gemv_host_trace_measurement_begin(struct GemvHostTraceMeasurement *measurement);
+void gemv_host_trace_measurement_end(struct GemvHostTraceMeasurement *measurement);
 
 bool gemv_host_trace_init(
 	struct GemvHostTrace *trace,
@@ -99,8 +128,7 @@ void gemv_host_trace_record_event(
 	const char *subop,
 	int32_t iteration,
 	int32_t warmup,
-	uint64_t start_ns,
-	uint64_t end_ns
+	const struct GemvHostTraceMeasurement *measurement
 );
 
 void gemv_host_trace_record_transfer(
@@ -117,8 +145,7 @@ void gemv_host_trace_record_transfer(
 	uint64_t size_per_dpu_bytes,
 	uint64_t source_buffer_use_count_before,
 	uint64_t target_region_access_count_before,
-	uint64_t start_ns,
-	uint64_t end_ns
+	const struct GemvHostTraceMeasurement *measurement
 );
 
 bool gemv_host_trace_write(const struct GemvHostTrace *trace);

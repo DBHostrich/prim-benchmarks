@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <time.h>
 
 struct GemvPhysicalRankTopology {
@@ -321,6 +323,111 @@ uint64_t gemv_host_trace_now_ns(void) {
 	return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 }
 
+static uint64_t thread_cpu_now_ns(void) {
+	struct timespec now;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) {
+		perror("clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+		exit(EXIT_FAILURE);
+	}
+	return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static void read_runtime_counters(
+	int32_t *cpu_id,
+	uint64_t *voluntary_context_switches,
+	uint64_t *involuntary_context_switches,
+	uint64_t *minor_faults,
+	uint64_t *major_faults
+) {
+	struct rusage usage;
+	int cpu = sched_getcpu();
+	if (cpu < 0) {
+		perror("sched_getcpu");
+		exit(EXIT_FAILURE);
+	}
+	if (getrusage(RUSAGE_THREAD, &usage) != 0) {
+		perror("getrusage(RUSAGE_THREAD)");
+		exit(EXIT_FAILURE);
+	}
+	if (usage.ru_nvcsw < 0 || usage.ru_nivcsw < 0
+		|| usage.ru_minflt < 0 || usage.ru_majflt < 0) {
+		fprintf(stderr, "Negative GEMV runtime diagnostic counter\n");
+		exit(EXIT_FAILURE);
+	}
+	*cpu_id = cpu;
+	*voluntary_context_switches = (uint64_t)usage.ru_nvcsw;
+	*involuntary_context_switches = (uint64_t)usage.ru_nivcsw;
+	*minor_faults = (uint64_t)usage.ru_minflt;
+	*major_faults = (uint64_t)usage.ru_majflt;
+}
+
+void gemv_host_trace_measurement_begin(
+	struct GemvHostTraceMeasurement *measurement
+) {
+	memset(measurement, 0, sizeof(*measurement));
+	read_runtime_counters(
+		&measurement->cpu_id_start,
+		&measurement->voluntary_context_switches_start,
+		&measurement->involuntary_context_switches_start,
+		&measurement->minor_faults_start,
+		&measurement->major_faults_start
+	);
+	measurement->wall_start_ns = gemv_host_trace_now_ns();
+	measurement->thread_cpu_start_ns = thread_cpu_now_ns();
+}
+
+void gemv_host_trace_measurement_end(
+	struct GemvHostTraceMeasurement *measurement
+) {
+	measurement->thread_cpu_end_ns = thread_cpu_now_ns();
+	measurement->wall_end_ns = gemv_host_trace_now_ns();
+	read_runtime_counters(
+		&measurement->cpu_id_end,
+		&measurement->voluntary_context_switches_end,
+		&measurement->involuntary_context_switches_end,
+		&measurement->minor_faults_end,
+		&measurement->major_faults_end
+	);
+}
+
+static void set_runtime_diagnostics(
+	struct GemvHostTraceEvent *event,
+	const struct GemvHostTraceMeasurement *measurement
+) {
+	uint64_t wall_ns;
+	if (measurement == NULL
+		|| measurement->wall_end_ns < measurement->wall_start_ns
+		|| measurement->thread_cpu_end_ns < measurement->thread_cpu_start_ns
+		|| measurement->voluntary_context_switches_end
+			< measurement->voluntary_context_switches_start
+		|| measurement->involuntary_context_switches_end
+			< measurement->involuntary_context_switches_start
+		|| measurement->minor_faults_end < measurement->minor_faults_start
+		|| measurement->major_faults_end < measurement->major_faults_start) {
+		fprintf(stderr, "Invalid GEMV runtime diagnostic interval\n");
+		exit(EXIT_FAILURE);
+	}
+	event->start_ns = measurement->wall_start_ns;
+	event->end_ns = measurement->wall_end_ns;
+	event->thread_cpu_ns = measurement->thread_cpu_end_ns
+		- measurement->thread_cpu_start_ns;
+	wall_ns = event->end_ns - event->start_ns;
+	event->wall_minus_thread_cpu_ns = wall_ns > event->thread_cpu_ns
+		? wall_ns - event->thread_cpu_ns : 0;
+	event->cpu_id_start = measurement->cpu_id_start;
+	event->cpu_id_end = measurement->cpu_id_end;
+	event->voluntary_context_switch_delta =
+		measurement->voluntary_context_switches_end
+		- measurement->voluntary_context_switches_start;
+	event->involuntary_context_switch_delta =
+		measurement->involuntary_context_switches_end
+		- measurement->involuntary_context_switches_start;
+	event->minor_fault_delta = measurement->minor_faults_end
+		- measurement->minor_faults_start;
+	event->major_fault_delta = measurement->major_faults_end
+		- measurement->major_faults_start;
+}
+
 bool gemv_host_trace_init(
 	struct GemvHostTrace *trace,
 	struct dpu_set_t dpu_set,
@@ -337,6 +444,8 @@ bool gemv_host_trace_init(
 	const char *repeat_id = getenv("GEMV_TRACE_REPEAT_ID");
 	const char *host_numa_node = getenv("GEMV_TRACE_HOST_NUMA_NODE");
 	const char *process_state = getenv("GEMV_TRACE_PROCESS_STATE");
+	const char *host_binding_mode = getenv("GEMV_TRACE_HOST_BINDING_MODE");
+	const char *host_cpu_list = getenv("GEMV_TRACE_HOST_CPU_LIST");
 	const char *pretrace_warmup_runs = getenv("GEMV_TRACE_PREWARM_RUNS");
 	const char *topology_path = getenv("GEMV_TRACE_DPU_RANK_TOPOLOGY_TSV");
 	struct dpu_set_t rank = {0};
@@ -386,6 +495,10 @@ bool gemv_host_trace_init(
 		? "unknown" : host_numa_node;
 	trace->process_state = process_state == NULL || process_state[0] == '\0'
 		? "fresh_process" : process_state;
+	trace->host_binding_mode = host_binding_mode == NULL
+		|| host_binding_mode[0] == '\0' ? "NODE_ONLY" : host_binding_mode;
+	trace->host_cpu_list = host_cpu_list == NULL || host_cpu_list[0] == '\0'
+		? "unreported" : host_cpu_list;
 	trace->event_capacity = 64u;
 	trace->dpu_row_capacity = (size_t)configured_dpus * 16u;
 	if (!parse_unsigned_env("GEMV_TRACE_REPEAT_ID", repeat_id, &trace->repeat_id)
@@ -393,7 +506,8 @@ bool gemv_host_trace_init(
 			&trace->pretrace_warmup_runs))
 		return false;
 	if (!is_label_atom(trace->host_numa_node)
-		|| !is_label_atom(trace->process_state)) {
+		|| !is_label_atom(trace->process_state)
+		|| !is_label_atom(trace->host_binding_mode)) {
 		fprintf(stderr, "GEMV trace NUMA/process label contains unsupported characters\n");
 		return false;
 	}
@@ -542,16 +656,11 @@ void gemv_host_trace_record_event(
 	const char *subop,
 	int32_t iteration,
 	int32_t warmup,
-	uint64_t start_ns,
-	uint64_t end_ns
+	const struct GemvHostTraceMeasurement *measurement
 ) {
 	struct GemvHostTraceEvent *event;
 	if (!gemv_host_trace_enabled(trace))
 		return;
-	if (end_ns < start_ns) {
-		fprintf(stderr, "GEMV host trace clock moved backwards\n");
-		exit(EXIT_FAILURE);
-	}
 	if (trace->num_events >= trace->event_capacity)
 		grow_events(trace);
 	event = &trace->events[trace->num_events];
@@ -560,8 +669,7 @@ void gemv_host_trace_record_event(
 	event->subop = subop;
 	event->iteration = iteration;
 	event->warmup = warmup;
-	event->start_ns = start_ns;
-	event->end_ns = end_ns;
+	set_runtime_diagnostics(event, measurement);
 	++trace->num_events;
 }
 
@@ -579,8 +687,7 @@ void gemv_host_trace_record_transfer(
 	uint64_t size_per_dpu_bytes,
 	uint64_t source_buffer_use_count_before,
 	uint64_t target_region_access_count_before,
-	uint64_t start_ns,
-	uint64_t end_ns
+	const struct GemvHostTraceMeasurement *measurement
 ) {
 	struct GemvHostTraceEvent *event;
 	uint64_t event_id;
@@ -589,8 +696,7 @@ void gemv_host_trace_record_transfer(
 
 	if (!gemv_host_trace_enabled(trace))
 		return;
-	if (end_ns < start_ns
-		|| size_per_dpu_bytes > UINT64_MAX / trace->configured_dpus) {
+	if (size_per_dpu_bytes > UINT64_MAX / trace->configured_dpus) {
 		fprintf(stderr, "Invalid GEMV transfer trace interval or byte count\n");
 		exit(EXIT_FAILURE);
 	}
@@ -623,8 +729,7 @@ void gemv_host_trace_record_transfer(
 	event->offset_bytes = offset_bytes;
 	event->source_buffer_use_count_before = source_buffer_use_count_before;
 	event->target_region_access_count_before = target_region_access_count_before;
-	event->start_ns = start_ns;
-	event->end_ns = end_ns;
+	set_runtime_diagnostics(event, measurement);
 	++trace->num_events;
 
 	for (dpu_id = 0; dpu_id < trace->configured_dpus; ++dpu_id) {
@@ -710,8 +815,12 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		"source_buffer_use_count_before,target_region_access_count_before,"
 		"phase_class,subop,iteration,warmup,"
 		"size_per_dpu_bytes,total_logical_bytes,total_transfer_bytes,"
-		"target_symbol,offset_bytes,process_state,pretrace_warmup_runs,"
-		"transport_key,host_start_ns,host_end_ns,measured_ns\n",
+		"target_symbol,offset_bytes,process_state,host_binding_mode,"
+		"host_cpu_list,pretrace_warmup_runs,transport_key,"
+		"host_start_ns,host_end_ns,measured_ns,thread_cpu_ns,"
+		"wall_minus_thread_cpu_ns,cpu_id_start,cpu_id_end,"
+		"voluntary_context_switch_delta,involuntary_context_switch_delta,"
+		"minor_fault_delta,major_fault_delta\n",
 		stream
 	);
 	for (index = 0; index < trace->num_events; ++index) {
@@ -816,10 +925,22 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		}
 		fputc(',', stream);
 		write_csv_string(stream, trace->process_state);
+		fputc(',', stream);
+		write_csv_string(stream, trace->host_binding_mode);
+		fputc(',', stream);
+		write_csv_string(stream, trace->host_cpu_list);
 		fprintf(stream, ",%" PRIu64 ",", trace->pretrace_warmup_runs);
 		write_csv_string(stream, transport_key);
-		fprintf(stream, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-			event->start_ns, event->end_ns, event->end_ns - event->start_ns);
+		fprintf(stream,
+			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			",%" PRIu64 ",%" PRId32 ",%" PRId32 ",%" PRIu64
+			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+			event->start_ns, event->end_ns, event->end_ns - event->start_ns,
+			event->thread_cpu_ns, event->wall_minus_thread_cpu_ns,
+			event->cpu_id_start, event->cpu_id_end,
+			event->voluntary_context_switch_delta,
+			event->involuntary_context_switch_delta,
+			event->minor_fault_delta, event->major_fault_delta);
 	}
 	if (fclose(stream) != 0) {
 		fprintf(stderr, "Could not close GEMV event trace %s: %s\n",

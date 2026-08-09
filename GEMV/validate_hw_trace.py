@@ -84,11 +84,21 @@ EVENT_FIELDS = {
     "target_symbol",
     "offset_bytes",
     "process_state",
+    "host_binding_mode",
+    "host_cpu_list",
     "pretrace_warmup_runs",
     "transport_key",
     "host_start_ns",
     "host_end_ns",
     "measured_ns",
+    "thread_cpu_ns",
+    "wall_minus_thread_cpu_ns",
+    "cpu_id_start",
+    "cpu_id_end",
+    "voluntary_context_switch_delta",
+    "involuntary_context_switch_delta",
+    "minor_fault_delta",
+    "major_fault_delta",
 }
 
 DPU_FIELDS = {
@@ -296,6 +306,8 @@ def validate(
     expected_host_numa_node: int = 0,
     expected_dpu_numa_node: int = 0,
     expected_sysfs_ranks: set[int] | None = None,
+    expected_host_binding_mode: str | None = None,
+    expected_host_cpu_list: str | None = None,
 ) -> dict[str, object]:
     details_path = detail_path_for(event_path)
     events = read_csv(event_path, EVENT_FIELDS, "event")
@@ -325,6 +337,20 @@ def validate(
         "host NUMA node differs from the requested node",
     )
     require(bool(one_text(events, "process_state")), "process_state is empty")
+    host_binding_mode = one_text(events, "host_binding_mode")
+    host_cpu_list = one_text(events, "host_cpu_list")
+    require(bool(host_binding_mode), "host_binding_mode is empty")
+    require(bool(host_cpu_list), "host_cpu_list is empty")
+    if expected_host_binding_mode is not None:
+        require(
+            host_binding_mode == expected_host_binding_mode,
+            "host binding mode differs from the requested mode",
+        )
+    if expected_host_cpu_list is not None:
+        require(
+            host_cpu_list == expected_host_cpu_list,
+            "host CPU list differs from the requested list",
+        )
 
     wanted_sequence = expected_sequence()
     require(len(events) == len(wanted_sequence), f"event rows={len(events)}, expected 23")
@@ -378,9 +404,26 @@ def validate(
         start = int(row["host_start_ns"])
         end = int(row["host_end_ns"])
         measured = int(row["measured_ns"])
+        thread_cpu = int(row["thread_cpu_ns"])
+        wait_like = int(row["wall_minus_thread_cpu_ns"])
+        cpu_start = int(row["cpu_id_start"])
+        cpu_end = int(row["cpu_id_end"])
         require(end >= start, f"event {event_id} has a negative interval")
         require(measured == end - start, f"event {event_id} measured_ns differs")
         require(measured > 0, f"event {event_id} measured_ns is zero")
+        require(thread_cpu >= 0, f"event {event_id} thread_cpu_ns is negative")
+        require(
+            wait_like == max(0, measured - thread_cpu),
+            f"event {event_id} wall-minus-thread CPU time differs",
+        )
+        require(cpu_start >= 0 and cpu_end >= 0, f"event {event_id} CPU ID differs")
+        for field in (
+            "voluntary_context_switch_delta",
+            "involuntary_context_switch_delta",
+            "minor_fault_delta",
+            "major_fault_delta",
+        ):
+            require(int(row[field]) >= 0, f"event {event_id} {field} is negative")
         require(
             row["sdk_api_kind"] == sdk_api_kind(row["op"]),
             f"event {event_id} sdk_api_kind differs",
@@ -547,6 +590,8 @@ def validate(
                 duration for values in durations_by_subop.values() for duration in values
             )
         ),
+        "host_binding_mode": host_binding_mode,
+        "host_cpu_list": host_cpu_list,
     }
 
 
@@ -556,6 +601,8 @@ def main() -> int:
     parser.add_argument("--expected-host-numa-node", type=int, default=0)
     parser.add_argument("--expected-dpu-numa-node", type=int, default=0)
     parser.add_argument("--expected-sysfs-ranks", type=parse_int_set)
+    parser.add_argument("--expected-host-binding-mode")
+    parser.add_argument("--expected-host-cpu-list")
     args = parser.parse_args()
     try:
         summaries = [
@@ -564,6 +611,8 @@ def main() -> int:
                 args.expected_host_numa_node,
                 args.expected_dpu_numa_node,
                 args.expected_sysfs_ranks,
+                args.expected_host_binding_mode,
+                args.expected_host_cpu_list,
             )
             for path in args.traces
         ]

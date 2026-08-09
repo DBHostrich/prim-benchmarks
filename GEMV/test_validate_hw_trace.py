@@ -53,10 +53,20 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                     "warmup": warmup,
                     "host_numa_node": "0",
                     "process_state": "interleaved_fresh_process",
+                    "host_binding_mode": "FIXED_CORE",
+                    "host_cpu_list": "2",
                     "pretrace_warmup_runs": "3",
                     "host_start_ns": str(event_id * 100 + 1),
                     "host_end_ns": str(event_id * 100 + 51),
                     "measured_ns": "50",
+                    "thread_cpu_ns": "40",
+                    "wall_minus_thread_cpu_ns": "10",
+                    "cpu_id_start": "2",
+                    "cpu_id_end": "2",
+                    "voluntary_context_switch_delta": "0",
+                    "involuntary_context_switch_delta": "0",
+                    "minor_fault_delta": "0",
+                    "major_fault_delta": "0",
                 }
             )
             if op == "dpu_push_xfer":

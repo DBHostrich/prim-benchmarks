@@ -205,22 +205,20 @@ int main(int argc, char **argv) {
 	struct GemvDpuAllocation dpu_allocation;
 	uint32_t nr_of_dpus;
 	bool trace_requested = gemv_host_trace_requested();
-	uint64_t alloc_start_ns = 0;
-	uint64_t alloc_end_ns = 0;
-	uint64_t load_start_ns = 0;
-	uint64_t load_end_ns = 0;
+	struct GemvHostTraceMeasurement alloc_measurement = {0};
+	struct GemvHostTraceMeasurement load_measurement = {0};
 
 	// Allocate DPUs and load binary
 	if (trace_requested)
-		alloc_start_ns = gemv_host_trace_now_ns();
+		gemv_host_trace_measurement_begin(&alloc_measurement);
 	DPU_ASSERT(allocate_gemv_dpus(&dpu_allocation, &dpu_set));
 	if (trace_requested) {
-		alloc_end_ns = gemv_host_trace_now_ns();
-		load_start_ns = gemv_host_trace_now_ns();
+		gemv_host_trace_measurement_end(&alloc_measurement);
+		gemv_host_trace_measurement_begin(&load_measurement);
 	}
 	DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
 	if (trace_requested)
-		load_end_ns = gemv_host_trace_now_ns();
+		gemv_host_trace_measurement_end(&load_measurement);
 	DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_of_dpus));
 
 #if ENERGY
@@ -329,11 +327,11 @@ int main(int argc, char **argv) {
 	if (gemv_host_trace_enabled(&host_trace)) {
 		gemv_host_trace_record_event(
 			&host_trace, "dpu_alloc", "", -1, -1,
-			alloc_start_ns, alloc_end_ns
+			&alloc_measurement
 		);
 		gemv_host_trace_record_event(
 			&host_trace, "dpu_load", "", -1, -1,
-			load_start_ns, load_end_ns
+			&load_measurement
 		);
 	}
 
@@ -349,8 +347,7 @@ int main(int argc, char **argv) {
 	stop(&timer, 0);
 	for (unsigned int rep = 0; rep < p.n_warmup + p.n_reps; rep++) {
 		int32_t warmup = rep < p.n_warmup ? 1 : 0;
-		uint64_t operation_start_ns = 0;
-		uint64_t operation_end_ns = 0;
+		struct GemvHostTraceMeasurement operation_measurement = {0};
 
 		if (rep >= p.n_warmup)
 			start(&timer, 1, rep - p.n_warmup);
@@ -364,16 +361,15 @@ int main(int argc, char **argv) {
 		}
 
 		if (gemv_host_trace_enabled(&host_trace))
-			operation_start_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_begin(&operation_measurement);
 		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0, sizeof(dpu_arguments_t), DPU_XFER_DEFAULT));
 		if (gemv_host_trace_enabled(&host_trace)) {
-			operation_end_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_end(&operation_measurement);
 			gemv_host_trace_record_transfer(
 				&host_trace, "input_arguments", "TO_DPU", rep, warmup,
 				"WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,
 				sizeof(dpu_arguments_t), sizeof(dpu_arguments_t),
-				rep, rep,
-				operation_start_ns, operation_end_ns
+				rep, rep, &operation_measurement
 			);
 		}
 
@@ -383,35 +379,33 @@ int main(int argc, char **argv) {
 			DPU_ASSERT(dpu_prepare_xfer(dpu, A + dpu_info[i].prev_rows_dpu * n_size));
 		}
 		if (gemv_host_trace_enabled(&host_trace))
-			operation_start_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_begin(&operation_measurement);
 		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0, max_rows_per_dpu * n_size_pad * sizeof(T), DPU_XFER_DEFAULT));
 		if (gemv_host_trace_enabled(&host_trace)) {
-			operation_end_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_end(&operation_measurement);
 			gemv_host_trace_record_transfer(
 				&host_trace, "input_matrix", "TO_DPU", rep, warmup,
 				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,
 				matrix_logical_bytes, 0,
 				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
-				rep, rep,
-				operation_start_ns, operation_end_ns
+				rep, rep, &operation_measurement
 			);
 		}
 		DPU_FOREACH(dpu_set, dpu, i) {
 			DPU_ASSERT(dpu_prepare_xfer(dpu, B));
 		}
 		if (gemv_host_trace_enabled(&host_trace))
-			operation_start_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_begin(&operation_measurement);
 		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, max_rows_per_dpu * n_size_pad * sizeof(T) , n_size_pad * sizeof(T), DPU_XFER_DEFAULT));
 		if (gemv_host_trace_enabled(&host_trace)) {
-			operation_end_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_end(&operation_measurement);
 			gemv_host_trace_record_transfer(
 				&host_trace, "input_vector", "TO_DPU", rep, warmup,
 				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME",
 				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
 				NULL, (uint64_t)n_size * sizeof(T),
 				(uint64_t)n_size_pad * sizeof(T),
-				rep, rep,
-				operation_start_ns, operation_end_ns
+				rep, rep, &operation_measurement
 			);
 		}
 
@@ -428,13 +422,13 @@ int main(int argc, char **argv) {
 		}
 
 		if (gemv_host_trace_enabled(&host_trace))
-			operation_start_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_begin(&operation_measurement);
 		DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
 		if (gemv_host_trace_enabled(&host_trace)) {
-			operation_end_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_end(&operation_measurement);
 			gemv_host_trace_record_event(
 				&host_trace, "dpu_launch", "sync", rep, warmup,
-				operation_start_ns, operation_end_ns
+				&operation_measurement
 			);
 		}
 
@@ -460,10 +454,10 @@ int main(int argc, char **argv) {
 			DPU_ASSERT(dpu_prepare_xfer(dpu, C_dpu + i * max_rows_per_dpu));
 		}
 		if (gemv_host_trace_enabled(&host_trace))
-			operation_start_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_begin(&operation_measurement);
 		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME, max_rows_per_dpu * n_size_pad * sizeof(T) + n_size_pad * sizeof(T), max_rows_per_dpu * sizeof(T), DPU_XFER_DEFAULT));
 		if (gemv_host_trace_enabled(&host_trace)) {
-			operation_end_ns = gemv_host_trace_now_ns();
+			gemv_host_trace_measurement_end(&operation_measurement);
 			gemv_host_trace_record_transfer(
 				&host_trace, "output_vector", "FROM_DPU", rep, warmup,
 				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME",
@@ -471,8 +465,7 @@ int main(int argc, char **argv) {
 					+ (uint64_t)n_size_pad * sizeof(T),
 				result_logical_bytes, 0,
 				(uint64_t)max_rows_per_dpu * sizeof(T),
-				rep, rep,
-				operation_start_ns, operation_end_ns
+				rep, rep, &operation_measurement
 			);
 		}
 		if(rep >= p.n_warmup)
@@ -530,16 +523,15 @@ int main(int argc, char **argv) {
 	free(result_logical_bytes);
 	free(dpu_info);
 	free(input_args);
-	uint64_t free_start_ns = 0;
-	uint64_t free_end_ns = 0;
+	struct GemvHostTraceMeasurement free_measurement = {0};
 	if (gemv_host_trace_enabled(&host_trace))
-		free_start_ns = gemv_host_trace_now_ns();
+		gemv_host_trace_measurement_begin(&free_measurement);
 	DPU_ASSERT(free_gemv_dpus(&dpu_allocation, dpu_set));
 	if (gemv_host_trace_enabled(&host_trace)) {
-		free_end_ns = gemv_host_trace_now_ns();
+		gemv_host_trace_measurement_end(&free_measurement);
 		gemv_host_trace_record_event(
 			&host_trace, "dpu_free", "", -1, -1,
-			free_start_ns, free_end_ns
+			&free_measurement
 		);
 	}
 	if (!gemv_host_trace_write(&host_trace)) {
