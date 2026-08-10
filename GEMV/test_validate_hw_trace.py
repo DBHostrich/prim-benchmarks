@@ -25,6 +25,14 @@ from validate_hw_trace import (
 
 
 class ValidateHardwareTraceTests(unittest.TestCase):
+    def test_c_trace_uses_canonical_mram_target_label(self) -> None:
+        source_path = Path(__file__).with_name("host") / "app.c"
+        source = source_path.read_text()
+        self.assertEqual(
+            source.count('"MRAM", "DPU_MRAM_HEAP_POINTER_NAME"'),
+            3,
+        )
+
     def create_trace(
         self,
         root: Path,

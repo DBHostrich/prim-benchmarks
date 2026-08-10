@@ -79,6 +79,10 @@ if [[ "$HOST_CPU_ID" == "$PROBE_CPU_ID" ]]; then
 fi
 
 mkdir -p "$RESULT_ROOT/artifacts" "$RESULT_ROOT/build_logs"
+# Publish the retained result directory before any hardware or validation step.
+# This keeps post-failure inspection commands usable under `set -e`.
+mkdir -p "$(dirname "$LATEST_RESULT_POINTER")"
+printf '%s\n' "$RESULT_ROOT" > "$LATEST_RESULT_POINTER"
 cd "$SCRIPT_DIR"
 uname -a > "$RESULT_ROOT/uname.txt"
 lscpu > "$RESULT_ROOT/lscpu.txt"
@@ -312,7 +316,6 @@ if [[ "$CREATE_ARCHIVE" == "1" ]]; then
     tar -czf "$archive" -C "$(dirname "$RESULT_ROOT")" \
         "$(basename "$RESULT_ROOT")"
 fi
-mkdir -p "$(dirname "$LATEST_RESULT_POINTER")"
 printf '%s\n' "$RESULT_ROOT" | tee "$LATEST_RESULT_POINTER"
 echo "Trace results:          $RESULT_ROOT"
 echo "Order comparison:       $RESULT_ROOT/transfer_order_analysis/transfer_order_comparison.csv"

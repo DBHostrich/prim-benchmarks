@@ -244,7 +244,7 @@ static void push_input_matrix(
 		gemv_host_trace_measurement_end(&measurement);
 		gemv_host_trace_record_transfer(
 			host_trace, "input_matrix", "TO_DPU", rep, warmup,
-			"MRAM", DPU_MRAM_HEAP_POINTER_NAME, 0,
+			"MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,
 			matrix_logical_bytes, 0,
 			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
 			rep, rep, &measurement
@@ -277,7 +277,7 @@ static void push_input_vector(
 		gemv_host_trace_measurement_end(&measurement);
 		gemv_host_trace_record_transfer(
 			host_trace, "input_vector", "TO_DPU", rep, warmup,
-			"MRAM", DPU_MRAM_HEAP_POINTER_NAME,
+			"MRAM", "DPU_MRAM_HEAP_POINTER_NAME",
 			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
 			NULL, (uint64_t)n_size * sizeof(T),
 			(uint64_t)n_size_pad * sizeof(T),
