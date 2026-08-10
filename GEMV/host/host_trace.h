@@ -40,6 +40,8 @@ struct GemvHostTraceEvent {
 	uint64_t offset_bytes;
 	uint64_t source_buffer_use_count_before;
 	uint64_t target_region_access_count_before;
+	const char *diagnostic_copy_ordinal;
+	uint64_t mram_push_ordinal_since_launch;
 	uint64_t start_ns;
 	uint64_t end_ns;
 	uint64_t thread_cpu_ns;
@@ -82,6 +84,7 @@ struct GemvHostTrace {
 	const char *host_binding_mode;
 	const char *host_cpu_list;
 	const char *transfer_order_variant;
+	const char *vector_replay_mode;
 	uint64_t pretrace_warmup_runs;
 	uint32_t *rank_ordinals;
 	uint32_t *dpu_ids_in_rank;
@@ -146,6 +149,8 @@ void gemv_host_trace_record_transfer(
 	uint64_t size_per_dpu_bytes,
 	uint64_t source_buffer_use_count_before,
 	uint64_t target_region_access_count_before,
+	const char *diagnostic_copy_ordinal,
+	uint64_t mram_push_ordinal_since_launch,
 	const struct GemvHostTraceMeasurement *measurement
 );
 

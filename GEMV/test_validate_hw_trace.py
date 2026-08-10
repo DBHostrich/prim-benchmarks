@@ -37,14 +37,17 @@ class ValidateHardwareTraceTests(unittest.TestCase):
         self,
         root: Path,
         transfer_order_variant: str = "MATRIX_THEN_VECTOR",
+        vector_replay_mode: str = "NONE",
     ) -> Path:
         event_path = root / "trace_01.csv"
         detail_path = root / "trace_01_dpus.csv"
         events: list[dict[str, str]] = []
         details: list[dict[str, str]] = []
         previous: dict[str, str] | None = None
+        vector_copies_seen: dict[int, int] = {}
+        mram_pushes_seen: dict[int, int] = {}
         for event_id, semantic in enumerate(
-            expected_sequence(transfer_order_variant)
+            expected_sequence(transfer_order_variant, vector_replay_mode)
         ):
             op, subop, direction, iteration, warmup = semantic
             row = {field: "" for field in EVENT_FIELDS}
@@ -70,6 +73,7 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                     "host_binding_mode": "FIXED_CORE",
                     "host_cpu_list": "2",
                     "transfer_order_variant": transfer_order_variant,
+                    "vector_replay_mode": vector_replay_mode,
                     "pretrace_warmup_runs": "3",
                     "host_start_ns": str(event_id * 100 + 1),
                     "host_end_ns": str(event_id * 100 + 51),
@@ -85,9 +89,31 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                 }
             )
             if op == "dpu_push_xfer":
+                iteration_number = int(iteration)
                 expectation = expected_transfer(subop, 64, 128, 8192)
                 size = int(expectation["size"])
                 logical = list(expectation["logical"])
+                if direction == "TO_DPU" and expectation["target_space"] == "MRAM":
+                    mram_pushes_seen[iteration_number] = (
+                        mram_pushes_seen.get(iteration_number, 0) + 1
+                    )
+                    mram_ordinal = mram_pushes_seen[iteration_number]
+                else:
+                    mram_ordinal = 0
+                if subop == "input_vector":
+                    copy_index = vector_copies_seen.get(iteration_number, 0)
+                    vector_copies_seen[iteration_number] = copy_index + 1
+                    copy_ordinal = (
+                        "PRIMARY" if copy_index == 0 else "IDENTICAL_REPLAY"
+                    )
+                    use_count = (
+                        2 * iteration_number + copy_index
+                        if vector_replay_mode == "IDENTICAL_REPLAY"
+                        else iteration_number
+                    )
+                else:
+                    copy_ordinal = "NONE"
+                    use_count = iteration_number
                 row.update(
                     {
                         "sdk_api_kind": sdk_api_kind(op),
@@ -141,13 +167,15 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                         ),
                         "phase_class": phase_class(op, warmup),
                         "source_buffer_reuse_class": source_buffer_reuse_class(
-                            int(iteration)
+                            use_count
                         ),
                         "target_region_reuse_class": target_region_reuse_class(
-                            int(iteration)
+                            use_count
                         ),
-                        "source_buffer_use_count_before": iteration,
-                        "target_region_access_count_before": iteration,
+                        "source_buffer_use_count_before": str(use_count),
+                        "target_region_access_count_before": str(use_count),
+                        "diagnostic_copy_ordinal": copy_ordinal,
+                        "mram_push_ordinal_since_launch": str(mram_ordinal),
                         "size_per_dpu_bytes": str(size),
                         "total_logical_bytes": str(sum(logical)),
                         "total_transfer_bytes": str(size * 64),
@@ -217,6 +245,48 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                 expected_transfer_order_variant="VECTOR_THEN_MATRIX",
             )
         self.assertEqual(summary["transfer_order_variant"], "VECTOR_THEN_MATRIX")
+
+    def test_accepts_identical_vector_replay_without_key_expansion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.create_trace(
+                Path(directory), vector_replay_mode="IDENTICAL_REPLAY"
+            )
+            summary = validate(
+                path,
+                expected_sysfs_ranks={0},
+                expected_transfer_order_variant="MATRIX_THEN_VECTOR",
+                expected_vector_replay_mode="IDENTICAL_REPLAY",
+            )
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+        vector_rows = [
+            row
+            for row in rows
+            if row["subop"] == "input_vector" and row["iteration"] == "1"
+        ]
+        self.assertEqual(summary["event_rows"], 27)
+        self.assertEqual(summary["transfer_rows"], 20)
+        self.assertEqual(summary["dpu_detail_rows"], 1280)
+        self.assertEqual(
+            [row["diagnostic_copy_ordinal"] for row in vector_rows],
+            ["PRIMARY", "IDENTICAL_REPLAY"],
+        )
+        self.assertEqual(
+            [row["mram_push_ordinal_since_launch"] for row in vector_rows],
+            ["2", "3"],
+        )
+        self.assertTrue(
+            all(
+                "diagnostic_copy_ordinal" not in row["transport_key"]
+                for row in vector_rows
+            )
+        )
+        self.assertTrue(
+            all(
+                "mram_push_ordinal_since_launch" not in row["transport_key"]
+                for row in vector_rows
+            )
+        )
 
     def test_rejects_unexpected_rank_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

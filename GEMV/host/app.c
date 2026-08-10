@@ -201,6 +201,11 @@ enum GemvTransferOrder {
 	GEMV_VECTOR_THEN_MATRIX,
 };
 
+enum GemvVectorReplayMode {
+	GEMV_VECTOR_REPLAY_NONE,
+	GEMV_VECTOR_REPLAY_IDENTICAL,
+};
+
 static bool parse_transfer_order(enum GemvTransferOrder *order) {
 	const char *value = getenv("GEMV_TRANSFER_ORDER");
 	if (value == NULL || value[0] == '\0'
@@ -216,6 +221,20 @@ static bool parse_transfer_order(enum GemvTransferOrder *order) {
 	return false;
 }
 
+static bool parse_vector_replay_mode(enum GemvVectorReplayMode *mode) {
+	const char *value = getenv("GEMV_VECTOR_REPLAY_MODE");
+	if (value == NULL || value[0] == '\0' || strcmp(value, "NONE") == 0) {
+		*mode = GEMV_VECTOR_REPLAY_NONE;
+		return true;
+	}
+	if (strcmp(value, "IDENTICAL_REPLAY") == 0) {
+		*mode = GEMV_VECTOR_REPLAY_IDENTICAL;
+		return true;
+	}
+	fprintf(stderr, "Unsupported GEMV_VECTOR_REPLAY_MODE: %s\n", value);
+	return false;
+}
+
 static void push_input_matrix(
 	struct dpu_set_t dpu_set,
 	unsigned int n_size,
@@ -224,6 +243,7 @@ static void push_input_matrix(
 	const uint64_t *matrix_logical_bytes,
 	unsigned int rep,
 	int32_t warmup,
+	uint64_t mram_push_ordinal_since_launch,
 	struct GemvHostTrace *host_trace
 ) {
 	struct dpu_set_t dpu;
@@ -247,7 +267,7 @@ static void push_input_matrix(
 			"MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,
 			matrix_logical_bytes, 0,
 			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
-			rep, rep, &measurement
+			rep, rep, "NONE", mram_push_ordinal_since_launch, &measurement
 		);
 	}
 }
@@ -259,6 +279,10 @@ static void push_input_vector(
 	uint32_t max_rows_per_dpu,
 	unsigned int rep,
 	int32_t warmup,
+	uint64_t source_buffer_use_count_before,
+	uint64_t target_region_access_count_before,
+	const char *diagnostic_copy_ordinal,
+	uint64_t mram_push_ordinal_since_launch,
 	struct GemvHostTrace *host_trace
 ) {
 	struct dpu_set_t dpu;
@@ -281,7 +305,10 @@ static void push_input_vector(
 			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
 			NULL, (uint64_t)n_size * sizeof(T),
 			(uint64_t)n_size_pad * sizeof(T),
-			rep, rep, &measurement
+			source_buffer_use_count_before,
+			target_region_access_count_before,
+			diagnostic_copy_ordinal, mram_push_ordinal_since_launch,
+			&measurement
 		);
 	}
 }
@@ -291,8 +318,17 @@ int main(int argc, char **argv) {
 
 	struct Params p = input_params(argc, argv);
 	enum GemvTransferOrder transfer_order;
+	enum GemvVectorReplayMode vector_replay_mode;
 	if (!parse_transfer_order(&transfer_order))
 		return EXIT_FAILURE;
+	if (!parse_vector_replay_mode(&vector_replay_mode))
+		return EXIT_FAILURE;
+	if (vector_replay_mode == GEMV_VECTOR_REPLAY_IDENTICAL
+		&& transfer_order != GEMV_MATRIX_THEN_VECTOR) {
+		fprintf(stderr,
+			"IDENTICAL_REPLAY requires MATRIX_THEN_VECTOR order\n");
+		return EXIT_FAILURE;
+	}
 
 	struct dpu_set_t dpu_set, dpu;
 	struct GemvDpuAllocation dpu_allocation;
@@ -440,6 +476,9 @@ int main(int argc, char **argv) {
 	stop(&timer, 0);
 	for (unsigned int rep = 0; rep < p.n_warmup + p.n_reps; rep++) {
 		int32_t warmup = rep < p.n_warmup ? 1 : 0;
+		uint64_t vector_use_count =
+			vector_replay_mode == GEMV_VECTOR_REPLAY_IDENTICAL
+			? (uint64_t)rep * 2u : rep;
 		struct GemvHostTraceMeasurement operation_measurement = {0};
 
 		if (rep >= p.n_warmup)
@@ -462,7 +501,7 @@ int main(int argc, char **argv) {
 				&host_trace, "input_arguments", "TO_DPU", rep, warmup,
 				"WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,
 				sizeof(dpu_arguments_t), sizeof(dpu_arguments_t),
-				rep, rep, &operation_measurement
+				rep, rep, "NONE", 0, &operation_measurement
 			);
 		}
 
@@ -470,21 +509,30 @@ int main(int argc, char **argv) {
 		if (transfer_order == GEMV_VECTOR_THEN_MATRIX) {
 			push_input_vector(
 				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
-				rep, warmup, &host_trace
+				rep, warmup, rep, rep, "PRIMARY", 1, &host_trace
 			);
 			push_input_matrix(
 				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
-				matrix_logical_bytes, rep, warmup, &host_trace
+				matrix_logical_bytes, rep, warmup, 2, &host_trace
 			);
 		} else {
 			push_input_matrix(
 				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
-				matrix_logical_bytes, rep, warmup, &host_trace
+				matrix_logical_bytes, rep, warmup, 1, &host_trace
 			);
 			push_input_vector(
 				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
-				rep, warmup, &host_trace
+				rep, warmup, vector_use_count, vector_use_count,
+				"PRIMARY", 2, &host_trace
 			);
+			if (vector_replay_mode == GEMV_VECTOR_REPLAY_IDENTICAL) {
+				push_input_vector(
+					dpu_set, n_size, n_size_pad, max_rows_per_dpu,
+					rep, warmup, vector_use_count + 1u,
+					vector_use_count + 1u, "IDENTICAL_REPLAY", 3,
+					&host_trace
+				);
+			}
 		}
 
 		if (rep >= p.n_warmup)
@@ -543,7 +591,7 @@ int main(int argc, char **argv) {
 					+ (uint64_t)n_size_pad * sizeof(T),
 				result_logical_bytes, 0,
 				(uint64_t)max_rows_per_dpu * sizeof(T),
-				rep, rep, &operation_measurement
+				rep, rep, "NONE", 0, &operation_measurement
 			);
 		}
 		if(rep >= p.n_warmup)

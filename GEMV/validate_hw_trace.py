@@ -87,6 +87,9 @@ EVENT_FIELDS = {
     "host_binding_mode",
     "host_cpu_list",
     "transfer_order_variant",
+    "vector_replay_mode",
+    "diagnostic_copy_ordinal",
+    "mram_push_ordinal_since_launch",
     "pretrace_warmup_runs",
     "transport_key",
     "host_start_ns",
@@ -176,10 +179,20 @@ def expected_rows_per_dpu(nr_dpus: int) -> list[int]:
 
 def expected_sequence(
     transfer_order_variant: str = "MATRIX_THEN_VECTOR",
+    vector_replay_mode: str = "NONE",
 ) -> list[tuple[str, str, str, str, str]]:
     require(
         transfer_order_variant in {"MATRIX_THEN_VECTOR", "VECTOR_THEN_MATRIX"},
         f"unsupported transfer order variant={transfer_order_variant}",
+    )
+    require(
+        vector_replay_mode in {"NONE", "IDENTICAL_REPLAY"},
+        f"unsupported vector replay mode={vector_replay_mode}",
+    )
+    require(
+        vector_replay_mode == "NONE"
+        or transfer_order_variant == "MATRIX_THEN_VECTOR",
+        "IDENTICAL_REPLAY requires MATRIX_THEN_VECTOR order",
     )
     input_order = (
         ("input_matrix", "input_vector")
@@ -196,6 +209,19 @@ def expected_sequence(
             sequence.append(
                 ("dpu_push_xfer", subop, "TO_DPU", str(iteration), warmup)
             )
+            if (
+                subop == "input_vector"
+                and vector_replay_mode == "IDENTICAL_REPLAY"
+            ):
+                sequence.append(
+                    (
+                        "dpu_push_xfer",
+                        "input_vector",
+                        "TO_DPU",
+                        str(iteration),
+                        warmup,
+                    )
+                )
         sequence.append(("dpu_launch", "sync", "", str(iteration), warmup))
         sequence.append(
             (
@@ -317,6 +343,7 @@ def validate(
     expected_host_binding_mode: str | None = None,
     expected_host_cpu_list: str | None = None,
     expected_transfer_order_variant: str | None = None,
+    expected_vector_replay_mode: str | None = None,
 ) -> dict[str, object]:
     details_path = detail_path_for(event_path)
     events = read_csv(event_path, EVENT_FIELDS, "event")
@@ -349,11 +376,21 @@ def validate(
     host_binding_mode = one_text(events, "host_binding_mode")
     host_cpu_list = one_text(events, "host_cpu_list")
     transfer_order_variant = one_text(events, "transfer_order_variant")
+    vector_replay_mode = one_text(events, "vector_replay_mode")
     require(bool(host_binding_mode), "host_binding_mode is empty")
     require(bool(host_cpu_list), "host_cpu_list is empty")
     require(
         transfer_order_variant in {"MATRIX_THEN_VECTOR", "VECTOR_THEN_MATRIX"},
         "transfer order variant differs from supported variants",
+    )
+    require(
+        vector_replay_mode in {"NONE", "IDENTICAL_REPLAY"},
+        "vector replay mode differs from supported variants",
+    )
+    require(
+        vector_replay_mode == "NONE"
+        or transfer_order_variant == "MATRIX_THEN_VECTOR",
+        "IDENTICAL_REPLAY uses an unsupported transfer order",
     )
     if expected_host_binding_mode is not None:
         require(
@@ -370,9 +407,17 @@ def validate(
             transfer_order_variant == expected_transfer_order_variant,
             "transfer order variant differs from the requested variant",
         )
+    if expected_vector_replay_mode is not None:
+        require(
+            vector_replay_mode == expected_vector_replay_mode,
+            "vector replay mode differs from the requested mode",
+        )
 
-    wanted_sequence = expected_sequence(transfer_order_variant)
-    require(len(events) == len(wanted_sequence), f"event rows={len(events)}, expected 23")
+    wanted_sequence = expected_sequence(transfer_order_variant, vector_replay_mode)
+    require(
+        len(events) == len(wanted_sequence),
+        f"event rows={len(events)}, expected {len(wanted_sequence)}",
+    )
     require(
         [int(row["event_id"]) for row in events] == list(range(len(events))),
         "event IDs differ from contiguous zero-based IDs",
@@ -389,7 +434,13 @@ def validate(
     ]
     require(actual_sequence == wanted_sequence, "event semantic sequence differs")
 
-    require(len(details) == ITERATIONS * 4 * nr_dpus, "DPU detail row count differs")
+    expected_transfer_count = sum(
+        op == "dpu_push_xfer" for op, *_ in wanted_sequence
+    )
+    require(
+        len(details) == expected_transfer_count * nr_dpus,
+        "DPU detail row count differs",
+    )
     for field, expected in (
         ("configured_dpus", nr_dpus),
         ("actual_ranks", ranks),
@@ -506,6 +557,8 @@ def validate(
         "target_symbol",
         "offset_bytes",
         "transport_key",
+        "diagnostic_copy_ordinal",
+        "mram_push_ordinal_since_launch",
     )
     require(
         all(row[field] == "" for row in nontransfer_rows for field in transfer_only_fields),
@@ -513,6 +566,8 @@ def validate(
     )
 
     durations_by_subop: dict[str, list[int]] = defaultdict(list)
+    vector_copies_seen: dict[int, int] = defaultdict(int)
+    mram_pushes_seen: dict[int, int] = defaultdict(int)
     for row in transfer_rows:
         event_id = int(row["event_id"])
         iteration = int(row["iteration"])
@@ -554,22 +609,58 @@ def validate(
             ),
             f"event {event_id} predecessor target space differs",
         )
+        if row["direction"] == "TO_DPU" and row["target_space"] == "MRAM":
+            mram_pushes_seen[iteration] += 1
+            expected_mram_ordinal = mram_pushes_seen[iteration]
+        else:
+            expected_mram_ordinal = 0
         require(
-            int(row["source_buffer_use_count_before"]) == iteration,
+            int(row["mram_push_ordinal_since_launch"])
+            == expected_mram_ordinal,
+            f"event {event_id} MRAM push ordinal differs",
+        )
+        if row["subop"] == "input_vector":
+            copy_index = vector_copies_seen[iteration]
+            expected_copy_ordinal = (
+                "PRIMARY" if copy_index == 0 else "IDENTICAL_REPLAY"
+            )
+            require(
+                copy_index == 0
+                or (
+                    copy_index == 1
+                    and vector_replay_mode == "IDENTICAL_REPLAY"
+                ),
+                f"event {event_id} has an unexpected input-vector copy",
+            )
+            vector_copies_seen[iteration] += 1
+            expected_use_count = (
+                2 * iteration + copy_index
+                if vector_replay_mode == "IDENTICAL_REPLAY"
+                else iteration
+            )
+        else:
+            expected_copy_ordinal = "NONE"
+            expected_use_count = iteration
+        require(
+            row["diagnostic_copy_ordinal"] == expected_copy_ordinal,
+            f"event {event_id} diagnostic copy ordinal differs",
+        )
+        require(
+            int(row["source_buffer_use_count_before"]) == expected_use_count,
             f"event {event_id} source buffer use count differs",
         )
         require(
-            int(row["target_region_access_count_before"]) == iteration,
+            int(row["target_region_access_count_before"]) == expected_use_count,
             f"event {event_id} target region access count differs",
         )
         require(
             row["source_buffer_reuse_class"]
-            == source_buffer_reuse_class(iteration),
+            == source_buffer_reuse_class(expected_use_count),
             f"event {event_id} source buffer reuse class differs",
         )
         require(
             row["target_region_reuse_class"]
-            == target_region_reuse_class(iteration),
+            == target_region_reuse_class(expected_use_count),
             f"event {event_id} target region reuse class differs",
         )
         for field, expected in topology.items():
@@ -612,6 +703,7 @@ def validate(
         "host_binding_mode": host_binding_mode,
         "host_cpu_list": host_cpu_list,
         "transfer_order_variant": transfer_order_variant,
+        "vector_replay_mode": vector_replay_mode,
     }
 
 
@@ -624,6 +716,7 @@ def main() -> int:
     parser.add_argument("--expected-host-binding-mode")
     parser.add_argument("--expected-host-cpu-list")
     parser.add_argument("--expected-transfer-order-variant")
+    parser.add_argument("--expected-vector-replay-mode")
     args = parser.parse_args()
     try:
         summaries = [
@@ -635,6 +728,7 @@ def main() -> int:
                 args.expected_host_binding_mode,
                 args.expected_host_cpu_list,
                 args.expected_transfer_order_variant,
+                args.expected_vector_replay_mode,
             )
             for path in args.traces
         ]

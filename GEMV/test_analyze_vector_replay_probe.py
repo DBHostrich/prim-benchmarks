@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import csv
+import tempfile
+import unittest
+from pathlib import Path
+
+from analyze_vector_replay_probe import analyze
+
+
+class AnalyzeVectorReplayProbeTests(unittest.TestCase):
+    def write_trace(self, root: Path, repeat: int, slow_primary: bool) -> None:
+        directory = root / "GEMV_128dpu_16tl_VECTOR_REPLAY"
+        directory.mkdir(parents=True, exist_ok=True)
+        rows = []
+        event_id = 0
+        for iteration in range(4):
+            context = "FIRST_USE" if iteration == 0 else "REUSED"
+            rows.append(
+                {
+                    "run_id": directory.name,
+                    "repeat_id": str(repeat),
+                    "event_id": str(event_id),
+                    "op": "dpu_push_xfer",
+                    "subop": "input_matrix",
+                    "measured_ns": "500" if slow_primary else "100",
+                    "vector_replay_mode": "IDENTICAL_REPLAY",
+                }
+            )
+            event_id += 1
+            for ordinal, duration in (
+                ("PRIMARY", 400 if slow_primary else 100),
+                ("IDENTICAL_REPLAY", 100),
+            ):
+                start = 1_000_000 + event_id * 1_000
+                rows.append(
+                    {
+                        "run_id": directory.name,
+                        "repeat_id": str(repeat),
+                        "event_id": str(event_id),
+                        "op": "dpu_push_xfer",
+                        "subop": "input_vector",
+                        "direction": "TO_DPU",
+                        "target_space": "MRAM",
+                        "target_symbol": "DPU_MRAM_HEAP_POINTER_NAME",
+                        "offset_bytes": "32768",
+                        "transfer_bytes_per_dpu": "32768",
+                        "total_logical_bytes": "4194304",
+                        "total_transfer_bytes": "4194304",
+                        "same_source_across_group": "1",
+                        "allocated_topology_signature": "r0@n0@c1|r4@n0@c2",
+                        "iteration": str(iteration),
+                        "source_buffer_reuse_class": context,
+                        "source_buffer_use_count_before": str(2 * iteration),
+                        "diagnostic_copy_ordinal": ordinal,
+                        "mram_push_ordinal_since_launch": (
+                            "2" if ordinal == "PRIMARY" else "3"
+                        ),
+                        "previous_sdk_subop": (
+                            "input_matrix"
+                            if ordinal == "PRIMARY"
+                            else "input_vector"
+                        ),
+                        "transport_key": f"key_{context}",
+                        "measured_ns": str(duration),
+                        "wall_minus_thread_cpu_ns": str(duration - 10),
+                        "cpu_id_start": "0",
+                        "cpu_id_end": "0",
+                        "involuntary_context_switch_delta": "0",
+                        "host_start_ns": str(start),
+                        "host_end_ns": str(start + duration),
+                        "vector_replay_mode": "IDENTICAL_REPLAY",
+                    }
+                )
+                event_id += 1
+        trace_path = directory / f"trace_{repeat:02d}.csv"
+        fields = sorted({field for row in rows for field in row})
+        with trace_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        with (directory / f"heartbeat_{repeat:02d}.csv").open(
+            "w", newline=""
+        ) as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=[
+                    "planned_raw_ns",
+                    "actual_raw_ns",
+                    "lateness_ns",
+                ],
+            )
+            writer.writeheader()
+
+    def test_detects_transient_primary_transfer_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for repeat in range(1, 13):
+                self.write_trace(root, repeat, slow_primary=repeat >= 10)
+            outputs = analyze(root)
+        self.assertEqual(len(outputs["vector_replay_events"]), 48)
+        self.assertEqual(len(outputs["vector_replay_summary"]), 4)
+        self.assertEqual(
+            {row["decision"] for row in outputs["vector_replay_comparison"]},
+            {"SUPPORTS_TRANSIENT_PRIMARY_TRANSFER_STATE"},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
