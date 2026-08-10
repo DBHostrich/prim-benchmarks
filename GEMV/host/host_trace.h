@@ -42,6 +42,7 @@ struct GemvHostTraceEvent {
 	uint64_t target_region_access_count_before;
 	const char *diagnostic_copy_ordinal;
 	uint64_t mram_push_ordinal_since_launch;
+	uint64_t replay_delay_requested_us;
 	uint64_t start_ns;
 	uint64_t end_ns;
 	uint64_t thread_cpu_ns;
@@ -151,6 +152,7 @@ void gemv_host_trace_record_transfer(
 	uint64_t target_region_access_count_before,
 	const char *diagnostic_copy_ordinal,
 	uint64_t mram_push_ordinal_since_launch,
+	uint64_t replay_delay_requested_us,
 	const struct GemvHostTraceMeasurement *measurement
 );
 

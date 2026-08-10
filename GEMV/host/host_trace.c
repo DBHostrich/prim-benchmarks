@@ -699,6 +699,7 @@ void gemv_host_trace_record_transfer(
 	uint64_t target_region_access_count_before,
 	const char *diagnostic_copy_ordinal,
 	uint64_t mram_push_ordinal_since_launch,
+	uint64_t replay_delay_requested_us,
 	const struct GemvHostTraceMeasurement *measurement
 ) {
 	struct GemvHostTraceEvent *event;
@@ -743,6 +744,7 @@ void gemv_host_trace_record_transfer(
 	event->target_region_access_count_before = target_region_access_count_before;
 	event->diagnostic_copy_ordinal = diagnostic_copy_ordinal;
 	event->mram_push_ordinal_since_launch = mram_push_ordinal_since_launch;
+	event->replay_delay_requested_us = replay_delay_requested_us;
 	set_runtime_diagnostics(event, measurement);
 	++trace->num_events;
 
@@ -832,6 +834,7 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		"target_symbol,offset_bytes,process_state,host_binding_mode,"
 		"host_cpu_list,transfer_order_variant,vector_replay_mode,"
 		"diagnostic_copy_ordinal,mram_push_ordinal_since_launch,"
+		"replay_delay_requested_us,"
 		"pretrace_warmup_runs,transport_key,"
 		"host_start_ns,host_end_ns,measured_ns,thread_cpu_ns,"
 		"wall_minus_thread_cpu_ns,cpu_id_start,cpu_id_end,"
@@ -952,10 +955,11 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		fputc(',', stream);
 		if (event->has_transfer) {
 			write_csv_string(stream, event->diagnostic_copy_ordinal);
-			fprintf(stream, ",%" PRIu64,
-				event->mram_push_ordinal_since_launch);
+			fprintf(stream, ",%" PRIu64 ",%" PRIu64,
+				event->mram_push_ordinal_since_launch,
+				event->replay_delay_requested_us);
 		} else {
-			fputc(',', stream);
+			fputs(",,", stream);
 		}
 		fprintf(stream, ",%" PRIu64 ",", trace->pretrace_warmup_runs);
 		write_csv_string(stream, transport_key);

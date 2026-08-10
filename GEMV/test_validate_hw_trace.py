@@ -38,6 +38,7 @@ class ValidateHardwareTraceTests(unittest.TestCase):
         root: Path,
         transfer_order_variant: str = "MATRIX_THEN_VECTOR",
         vector_replay_mode: str = "NONE",
+        replay_delay_schedule_us: tuple[int, int, int, int] = (0, 0, 0, 0),
     ) -> Path:
         event_path = root / "trace_01.csv"
         detail_path = root / "trace_01_dpus.csv"
@@ -176,6 +177,11 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                         "target_region_access_count_before": str(use_count),
                         "diagnostic_copy_ordinal": copy_ordinal,
                         "mram_push_ordinal_since_launch": str(mram_ordinal),
+                        "replay_delay_requested_us": str(
+                            replay_delay_schedule_us[iteration_number]
+                            if copy_ordinal == "IDENTICAL_REPLAY"
+                            else 0
+                        ),
                         "size_per_dpu_bytes": str(size),
                         "total_logical_bytes": str(sum(logical)),
                         "total_transfer_bytes": str(size * 64),
@@ -249,13 +255,16 @@ class ValidateHardwareTraceTests(unittest.TestCase):
     def test_accepts_identical_vector_replay_without_key_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.create_trace(
-                Path(directory), vector_replay_mode="IDENTICAL_REPLAY"
+                Path(directory),
+                vector_replay_mode="IDENTICAL_REPLAY",
+                replay_delay_schedule_us=(0, 1000, 0, 1000),
             )
             summary = validate(
                 path,
                 expected_sysfs_ranks={0},
                 expected_transfer_order_variant="MATRIX_THEN_VECTOR",
                 expected_vector_replay_mode="IDENTICAL_REPLAY",
+                expected_vector_replay_delays_us={0, 1000},
             )
             with path.open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
@@ -284,6 +293,16 @@ class ValidateHardwareTraceTests(unittest.TestCase):
         self.assertTrue(
             all(
                 "mram_push_ordinal_since_launch" not in row["transport_key"]
+                for row in vector_rows
+            )
+        )
+        self.assertEqual(
+            [row["replay_delay_requested_us"] for row in vector_rows],
+            ["0", "1000"],
+        )
+        self.assertTrue(
+            all(
+                "replay_delay_requested_us" not in row["transport_key"]
                 for row in vector_rows
             )
         )

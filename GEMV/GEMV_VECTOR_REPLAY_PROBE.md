@@ -1,53 +1,70 @@
-# GEMV paired input-vector replay probe
+# GEMV controlled vector-replay delay probe
 
 ## Question
 
-This diagnostic keeps GEMV's real `input_matrix -> input_vector` order and then
-immediately writes the identical input vector to the identical MRAM region a
-second time before `dpu_launch`:
+The earlier identical replay experiment showed that slow `input_vector` calls
+usually remain slow in the immediately following replay. This follow-up tests
+whether that transfer-side episode decays after 1 ms.
+
+Every GEMV iteration keeps the real transfer order and writes the same input
+vector to the same MRAM region twice:
 
 ```text
 input_arguments -> input_matrix -> input_vector PRIMARY
+                -> wait 0 or 1000 us
                 -> input_vector IDENTICAL_REPLAY -> dpu_launch
 ```
 
-The replay uses the same host buffer, DPU set, target symbol, offset, and byte
-count. It overwrites the vector with identical contents, so the ordinary GEMV
-output equality check remains the semantic gate.
+The wait uses `nanosleep`, which yields the pinned host CPU. The analyzer also
+computes the observed gap from the PRIMARY end timestamp to the replay start
+timestamp. This gap includes the requested sleep and replay `dpu_prepare_xfer`.
 
-## Diagnostic labels
+## Balanced schedules
 
-Set `GEMV_VECTOR_REPLAY_MODE=IDENTICAL_REPLAY` to enable the extra copy. It is
-accepted only with `GEMV_TRANSFER_ORDER=MATRIX_THEN_VECTOR`.
+The runner cycles through eight four-iteration schedules:
 
-The event CSV adds these diagnostic columns:
+```text
+0,0,0,0
+0,0,1000,1000
+0,1000,0,1000
+0,1000,1000,0
+1000,0,0,1000
+1000,0,1000,0
+1000,1000,0,0
+1000,1000,1000,1000
+```
 
-* `vector_replay_mode`: `NONE` or `IDENTICAL_REPLAY`;
-* `diagnostic_copy_ordinal`: `PRIMARY`, `IDENTICAL_REPLAY`, or `NONE`;
-* `mram_push_ordinal_since_launch`: matrix=1, primary vector=2, replay=3.
+At every iteration, each delay arm receives the same process count. Every
+adjacent previous/current delay combination also receives the same count.
+`TRACE_RUNS` therefore uses a multiple of eight. The gate uses 8 traces and the
+formal run uses 24 traces.
 
-The source-buffer and target-region access counts include the replay. None of
-these diagnostic fields is included in the v9 `transport_key`.
+## Diagnostic fields
+
+`GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US` supplies one delay for each of the four
+iterations. The event CSV includes `replay_delay_requested_us`; the replay row
+carries the selected delay and every other transfer row carries zero.
+
+The delay, copy ordinal, MRAM push ordinal, iteration, heartbeat, and observed
+gap stay outside the v9 `transport_key`. They serve as experimental diagnostics.
 
 ## Interpretation
 
-For every process and iteration, the analyzer pairs PRIMARY with its immediately
-following replay and applies a robust threshold learned only from PRIMARY rows.
+The analyzer learns one pooled PRIMARY slow threshold per reuse context, then
+compares the balanced delay arms.
 
-* PRIMARY slow and replay normal supports a transient first-copy transfer state.
-* Both slow with a calibrated heartbeat spike supports a shared runtime episode.
-* Both slow without heartbeat supports a shared SDK/driver/rank-side episode that
-  the separate CPU heartbeat cannot see.
-* Fewer than three slow PRIMARY events remains sample-limited.
+* A higher recovery rate after 1000 us supports a time-decaying transfer-side
+  episode.
+* Similar recovery rates with slow delayed replays support a state that lasts
+  beyond 1 ms.
+* Different PRIMARY medians flag arm imbalance.
+* Fewer than three slow PRIMARY rows in either arm yields a sample-limited
+  decision.
 
-`vector_replay_analysis/` contains the event pairs, per-copy stability summary,
-and comparison/decision table. These outcomes are diagnostic evidence and do not
-automatically promote a new lookup-key field.
-
-## Collection sizes
-
-A gate uses three traced fresh processes. The formal default uses 24. Every
-process contributes one FIRST_USE primary/replay pair and three REUSED pairs.
+The FIRST_USE comparison has the cleanest causal interpretation because its
+PRIMARY transfer precedes every scheduled delay in a fresh process. The REUSED
+comparison uses the balanced transition design to control previous-delay
+history.
 
 ## Hardware gate
 
@@ -55,13 +72,13 @@ process contributes one FIRST_USE primary/replay pair and three REUSED pairs.
 cd ~/bdang/prim-benchmarks/GEMV
 export DPU_RANK_TOPOLOGY_TSV="$HOME/upmem_topology_20260807_172654/dpu_rank_topology.tsv"
 
-RESULT_ROOT="/tmp/bdang/gemv_vector_replay_gate_$(date +%Y%m%d_%H%M%S)" \
-TRACE_RUNS=3 CREATE_ARCHIVE=1 bash ./run_vector_replay_probe.sh
+RESULT_ROOT="/tmp/bdang/gemv_vector_replay_delay_gate_$(date +%Y%m%d_%H%M%S)" \
+TRACE_RUNS=8 CREATE_ARCHIVE=1 bash ./run_vector_replay_probe.sh
 ```
 
-Require three validation `PASS` lines, 27 event rows and 2,560 DPU-detail rows
-per trace, and `Outputs are equal` in every run log. A three-trace analysis is
-normally sample-limited and is only a hardware/schema gate.
+The gate produces eight validation `PASS` lines. Each trace contains 27 event
+rows, 20 transfer rows, and 2,560 DPU-detail rows. Every run log must contain
+`Outputs are equal`.
 
 ## Formal collection
 
@@ -69,9 +86,10 @@ normally sample-limited and is only a hardware/schema gate.
 cd ~/bdang/prim-benchmarks/GEMV
 export DPU_RANK_TOPOLOGY_TSV="$HOME/upmem_topology_20260807_172654/dpu_rank_topology.tsv"
 
-RESULT_ROOT="/tmp/bdang/gemv_vector_replay_formal_$(date +%Y%m%d_%H%M%S)" \
+RESULT_ROOT="/tmp/bdang/gemv_vector_replay_delay_formal_$(date +%Y%m%d_%H%M%S)" \
 TRACE_RUNS=24 CREATE_ARCHIVE=1 bash ./run_vector_replay_probe.sh
 ```
 
-Archive the raw traces, heartbeat calibration, topology TSV/checksum, validation
-log, pair-level analysis, source commit, and dirty-worktree record together.
+The archive contains raw traces, schedule assignments, heartbeat calibration,
+the topology snapshot and checksum, validation logs, analysis CSVs, the source
+commit, and the worktree status.

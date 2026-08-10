@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-RESULT_ROOT="${RESULT_ROOT:-/tmp/bdang/gemv_vector_replay_$(date +%Y%m%d_%H%M%S)}"
-LATEST_RESULT_POINTER="${LATEST_RESULT_POINTER:-/tmp/bdang/latest_gemv_vector_replay_path.txt}"
+RESULT_ROOT="${RESULT_ROOT:-/tmp/bdang/gemv_vector_replay_delay_$(date +%Y%m%d_%H%M%S)}"
+LATEST_RESULT_POINTER="${LATEST_RESULT_POINTER:-/tmp/bdang/latest_gemv_vector_replay_delay_path.txt}"
 NUMA_NODE="${NUMA_NODE:-0}"
 EXCLUDED_SYSFS_RANKS="${EXCLUDED_SYSFS_RANKS:-5}"
 NR_DPUS="${NR_DPUS:-128}"
@@ -25,7 +25,9 @@ HOST_CPU_ID="${HOST_CPU_ID:-}"
 PROBE_CPU_ID="${PROBE_CPU_ID:-}"
 TRANSFER_ORDER_VARIANT="MATRIX_THEN_VECTOR"
 VECTOR_REPLAY_MODE="IDENTICAL_REPLAY"
-TRANSPORT_KEY_VERSION="v9_unchanged_vector_replay_diagnostic_only"
+REPLAY_DELAY_LEVELS_US="0,1000"
+REPLAY_DELAY_DESIGN="BALANCED_8_SCHEDULES"
+TRANSPORT_KEY_VERSION="v9_unchanged_vector_replay_delay_diagnostic_only"
 CONFIG_NAME="GEMV_128dpu_16tl_VECTOR_REPLAY"
 probe_pid=""
 
@@ -60,6 +62,10 @@ if [[ "$M_SIZE" != "8192" || "$N_SIZE" != "8192" ]]; then
 fi
 if [[ "$IN_PROCESS_WARMUP" != "1" || "$IN_PROCESS_REPS" != "3" ]]; then
     echo "ERROR: use one in-process warmup and three measured repetitions" >&2
+    exit 1
+fi
+if (( TRACE_RUNS < 8 || TRACE_RUNS % 8 != 0 )); then
+    echo "ERROR: TRACE_RUNS must be a positive multiple of 8" >&2
     exit 1
 fi
 for command in numactl cc python3 make git lscpu sha256sum tar \
@@ -176,19 +182,31 @@ sha256sum "$RESULT_ROOT/artifacts/gemv_host" \
 
 result_dir="$RESULT_ROOT/$CONFIG_NAME"
 mkdir -p "$result_dir"
-printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nM_SIZE=%s\nN_SIZE=%s\nNUMA_NODE=%s\nEXCLUDED_SYSFS_RANKS=%s\nGEMV_DPU_RANK_PATHS=%s\nEXPECTED_SYSFS_RANKS=%s\nEXPECTED_CHANNELS=%s\nPROCESS_WARMUP_RUNS=%s\nTRACE_RUNS=%s\nIN_PROCESS_WARMUP=%s\nIN_PROCESS_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nHOST_BINDING_MODE=FIXED_CORE\nHOST_CPU_LIST=%s\nPROBE_CPU_ID=%s\nTRANSFER_ORDER_VARIANT=%s\nVECTOR_REPLAY_MODE=%s\nHEARTBEAT_THRESHOLD_US=%s\nTIMING_SCOPE=PUSH_ONLY\n' \
+printf 'NR_DPUS=%s\nNR_TASKLETS=%s\nM_SIZE=%s\nN_SIZE=%s\nNUMA_NODE=%s\nEXCLUDED_SYSFS_RANKS=%s\nGEMV_DPU_RANK_PATHS=%s\nEXPECTED_SYSFS_RANKS=%s\nEXPECTED_CHANNELS=%s\nPROCESS_WARMUP_RUNS=%s\nTRACE_RUNS=%s\nIN_PROCESS_WARMUP=%s\nIN_PROCESS_REPS=%s\nTRANSPORT_KEY_VERSION=%s\nHOST_BINDING_MODE=FIXED_CORE\nHOST_CPU_LIST=%s\nPROBE_CPU_ID=%s\nTRANSFER_ORDER_VARIANT=%s\nVECTOR_REPLAY_MODE=%s\nREPLAY_DELAY_LEVELS_US=%s\nREPLAY_DELAY_DESIGN=%s\nHEARTBEAT_THRESHOLD_US=%s\nTIMING_SCOPE=PUSH_ONLY\n' \
     "$NR_DPUS" "$TASKLETS" "$M_SIZE" "$N_SIZE" "$NUMA_NODE" \
     "$EXCLUDED_SYSFS_RANKS" "$rank_paths" "$sysfs_ranks" "$channels" \
     "$PROCESS_WARMUP_RUNS" "$TRACE_RUNS" "$IN_PROCESS_WARMUP" \
     "$IN_PROCESS_REPS" "$TRANSPORT_KEY_VERSION" "$HOST_CPU_ID" \
     "$PROBE_CPU_ID" "$TRANSFER_ORDER_VARIANT" "$VECTOR_REPLAY_MODE" \
+    "$REPLAY_DELAY_LEVELS_US" "$REPLAY_DELAY_DESIGN" \
     "$HEARTBEAT_THRESHOLD_US" > "$result_dir/config.txt"
-printf 'phase,repeat,config,start_wall_ns,end_wall_ns\n' \
+printf 'phase,repeat,config,replay_delay_schedule_us,start_wall_ns,end_wall_ns\n' \
     > "$RESULT_ROOT/schedule.csv"
 
 export GEMV_DPU_RANK_PATHS="$rank_paths"
 export GEMV_TRANSFER_ORDER="$TRANSFER_ORDER_VARIANT"
 export GEMV_VECTOR_REPLAY_MODE="$VECTOR_REPLAY_MODE"
+
+delay_schedules=(
+    "0,0,0,0"
+    "0,0,1000,1000"
+    "0,1000,0,1000"
+    "0,1000,1000,0"
+    "1000,0,0,1000"
+    "1000,0,1000,0"
+    "1000,1000,0,0"
+    "1000,1000,1000,1000"
+)
 
 run_gemv() {
     numactl --physcpubind="$HOST_CPU_ID" --membind="$NUMA_NODE" \
@@ -240,6 +258,7 @@ unset_trace_env() {
 
 for rep in $(seq 1 "$PROCESS_WARMUP_RUNS"); do
     unset_trace_env
+    export GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US="0,0,0,0"
     rep_id="$(printf '%02d' "$rep")"
     log_path="$result_dir/warmup_${rep_id}.log"
     start_wall_ns="$(date +%s%N)"
@@ -247,33 +266,38 @@ for rep in $(seq 1 "$PROCESS_WARMUP_RUNS"); do
     run_gemv > "$log_path" 2>&1
     end_wall_ns="$(date +%s%N)"
     require_correct_result "$log_path"
-    printf 'warmup,%s,%s,%s,%s\n' "$rep" "$CONFIG_NAME" \
+    printf 'warmup,%s,%s,"%s",%s,%s\n' "$rep" "$CONFIG_NAME" \
+        "$GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US" \
         "$start_wall_ns" "$end_wall_ns" >> "$RESULT_ROOT/schedule.csv"
 done
 
 for rep in $(seq 1 "$TRACE_RUNS"); do
     rep_id="$(printf '%02d' "$rep")"
+    schedule_index=$(((rep - 1) % ${#delay_schedules[@]}))
+    export GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US="${delay_schedules[$schedule_index]}"
     export GEMV_TRACE_CSV="$result_dir/trace_${rep_id}.csv"
     export GEMV_TRACE_DPUS_CSV="$result_dir/trace_${rep_id}_dpus.csv"
     export GEMV_TRACE_RUN_ID="$CONFIG_NAME"
     export GEMV_TRACE_REPEAT_ID="$rep"
     export GEMV_TRACE_HOST_NUMA_NODE="$NUMA_NODE"
-    export GEMV_TRACE_PROCESS_STATE="vector_replay_probe"
+    export GEMV_TRACE_PROCESS_STATE="vector_replay_delay_probe"
     export GEMV_TRACE_PREWARM_RUNS="$PROCESS_WARMUP_RUNS"
     export GEMV_TRACE_HOST_BINDING_MODE="FIXED_CORE"
     export GEMV_TRACE_HOST_CPU_LIST="$HOST_CPU_ID"
     log_path="$result_dir/run_${rep_id}.log"
     heartbeat_path="$result_dir/heartbeat_${rep_id}.csv"
     start_wall_ns="$(date +%s%N)"
-    echo "==> phase=trace repeat=$rep"
+    echo "==> phase=trace repeat=$rep replay_delay_schedule_us=$GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US"
     run_gemv_with_heartbeat "$heartbeat_path" "$log_path"
     end_wall_ns="$(date +%s%N)"
     require_correct_result "$log_path"
-    printf 'trace,%s,%s,%s,%s\n' "$rep" "$CONFIG_NAME" \
+    printf 'trace,%s,%s,"%s",%s,%s\n' "$rep" "$CONFIG_NAME" \
+        "$GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US" \
         "$start_wall_ns" "$end_wall_ns" >> "$RESULT_ROOT/schedule.csv"
 done
 unset_trace_env
-unset GEMV_DPU_RANK_PATHS GEMV_TRANSFER_ORDER GEMV_VECTOR_REPLAY_MODE || true
+unset GEMV_DPU_RANK_PATHS GEMV_TRANSFER_ORDER GEMV_VECTOR_REPLAY_MODE \
+    GEMV_VECTOR_REPLAY_DELAY_SCHEDULE_US || true
 
 mapfile -t traces < <(find "$result_dir" -maxdepth 1 \
     -type f -name 'trace_*.csv' ! -name '*_dpus.csv' | sort)
@@ -285,10 +309,12 @@ python3 "$SCRIPT_DIR/validate_hw_trace.py" \
     --expected-host-cpu-list "$HOST_CPU_ID" \
     --expected-transfer-order-variant "$TRANSFER_ORDER_VARIANT" \
     --expected-vector-replay-mode "$VECTOR_REPLAY_MODE" \
+    --expected-vector-replay-delays-us "$REPLAY_DELAY_LEVELS_US" \
     "${traces[@]}" > "$result_dir/validation.log"
 
-python3 "$SCRIPT_DIR/analyze_vector_replay_probe.py" "$RESULT_ROOT" \
-    > "$RESULT_ROOT/vector_replay_analysis.log"
+python3 "$SCRIPT_DIR/analyze_vector_replay_delay_probe.py" "$RESULT_ROOT" \
+    --expected-delay-us 0 1000 \
+    > "$RESULT_ROOT/vector_replay_delay_analysis.log"
 
 archive=""
 if [[ "$CREATE_ARCHIVE" == "1" ]]; then
@@ -298,7 +324,7 @@ if [[ "$CREATE_ARCHIVE" == "1" ]]; then
 fi
 printf '%s\n' "$RESULT_ROOT" | tee "$LATEST_RESULT_POINTER"
 echo "Trace results:      $RESULT_ROOT"
-echo "Replay comparison:  $RESULT_ROOT/vector_replay_analysis/vector_replay_comparison.csv"
+echo "Delay comparison:   $RESULT_ROOT/vector_replay_delay_analysis/vector_replay_delay_comparison.csv"
 echo "Heartbeat config:   $RESULT_ROOT/heartbeat_calibration_summary.csv"
 if [[ -n "$archive" ]]; then
     echo "Archive:            $archive"

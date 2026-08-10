@@ -90,6 +90,7 @@ EVENT_FIELDS = {
     "vector_replay_mode",
     "diagnostic_copy_ordinal",
     "mram_push_ordinal_since_launch",
+    "replay_delay_requested_us",
     "pretrace_warmup_runs",
     "transport_key",
     "host_start_ns",
@@ -344,6 +345,7 @@ def validate(
     expected_host_cpu_list: str | None = None,
     expected_transfer_order_variant: str | None = None,
     expected_vector_replay_mode: str | None = None,
+    expected_vector_replay_delays_us: set[int] | None = None,
 ) -> dict[str, object]:
     details_path = detail_path_for(event_path)
     events = read_csv(event_path, EVENT_FIELDS, "event")
@@ -559,6 +561,7 @@ def validate(
         "transport_key",
         "diagnostic_copy_ordinal",
         "mram_push_ordinal_since_launch",
+        "replay_delay_requested_us",
     )
     require(
         all(row[field] == "" for row in nontransfer_rows for field in transfer_only_fields),
@@ -645,6 +648,13 @@ def validate(
             row["diagnostic_copy_ordinal"] == expected_copy_ordinal,
             f"event {event_id} diagnostic copy ordinal differs",
         )
+        replay_delay_us = int(row["replay_delay_requested_us"])
+        require(replay_delay_us >= 0, f"event {event_id} replay delay is negative")
+        require(
+            expected_copy_ordinal == "IDENTICAL_REPLAY"
+            or replay_delay_us == 0,
+            f"event {event_id} carries replay delay outside the replay copy",
+        )
         require(
             int(row["source_buffer_use_count_before"]) == expected_use_count,
             f"event {event_id} source buffer use count differs",
@@ -685,6 +695,18 @@ def validate(
         )
         durations_by_subop[row["subop"]].append(int(row["measured_ns"]))
 
+    observed_replay_delays_us = {
+        int(row["replay_delay_requested_us"])
+        for row in transfer_rows
+        if row["diagnostic_copy_ordinal"] == "IDENTICAL_REPLAY"
+    }
+    if expected_vector_replay_delays_us is not None:
+        require(
+            bool(observed_replay_delays_us)
+            and observed_replay_delays_us <= expected_vector_replay_delays_us,
+            "vector replay delay falls outside the requested set",
+        )
+
     return {
         "path": str(event_path),
         "configured_dpus": nr_dpus,
@@ -704,6 +726,9 @@ def validate(
         "host_cpu_list": host_cpu_list,
         "transfer_order_variant": transfer_order_variant,
         "vector_replay_mode": vector_replay_mode,
+        "vector_replay_delays_us": ",".join(
+            str(value) for value in sorted(observed_replay_delays_us)
+        ),
     }
 
 
@@ -717,6 +742,9 @@ def main() -> int:
     parser.add_argument("--expected-host-cpu-list")
     parser.add_argument("--expected-transfer-order-variant")
     parser.add_argument("--expected-vector-replay-mode")
+    parser.add_argument(
+        "--expected-vector-replay-delays-us", type=parse_int_set
+    )
     args = parser.parse_args()
     try:
         summaries = [
@@ -729,9 +757,20 @@ def main() -> int:
                 args.expected_host_cpu_list,
                 args.expected_transfer_order_variant,
                 args.expected_vector_replay_mode,
+                args.expected_vector_replay_delays_us,
             )
             for path in args.traces
         ]
+        if args.expected_vector_replay_delays_us is not None:
+            observed_delays = {
+                delay
+                for summary in summaries
+                for delay in parse_int_set(str(summary["vector_replay_delays_us"]))
+            }
+            require(
+                observed_delays == args.expected_vector_replay_delays_us,
+                "combined vector replay delay set differs from the requested set",
+            )
     except (OSError, ValueError, KeyError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

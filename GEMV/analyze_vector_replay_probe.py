@@ -185,6 +185,14 @@ def analyze(result_root: Path) -> Dict[str, List[Dict[str, object]]]:
             )
             primary_ns = int(primary["measured_ns"])
             replay_ns = int(replay["measured_ns"])
+            replay_delay_requested_us = int(
+                replay.get("replay_delay_requested_us", "0") or "0"
+            )
+            replay_gap_ns = int(replay["host_start_ns"]) - int(
+                primary["host_end_ns"]
+            )
+            if replay_gap_ns < 0:
+                raise ValueError(f"negative replay gap in {trace_path}")
             pairs.append(
                 {
                     "run_id": primary["run_id"],
@@ -201,6 +209,8 @@ def analyze(result_root: Path) -> Dict[str, List[Dict[str, object]]]:
                     "replay_mram_push_ordinal_since_launch": replay[
                         "mram_push_ordinal_since_launch"
                     ],
+                    "replay_delay_requested_us": replay_delay_requested_us,
+                    "replay_gap_ns": replay_gap_ns,
                     "primary_source_buffer_use_count_before": primary[
                         "source_buffer_use_count_before"
                     ],
