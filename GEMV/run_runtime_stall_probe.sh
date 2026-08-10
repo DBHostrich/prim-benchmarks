@@ -16,7 +16,7 @@ TRACE_RUNS="${TRACE_RUNS:-12}"
 IN_PROCESS_WARMUP="${IN_PROCESS_WARMUP:-1}"
 IN_PROCESS_REPS="${IN_PROCESS_REPS:-3}"
 HEARTBEAT_PERIOD_US="${HEARTBEAT_PERIOD_US:-100}"
-HEARTBEAT_THRESHOLD_US="${HEARTBEAT_THRESHOLD_US:-50}"
+HEARTBEAT_THRESHOLD_US="${HEARTBEAT_THRESHOLD_US:-200}"
 HEARTBEAT_WINDOW_NS="${HEARTBEAT_WINDOW_NS:-200000}"
 CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
 DPU_RANK_TOPOLOGY_TSV="${DPU_RANK_TOPOLOGY_TSV:-}"
@@ -274,7 +274,8 @@ run_rounds() {
             unset GEMV_TRACE_CSV GEMV_TRACE_DPUS_CSV GEMV_TRACE_RUN_ID \
                 GEMV_TRACE_REPEAT_ID GEMV_TRACE_HOST_NUMA_NODE \
                 GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS \
-                GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST || true
+                GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST \
+                GEMV_TRANSFER_ORDER || true
             if [[ "$phase" == "trace" ]]; then
                 export GEMV_TRACE_CSV="$result_dir/trace_${rep_id}.csv"
                 export GEMV_TRACE_DPUS_CSV="$result_dir/trace_${rep_id}_dpus.csv"
@@ -285,6 +286,7 @@ run_rounds() {
                 export GEMV_TRACE_PREWARM_RUNS="$PROCESS_WARMUP_RUNS"
                 export GEMV_TRACE_HOST_BINDING_MODE="$binding"
                 export GEMV_TRACE_HOST_CPU_LIST="$cpu_list"
+                export GEMV_TRANSFER_ORDER="MATRIX_THEN_VECTOR"
                 log_path="$result_dir/run_${rep_id}.log"
                 heartbeat_path="$result_dir/heartbeat_${rep_id}.csv"
             else
@@ -313,7 +315,8 @@ run_rounds trace "$TRACE_RUNS"
 unset GEMV_DPU_RANK_PATHS GEMV_TRACE_CSV GEMV_TRACE_DPUS_CSV \
     GEMV_TRACE_RUN_ID GEMV_TRACE_REPEAT_ID GEMV_TRACE_HOST_NUMA_NODE \
     GEMV_TRACE_PROCESS_STATE GEMV_TRACE_PREWARM_RUNS \
-    GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST || true
+    GEMV_TRACE_HOST_BINDING_MODE GEMV_TRACE_HOST_CPU_LIST \
+    GEMV_TRANSFER_ORDER || true
 
 for spec in "${configs[@]}"; do
     IFS=';' read -r nr_dpus binding rank_paths sysfs_ranks channels <<< "$spec"
@@ -328,6 +331,7 @@ for spec in "${configs[@]}"; do
         --expected-sysfs-ranks "$sysfs_ranks" \
         --expected-host-binding-mode "$binding" \
         --expected-host-cpu-list "$cpu_list" \
+        --expected-transfer-order-variant "MATRIX_THEN_VECTOR" \
         "${config_traces[@]}" > "$result_dir/validation.log"
     echo "==> PASS $name"
 done

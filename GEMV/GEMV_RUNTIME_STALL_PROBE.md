@@ -21,9 +21,10 @@ The host trace adds thread CPU time, wall time minus thread CPU time, CPU IDs at
 both event boundaries, context-switch deltas, and page-fault deltas. These fields
 remain outside `transport_key`.
 
-The heartbeat probe wakes every 100 microseconds by default. It writes a row only
-when wakeup lateness reaches 50 microseconds, which limits observer overhead and
-result size.
+The heartbeat probe wakes every 100 microseconds by default. The general runtime
+probe now records wakeup lateness from 200 microseconds. The focused transfer-order
+probe performs an idle calibration and chooses the larger of idle P99 and 200
+microseconds.
 
 The analyzer builds robust event thresholds from `MULTI_CORE` samples using
 `median + 3 * 1.4826 * MAD`. It then applies the same threshold to both binding

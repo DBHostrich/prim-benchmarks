@@ -25,13 +25,19 @@ from validate_hw_trace import (
 
 
 class ValidateHardwareTraceTests(unittest.TestCase):
-    def create_trace(self, root: Path) -> Path:
+    def create_trace(
+        self,
+        root: Path,
+        transfer_order_variant: str = "MATRIX_THEN_VECTOR",
+    ) -> Path:
         event_path = root / "trace_01.csv"
         detail_path = root / "trace_01_dpus.csv"
         events: list[dict[str, str]] = []
         details: list[dict[str, str]] = []
         previous: dict[str, str] | None = None
-        for event_id, semantic in enumerate(expected_sequence()):
+        for event_id, semantic in enumerate(
+            expected_sequence(transfer_order_variant)
+        ):
             op, subop, direction, iteration, warmup = semantic
             row = {field: "" for field in EVENT_FIELDS}
             row.update(
@@ -55,6 +61,7 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                     "process_state": "interleaved_fresh_process",
                     "host_binding_mode": "FIXED_CORE",
                     "host_cpu_list": "2",
+                    "transfer_order_variant": transfer_order_variant,
                     "pretrace_warmup_runs": "3",
                     "host_start_ns": str(event_id * 100 + 1),
                     "host_end_ns": str(event_id * 100 + 51),
@@ -190,6 +197,18 @@ class ValidateHardwareTraceTests(unittest.TestCase):
             summary = validate(path, expected_sysfs_ranks={0})
         self.assertEqual(summary["transfer_rows"], 16)
         self.assertEqual(summary["dpu_detail_rows"], 1024)
+
+    def test_accepts_vector_then_matrix_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.create_trace(
+                Path(directory), "VECTOR_THEN_MATRIX"
+            )
+            summary = validate(
+                path,
+                expected_sysfs_ranks={0},
+                expected_transfer_order_variant="VECTOR_THEN_MATRIX",
+            )
+        self.assertEqual(summary["transfer_order_variant"], "VECTOR_THEN_MATRIX")
 
     def test_rejects_unexpected_rank_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

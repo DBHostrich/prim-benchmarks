@@ -446,6 +446,7 @@ bool gemv_host_trace_init(
 	const char *process_state = getenv("GEMV_TRACE_PROCESS_STATE");
 	const char *host_binding_mode = getenv("GEMV_TRACE_HOST_BINDING_MODE");
 	const char *host_cpu_list = getenv("GEMV_TRACE_HOST_CPU_LIST");
+	const char *transfer_order_variant = getenv("GEMV_TRANSFER_ORDER");
 	const char *pretrace_warmup_runs = getenv("GEMV_TRACE_PREWARM_RUNS");
 	const char *topology_path = getenv("GEMV_TRACE_DPU_RANK_TOPOLOGY_TSV");
 	struct dpu_set_t rank = {0};
@@ -499,6 +500,9 @@ bool gemv_host_trace_init(
 		|| host_binding_mode[0] == '\0' ? "NODE_ONLY" : host_binding_mode;
 	trace->host_cpu_list = host_cpu_list == NULL || host_cpu_list[0] == '\0'
 		? "unreported" : host_cpu_list;
+	trace->transfer_order_variant = transfer_order_variant == NULL
+		|| transfer_order_variant[0] == '\0'
+		? "MATRIX_THEN_VECTOR" : transfer_order_variant;
 	trace->event_capacity = 64u;
 	trace->dpu_row_capacity = (size_t)configured_dpus * 16u;
 	if (!parse_unsigned_env("GEMV_TRACE_REPEAT_ID", repeat_id, &trace->repeat_id)
@@ -507,7 +511,8 @@ bool gemv_host_trace_init(
 		return false;
 	if (!is_label_atom(trace->host_numa_node)
 		|| !is_label_atom(trace->process_state)
-		|| !is_label_atom(trace->host_binding_mode)) {
+		|| !is_label_atom(trace->host_binding_mode)
+		|| !is_label_atom(trace->transfer_order_variant)) {
 		fprintf(stderr, "GEMV trace NUMA/process label contains unsupported characters\n");
 		return false;
 	}
@@ -816,7 +821,7 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		"phase_class,subop,iteration,warmup,"
 		"size_per_dpu_bytes,total_logical_bytes,total_transfer_bytes,"
 		"target_symbol,offset_bytes,process_state,host_binding_mode,"
-		"host_cpu_list,pretrace_warmup_runs,transport_key,"
+		"host_cpu_list,transfer_order_variant,pretrace_warmup_runs,transport_key,"
 		"host_start_ns,host_end_ns,measured_ns,thread_cpu_ns,"
 		"wall_minus_thread_cpu_ns,cpu_id_start,cpu_id_end,"
 		"voluntary_context_switch_delta,involuntary_context_switch_delta,"
@@ -929,6 +934,8 @@ static bool write_events(const struct GemvHostTrace *trace) {
 		write_csv_string(stream, trace->host_binding_mode);
 		fputc(',', stream);
 		write_csv_string(stream, trace->host_cpu_list);
+		fputc(',', stream);
+		write_csv_string(stream, trace->transfer_order_variant);
 		fprintf(stream, ",%" PRIu64 ",", trace->pretrace_warmup_runs);
 		write_csv_string(stream, transport_key);
 		fprintf(stream,

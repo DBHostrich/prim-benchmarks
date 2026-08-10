@@ -196,10 +196,103 @@ static void gemv_host(T* C, T* A, T* B, unsigned int m_size, unsigned int n_size
 	}
 }
 
+enum GemvTransferOrder {
+	GEMV_MATRIX_THEN_VECTOR,
+	GEMV_VECTOR_THEN_MATRIX,
+};
+
+static bool parse_transfer_order(enum GemvTransferOrder *order) {
+	const char *value = getenv("GEMV_TRANSFER_ORDER");
+	if (value == NULL || value[0] == '\0'
+		|| strcmp(value, "MATRIX_THEN_VECTOR") == 0) {
+		*order = GEMV_MATRIX_THEN_VECTOR;
+		return true;
+	}
+	if (strcmp(value, "VECTOR_THEN_MATRIX") == 0) {
+		*order = GEMV_VECTOR_THEN_MATRIX;
+		return true;
+	}
+	fprintf(stderr, "Unsupported GEMV_TRANSFER_ORDER: %s\n", value);
+	return false;
+}
+
+static void push_input_matrix(
+	struct dpu_set_t dpu_set,
+	unsigned int n_size,
+	uint32_t n_size_pad,
+	uint32_t max_rows_per_dpu,
+	const uint64_t *matrix_logical_bytes,
+	unsigned int rep,
+	int32_t warmup,
+	struct GemvHostTrace *host_trace
+) {
+	struct dpu_set_t dpu;
+	uint32_t i = 0;
+	struct GemvHostTraceMeasurement measurement = {0};
+	DPU_FOREACH(dpu_set, dpu, i) {
+		DPU_ASSERT(dpu_prepare_xfer(
+			dpu, A + dpu_info[i].prev_rows_dpu * n_size
+		));
+	}
+	if (gemv_host_trace_enabled(host_trace))
+		gemv_host_trace_measurement_begin(&measurement);
+	DPU_ASSERT(dpu_push_xfer(
+		dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0,
+		max_rows_per_dpu * n_size_pad * sizeof(T), DPU_XFER_DEFAULT
+	));
+	if (gemv_host_trace_enabled(host_trace)) {
+		gemv_host_trace_measurement_end(&measurement);
+		gemv_host_trace_record_transfer(
+			host_trace, "input_matrix", "TO_DPU", rep, warmup,
+			"MRAM", DPU_MRAM_HEAP_POINTER_NAME, 0,
+			matrix_logical_bytes, 0,
+			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
+			rep, rep, &measurement
+		);
+	}
+}
+
+static void push_input_vector(
+	struct dpu_set_t dpu_set,
+	uint32_t n_size,
+	uint32_t n_size_pad,
+	uint32_t max_rows_per_dpu,
+	unsigned int rep,
+	int32_t warmup,
+	struct GemvHostTrace *host_trace
+) {
+	struct dpu_set_t dpu;
+	struct GemvHostTraceMeasurement measurement = {0};
+	DPU_FOREACH(dpu_set, dpu) {
+		DPU_ASSERT(dpu_prepare_xfer(dpu, B));
+	}
+	if (gemv_host_trace_enabled(host_trace))
+		gemv_host_trace_measurement_begin(&measurement);
+	DPU_ASSERT(dpu_push_xfer(
+		dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME,
+		(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
+		n_size_pad * sizeof(T), DPU_XFER_DEFAULT
+	));
+	if (gemv_host_trace_enabled(host_trace)) {
+		gemv_host_trace_measurement_end(&measurement);
+		gemv_host_trace_record_transfer(
+			host_trace, "input_vector", "TO_DPU", rep, warmup,
+			"MRAM", DPU_MRAM_HEAP_POINTER_NAME,
+			(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
+			NULL, (uint64_t)n_size * sizeof(T),
+			(uint64_t)n_size_pad * sizeof(T),
+			rep, rep, &measurement
+		);
+	}
+}
+
 // Main of the Host Application
 int main(int argc, char **argv) {
 
 	struct Params p = input_params(argc, argv);
+	enum GemvTransferOrder transfer_order;
+	if (!parse_transfer_order(&transfer_order))
+		return EXIT_FAILURE;
 
 	struct dpu_set_t dpu_set, dpu;
 	struct GemvDpuAllocation dpu_allocation;
@@ -373,39 +466,24 @@ int main(int argc, char **argv) {
 			);
 		}
 
-		// Copy input array and vector
-		i = 0;
-		DPU_FOREACH(dpu_set, dpu, i) {
-			DPU_ASSERT(dpu_prepare_xfer(dpu, A + dpu_info[i].prev_rows_dpu * n_size));
-		}
-		if (gemv_host_trace_enabled(&host_trace))
-			gemv_host_trace_measurement_begin(&operation_measurement);
-		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0, max_rows_per_dpu * n_size_pad * sizeof(T), DPU_XFER_DEFAULT));
-		if (gemv_host_trace_enabled(&host_trace)) {
-			gemv_host_trace_measurement_end(&operation_measurement);
-			gemv_host_trace_record_transfer(
-				&host_trace, "input_matrix", "TO_DPU", rep, warmup,
-				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,
-				matrix_logical_bytes, 0,
-				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
-				rep, rep, &operation_measurement
+		// Copy input array and vector using the selected control order.
+		if (transfer_order == GEMV_VECTOR_THEN_MATRIX) {
+			push_input_vector(
+				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
+				rep, warmup, &host_trace
 			);
-		}
-		DPU_FOREACH(dpu_set, dpu, i) {
-			DPU_ASSERT(dpu_prepare_xfer(dpu, B));
-		}
-		if (gemv_host_trace_enabled(&host_trace))
-			gemv_host_trace_measurement_begin(&operation_measurement);
-		DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, max_rows_per_dpu * n_size_pad * sizeof(T) , n_size_pad * sizeof(T), DPU_XFER_DEFAULT));
-		if (gemv_host_trace_enabled(&host_trace)) {
-			gemv_host_trace_measurement_end(&operation_measurement);
-			gemv_host_trace_record_transfer(
-				&host_trace, "input_vector", "TO_DPU", rep, warmup,
-				"MRAM", "DPU_MRAM_HEAP_POINTER_NAME",
-				(uint64_t)max_rows_per_dpu * n_size_pad * sizeof(T),
-				NULL, (uint64_t)n_size * sizeof(T),
-				(uint64_t)n_size_pad * sizeof(T),
-				rep, rep, &operation_measurement
+			push_input_matrix(
+				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
+				matrix_logical_bytes, rep, warmup, &host_trace
+			);
+		} else {
+			push_input_matrix(
+				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
+				matrix_logical_bytes, rep, warmup, &host_trace
+			);
+			push_input_vector(
+				dpu_set, n_size, n_size_pad, max_rows_per_dpu,
+				rep, warmup, &host_trace
 			);
 		}
 

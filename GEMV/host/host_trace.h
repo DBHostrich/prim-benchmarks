@@ -81,6 +81,7 @@ struct GemvHostTrace {
 	const char *process_state;
 	const char *host_binding_mode;
 	const char *host_cpu_list;
+	const char *transfer_order_variant;
 	uint64_t pretrace_warmup_runs;
 	uint32_t *rank_ordinals;
 	uint32_t *dpu_ids_in_rank;

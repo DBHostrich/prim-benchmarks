@@ -86,6 +86,7 @@ EVENT_FIELDS = {
     "process_state",
     "host_binding_mode",
     "host_cpu_list",
+    "transfer_order_variant",
     "pretrace_warmup_runs",
     "transport_key",
     "host_start_ns",
@@ -173,20 +174,27 @@ def expected_rows_per_dpu(nr_dpus: int) -> list[int]:
     return [chunks + int(dpu_id < extra) for dpu_id in range(nr_dpus)]
 
 
-def expected_sequence() -> list[tuple[str, str, str, str, str]]:
+def expected_sequence(
+    transfer_order_variant: str = "MATRIX_THEN_VECTOR",
+) -> list[tuple[str, str, str, str, str]]:
+    require(
+        transfer_order_variant in {"MATRIX_THEN_VECTOR", "VECTOR_THEN_MATRIX"},
+        f"unsupported transfer order variant={transfer_order_variant}",
+    )
+    input_order = (
+        ("input_matrix", "input_vector")
+        if transfer_order_variant == "MATRIX_THEN_VECTOR"
+        else ("input_vector", "input_matrix")
+    )
     sequence = [
         ("dpu_alloc", "", "", "", ""),
         ("dpu_load", "", "", "", ""),
     ]
     for iteration in range(ITERATIONS):
         warmup = "1" if iteration == 0 else "0"
-        for subop, direction in (
-            ("input_arguments", "TO_DPU"),
-            ("input_matrix", "TO_DPU"),
-            ("input_vector", "TO_DPU"),
-        ):
+        for subop in ("input_arguments", *input_order):
             sequence.append(
-                ("dpu_push_xfer", subop, direction, str(iteration), warmup)
+                ("dpu_push_xfer", subop, "TO_DPU", str(iteration), warmup)
             )
         sequence.append(("dpu_launch", "sync", "", str(iteration), warmup))
         sequence.append(
@@ -308,6 +316,7 @@ def validate(
     expected_sysfs_ranks: set[int] | None = None,
     expected_host_binding_mode: str | None = None,
     expected_host_cpu_list: str | None = None,
+    expected_transfer_order_variant: str | None = None,
 ) -> dict[str, object]:
     details_path = detail_path_for(event_path)
     events = read_csv(event_path, EVENT_FIELDS, "event")
@@ -339,8 +348,13 @@ def validate(
     require(bool(one_text(events, "process_state")), "process_state is empty")
     host_binding_mode = one_text(events, "host_binding_mode")
     host_cpu_list = one_text(events, "host_cpu_list")
+    transfer_order_variant = one_text(events, "transfer_order_variant")
     require(bool(host_binding_mode), "host_binding_mode is empty")
     require(bool(host_cpu_list), "host_cpu_list is empty")
+    require(
+        transfer_order_variant in {"MATRIX_THEN_VECTOR", "VECTOR_THEN_MATRIX"},
+        "transfer order variant differs from supported variants",
+    )
     if expected_host_binding_mode is not None:
         require(
             host_binding_mode == expected_host_binding_mode,
@@ -351,8 +365,13 @@ def validate(
             host_cpu_list == expected_host_cpu_list,
             "host CPU list differs from the requested list",
         )
+    if expected_transfer_order_variant is not None:
+        require(
+            transfer_order_variant == expected_transfer_order_variant,
+            "transfer order variant differs from the requested variant",
+        )
 
-    wanted_sequence = expected_sequence()
+    wanted_sequence = expected_sequence(transfer_order_variant)
     require(len(events) == len(wanted_sequence), f"event rows={len(events)}, expected 23")
     require(
         [int(row["event_id"]) for row in events] == list(range(len(events))),
@@ -592,6 +611,7 @@ def validate(
         ),
         "host_binding_mode": host_binding_mode,
         "host_cpu_list": host_cpu_list,
+        "transfer_order_variant": transfer_order_variant,
     }
 
 
@@ -603,6 +623,7 @@ def main() -> int:
     parser.add_argument("--expected-sysfs-ranks", type=parse_int_set)
     parser.add_argument("--expected-host-binding-mode")
     parser.add_argument("--expected-host-cpu-list")
+    parser.add_argument("--expected-transfer-order-variant")
     args = parser.parse_args()
     try:
         summaries = [
@@ -613,6 +634,7 @@ def main() -> int:
                 args.expected_sysfs_ranks,
                 args.expected_host_binding_mode,
                 args.expected_host_cpu_list,
+                args.expected_transfer_order_variant,
             )
             for path in args.traces
         ]
