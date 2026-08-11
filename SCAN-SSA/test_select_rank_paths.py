@@ -15,7 +15,7 @@ HEADER = (
 
 
 class SelectRankPathsTests(unittest.TestCase):
-    def test_numa0_excludes_rank5_and_balances_channels(self) -> None:
+    def test_numa0_excludes_rank4_and_rank5_and_balances_channels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "topology.tsv"
             lines = [HEADER]
@@ -32,14 +32,15 @@ class SelectRankPathsTests(unittest.TestCase):
                     f"{channel}\t8\t8\t64\t67108864\t4294967296\tok\n"
                 )
             path.write_text("".join(lines))
-            rows = selected_rows(path, 0, {5})
+            rows = selected_rows(path, 0, {4, 5})
         self.assertEqual(
             [int(row["sysfs_rank_id"]) for row in rows],
-            [0, 4, 8, 12, 16, 1, 6, 9, 13, 17, 2, 7, 10, 14, 18, 3, 11, 15, 19],
+            [0, 6, 8, 12, 16, 1, 7, 9, 13, 17, 2, 10, 14, 18, 3, 11, 15, 19],
         )
-        self.assertNotIn(5, {int(row["sysfs_rank_id"]) for row in rows})
+        self.assertTrue(
+            {int(row["sysfs_rank_id"]) for row in rows}.isdisjoint({4, 5})
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -23,7 +23,7 @@ from transport_key import (
 )
 
 
-SUPPORTED_DPUS = {64, 128, 256, 512, 1024, 1216}
+SUPPORTED_DPUS = {64, 128, 256, 512, 1024, 1152}
 ITERATIONS = 4
 INPUT_SIZE = 251658240
 TASKLETS = 16
@@ -340,7 +340,10 @@ def validate(
     )
     if expected_sysfs_ranks is not None:
         require(observed_sysfs == expected_sysfs_ranks, "sysfs ranks differ")
-    require(5 not in observed_sysfs, "faulty sysfs rank 5 is present")
+    require(
+        observed_sysfs.isdisjoint({4, 5}),
+        "faulty sysfs rank 4 or 5 is present",
+    )
 
     details_by_event = defaultdict(list)
     for row in details:
@@ -562,4 +565,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -302,7 +302,7 @@ def anomaly_diagnostics(
             "input_arguments_scan", "input_data", "partial_results",
             "input_arguments_add", "output_data",
         )
-        for scale in ("64", "128", "256", "512", "1024", "1216")
+        for scale in ("64", "128", "256", "512", "1024", "1152")
     }
     groups: dict[tuple[str, str], list[Sample]] = defaultdict(list)
     for sample in samples:

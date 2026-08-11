@@ -197,22 +197,21 @@ class ValidateHardwareTraceTests(unittest.TestCase):
         self.assertEqual(summary["transfer_rows"], 20)
         self.assertEqual(summary["dpu_detail_rows"], 1280)
 
-    def test_rejects_faulty_rank_5(self) -> None:
+    def test_rejects_faulty_rank_4(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.create_trace(Path(directory))
             detail_path = path.with_name("trace_01_dpus.csv")
             with detail_path.open(newline="") as stream:
                 rows = list(csv.DictReader(stream))
             for row in rows:
-                row["dpu_sysfs_rank_id"] = "5"
+                row["dpu_sysfs_rank_id"] = "4"
             with detail_path.open("w", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
-            with self.assertRaisesRegex(ValueError, "rank 5"):
+            with self.assertRaisesRegex(ValueError, "rank 4 or 5"):
                 validate(path)
 
 
 if __name__ == "__main__":
     unittest.main()
-

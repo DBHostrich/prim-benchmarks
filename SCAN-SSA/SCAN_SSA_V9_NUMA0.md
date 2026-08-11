@@ -6,19 +6,21 @@
 
 固定参数如下：
 
-* DPU 数量为 64、128、256、512、1024、1216。
+* DPU 数量为 64、128、256、512、1024、1152。
 * 主机 CPU 和内存绑定 NUMA0，DPU 物理 rank 也固定在 NUMA0。
-* `/dev/dpu_rank5` 始终排除。
+* `/dev/dpu_rank4` 和 `/dev/dpu_rank5` 始终排除。rank4 的 SCAN 输出校验失败，rank5 已有 MRAM/MUX 超时记录。
 * SCAN 使用强缩放，总输入为 251,658,240 个 INT64，约 2 GiB。
 * 每组配置先运行 3 个进程预热，再采集 30 个新进程 trace。
 * 每个 trace 包含 1 次进程内预热和 3 次正式迭代。
 * 稳定阈值为 `(P90-P10)/median <= 25%` 且 `CV <= 25%`，每组至少覆盖 20 个 trace。
 
-1216 DPU 对应 19 个健康 rank。选择器采用 channel round-robin 顺序：
+1152 DPU 对应 NUMA0 的 18 个健康整 rank。选择器采用 channel round-robin 顺序：
 
 ```text
-0,4,8,12,16,1,6,9,13,17,2,7,10,14,18,3,11,15,19
+0,6,8,12,16,1,7,9,13,17,2,10,14,18,3,11,15,19
 ```
+
+NUMA0 的 1216 DPU 配置需要 19 个整 rank。当前健康集合包含 18 个整 rank，因此正式 NUMA0 健康满载点定义为 1152 DPU。1216 DPU 可在 rank4 修复并重新通过 SCAN 正确性门禁后恢复。
 
 每次迭代记录五类传输：
 
@@ -59,7 +61,7 @@ git add SCAN-SSA/Makefile \
   SCAN-SSA/test_analyze_context_keys.py \
   SCAN-SSA/SCAN_SSA_V9_NUMA0.md
 git commit -m "Add SCAN-SSA v9 NUMA0 transfer tracing"
-git push origin "$(git branch --show-current)"
+git push bdang "$(git branch --show-current)"
 git rev-parse HEAD
 ```
 
@@ -74,8 +76,8 @@ cd ~/bdang/prim-benchmarks
 pwd
 git status --short
 BRANCH=$(git branch --show-current)
-git fetch origin
-git merge --ff-only "origin/$BRANCH"
+git fetch bdang
+git merge --ff-only "bdang/$BRANCH"
 git rev-parse HEAD
 ```
 
@@ -94,17 +96,17 @@ export DPU_RANK_TOPOLOGY_TSV="$HOME/upmem_topology_20260807_172654/dpu_rank_topo
 sha256sum "$DPU_RANK_TOPOLOGY_TSV"
 
 python3 select_rank_paths.py "$DPU_RANK_TOPOLOGY_TSV" \
-  --numa-node 0 --exclude-sysfs-ranks 5 \
-  --rank-count 19 --field sysfs_rank_id
+  --numa-node 0 --exclude-sysfs-ranks 4,5 \
+  --rank-count 18 --field sysfs_rank_id
 ```
 
 最后一条命令应打印：
 
 ```text
-0,4,8,12,16,1,6,9,13,17,2,7,10,14,18,3,11,15,19
+0,6,8,12,16,1,7,9,13,17,2,10,14,18,3,11,15,19
 ```
 
-## 64 和 1216 DPU 小门禁
+## 64、128 和 1152 DPU 小门禁
 
 ```bash
 cd ~/bdang/prim-benchmarks/SCAN-SSA
@@ -112,7 +114,7 @@ GATE_STAMP=$(date +%Y%m%d_%H%M%S)
 export RESULT_ROOT="/tmp/bdang/scan_ssa_v9_gate_${GATE_STAMP}"
 export DPU_RANK_TOPOLOGY_TSV="$HOME/upmem_topology_20260807_172654/dpu_rank_topology.tsv"
 
-DPUS_LIST="64 1216" \
+DPUS_LIST="64 128 1152" \
 PROCESS_WARMUP_RUNS=1 \
 TRACE_RUNS=2 \
 TRANSPORT_KEY_MIN_SAMPLES=2 \
