@@ -23,6 +23,15 @@
 #include "../support/timer.h"
 #include "../support/utils.h"
 
+#if defined(PIM_CPU_CHARACTERIZATION)
+#include "pim_cpu_phase.h"
+#else
+#define PIM_CPU_PHASE_BEGIN(name) ((void)0)
+#define PIM_CPU_PHASE_PAUSE(runtime_op) ((void)0)
+#define PIM_CPU_PHASE_RESUME(runtime_op) ((void)0)
+#define PIM_CPU_PHASE_END() ((void)0)
+#endif
+
 #define DPU_BINARY "./bin/dpu_code"
 
 #ifndef ENERGY
@@ -219,6 +228,7 @@ int main(int argc, char** argv) {
     }
 
     // Initialize SpMV data structures
+    PIM_CPU_PHASE_BEGIN("input_preprocess");
     PRINT_INFO(p.verbosity >= 1, "Reading matrix %s", p.fileName);
     struct COOMatrix cooMatrix = readCOOMatrix(p.fileName);
     PRINT_INFO(p.verbosity >= 1, "    %u rows, %u columns, %u nonzeros", cooMatrix.numRows, cooMatrix.numCols, cooMatrix.numNonzeros);
@@ -230,8 +240,10 @@ int main(int argc, char** argv) {
     float* inVector = malloc(ROUND_UP_TO_MULTIPLE_OF_8(numCols*sizeof(float)));
     initVector(inVector, numCols);
     float* outVector = malloc(ROUND_UP_TO_MULTIPLE_OF_8(numRows*sizeof(float)));
+    PIM_CPU_PHASE_END();
 
     // Partition data structure across DPUs
+    PIM_CPU_PHASE_BEGIN("partition_layout");
     uint32_t numRowsPerDPU = ROUND_UP_TO_MULTIPLE_OF_2((numRows - 1)/numDPUs + 1);
     PRINT_INFO(p.verbosity >= 1, "Assigning %u rows per DPU", numRowsPerDPU);
     struct DPUParams dpuParams[numDPUs];
@@ -285,14 +297,20 @@ int main(int argc, char** argv) {
             // Send data to DPU
             PRINT_INFO(p.verbosity >= 2, "        Copying data to DPU");
             startTimer(&timer);
+            PIM_CPU_PHASE_PAUSE("dpu_copy_to");
             copyToDPUTraced(&hostTrace, dpuIdx, "row_ptrs", dpu,
                             (uint8_t*)dpuRowPtrs_h, dpuRowPtrs_m,
                             (dpuNumRows + 1)*sizeof(uint32_t));
+            PIM_CPU_PHASE_RESUME("dpu_copy_to");
+            PIM_CPU_PHASE_PAUSE("dpu_copy_to");
             copyToDPUTraced(&hostTrace, dpuIdx, "nonzeros", dpu,
                             (uint8_t*)dpuNonzeros_h, dpuNonzeros_m,
                             dpuNumNonzeros*sizeof(struct Nonzero));
+            PIM_CPU_PHASE_RESUME("dpu_copy_to");
+            PIM_CPU_PHASE_PAUSE("dpu_copy_to");
             copyToDPUTraced(&hostTrace, dpuIdx, "input_vector", dpu,
                             (uint8_t*)inVector, dpuInVector_m, numCols*sizeof(float));
+            PIM_CPU_PHASE_RESUME("dpu_copy_to");
             stopTimer(&timer);
             loadTime += getElapsedTime(timer);
 
@@ -301,15 +319,18 @@ int main(int argc, char** argv) {
         // Send parameters to DPU
         PRINT_INFO(p.verbosity >= 2, "        Copying parameters to DPU");
         startTimer(&timer);
+        PIM_CPU_PHASE_PAUSE("dpu_copy_to");
         copyToDPUTraced(&hostTrace, dpuIdx, "params", dpu,
                         (uint8_t*)&dpuParams[dpuIdx], dpuParams_m,
                         sizeof(struct DPUParams));
+        PIM_CPU_PHASE_RESUME("dpu_copy_to");
         stopTimer(&timer);
         loadTime += getElapsedTime(timer);
 
         ++dpuIdx;
 
     }
+    PIM_CPU_PHASE_END();
     PRINT_INFO(p.verbosity >= 1, "    CPU-DPU Time: %f ms", loadTime*1e3);
 
     // Run all DPUs

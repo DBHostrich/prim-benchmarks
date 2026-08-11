@@ -5,11 +5,13 @@ GPU_BASE_DIR := baselines/gpu
 BUILDDIR ?= bin
 NR_TASKLETS ?= 16
 NR_DPUS ?= 1
+PROFILE_CPU ?= 0
+CPU_CHARACTERIZATION_ROOT ?=
 
 define conf_filename
-	${BUILDDIR}/.NR_DPUS_$(1)_NR_TASKLETS_$(2).conf
+	${BUILDDIR}/.NR_DPUS_$(1)_NR_TASKLETS_$(2)_PROFILE_CPU_$(3).conf
 endef
-CONF := $(call conf_filename,${NR_DPUS},${NR_TASKLETS})
+CONF := $(call conf_filename,${NR_DPUS},${NR_TASKLETS},${PROFILE_CPU})
 
 HOST_TARGET := ${BUILDDIR}/host_code
 DPU_TARGET := ${BUILDDIR}/dpu_code
@@ -32,12 +34,21 @@ DPU_FLAGS := ${COMMON_FLAGS} -O2 -DNR_TASKLETS=${NR_TASKLETS}
 CPU_BASE_FLAGS := -O3 -fopenmp
 GPU_BASE_FLAGS := -O3
 
+ifeq ($(PROFILE_CPU),1)
+ifeq ($(strip $(CPU_CHARACTERIZATION_ROOT)),)
+$(error CPU_CHARACTERIZATION_ROOT must point to PIMulator/tools/cpu_characterization)
+endif
+HOST_SOURCES += ${CPU_CHARACTERIZATION_ROOT}/runtime/pim_cpu_phase.c
+HOST_FLAGS += -DPIM_CPU_CHARACTERIZATION \
+	-I${CPU_CHARACTERIZATION_ROOT}/include -Wl,--export-dynamic
+endif
+
 all: ${HOST_TARGET} ${DPU_TARGET} ${CPU_BASE_TARGET}
 
 gpu: ${GPU_BASE_TARGET}
 
 ${CONF}:
-	$(RM) $(call conf_filename,*,*)
+	$(RM) $(call conf_filename,*,*,*)
 	touch ${CONF}
 
 ${HOST_TARGET}: ${HOST_SOURCES} ${COMMON_INCLUDES} ${CONF}
@@ -57,4 +68,3 @@ clean:
 
 test: all
 	./${HOST_TARGET}
-
