@@ -184,6 +184,17 @@ def expected_transfer(
     raise ValueError("unknown SCAN subop={}".format(subop))
 
 
+def expected_reuse_counts(subop: str, iteration: int) -> Tuple[int, int]:
+    source_count = iteration
+    if subop == "input_arguments_scan":
+        target_count = 2 * iteration
+    elif subop == "input_arguments_add":
+        target_count = 2 * iteration + 1
+    else:
+        target_count = iteration
+    return source_count, target_count
+
+
 def topology_from_details(
     details: List[Dict[str, str]], nr_dpus: int, ranks: int
 ) -> Dict[str, str]:
@@ -456,23 +467,25 @@ def validate(
             == (previous["target_space"] if previous["target_space"] else "NONE"),
             "predecessor target space differs",
         )
-        expected_count = iteration
+        expected_source_count, expected_target_count = expected_reuse_counts(
+            row["subop"], iteration
+        )
         require(
-            int(row["source_buffer_use_count_before"]) == expected_count,
+            int(row["source_buffer_use_count_before"]) == expected_source_count,
             "source buffer use count differs",
         )
         require(
-            int(row["target_region_access_count_before"]) == expected_count,
+            int(row["target_region_access_count_before"]) == expected_target_count,
             "target region access count differs",
         )
         require(
             row["source_buffer_reuse_class"]
-            == source_buffer_reuse_class(expected_count),
+            == source_buffer_reuse_class(expected_source_count),
             "source buffer reuse class differs",
         )
         require(
             row["target_region_reuse_class"]
-            == target_region_reuse_class(expected_count),
+            == target_region_reuse_class(expected_target_count),
             "target region reuse class differs",
         )
         require(row["diagnostic_copy_ordinal"] == "NONE", "copy ordinal differs")

@@ -34,6 +34,8 @@ NUMA0 的 1216 DPU 配置需要 19 个整 rank。当前健康集合包含 18 个
 
 每个 trace 应产生 31 条 SDK 事件，其中包含 20 条 collection transfer。逐 DPU 明细保存在配套的 `trace_*_dpus.csv`。
 
+reuse 计数按逻辑主机端点和物理 DPU 区域分别定义。五类主机端点在每轮各出现一次，所以 `source_buffer_use_count_before` 等于迭代号。两次参数传输共同访问 `DPU_INPUT_ARGUMENTS` 的相同 WRAM 区域，所以 `input_arguments_scan` 的目标计数为 `2 * iteration`，`input_arguments_add` 的目标计数为 `2 * iteration + 1`。第一轮的 add 参数因此已经属于 `target_region_reuse_class=REUSED`。
+
 ## 本机提交到 GitHub
 
 在本机执行：
@@ -59,8 +61,9 @@ git add SCAN-SSA/Makefile \
   SCAN-SSA/test_validate_hw_trace.py \
   SCAN-SSA/test_analyze_transport_keys.py \
   SCAN-SSA/test_analyze_context_keys.py \
+  SCAN-SSA/test_summarize_scale_stability.py \
   SCAN-SSA/SCAN_SSA_V9_NUMA0.md
-git commit -m "Add SCAN-SSA v9 NUMA0 transfer tracing"
+git commit -m "Fix SCAN v9 endpoint reuse accounting"
 git push bdang "$(git branch --show-current)"
 git rev-parse HEAD
 ```
@@ -75,9 +78,9 @@ git rev-parse HEAD
 cd ~/bdang/prim-benchmarks
 pwd
 git status --short
-BRANCH=$(git branch --show-current)
 git fetch bdang
-git merge --ff-only "bdang/$BRANCH"
+git switch gemv-vector-replay-delay-probe
+git merge --ff-only bdang/gemv-vector-replay-delay-probe
 git rev-parse HEAD
 ```
 
@@ -168,7 +171,7 @@ sha256sum "$ROOT/dpu_rank_topology.tsv" "${ROOT}.tar.gz"
 
 核心结果文件如下：
 
-* `scale_stability_summary.csv` 汇总六个规模的完整 v9 稳定性。
+* `scale_stability_summary.csv` 汇总六个规模的完整 v9 稳定性，其中 `stable_key_pct` 按键计数，`stable_event_pct` 按样本计数。
 * `transport_key_summary_all.csv` 给出每个完整 v9 key 的 median、P10、P90、CV 和状态。
 * `context_analysis/context_group_summary.csv` 比较五种键的稳定覆盖率和表规模。
 * `context_analysis/holdout_summary.csv` 给出留一 trace 预测误差、coverage 和 signed bias。

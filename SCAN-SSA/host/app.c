@@ -320,7 +320,8 @@ int main(int argc, char **argv) {
                 &host_trace, "input_arguments_scan", "TO_DPU", rep, warmup,
                 "WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,
                 sizeof(input_arguments), sizeof(input_arguments),
-                rep, rep, "NONE", 0, 0, &operation_measurement);
+                rep, (uint64_t)rep * 2u, "NONE", 0, 0,
+                &operation_measurement);
         }
 
         i = 0;
@@ -463,7 +464,8 @@ int main(int argc, char **argv) {
                 &host_trace, "input_arguments_add", "TO_DPU", rep, warmup,
                 "WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,
                 sizeof(input_arguments_2[0]), sizeof(input_arguments_2[0]),
-                rep, rep, "NONE", 0, 0, &operation_measurement);
+                rep, (uint64_t)rep * 2u + 1u, "NONE", 0, 0,
+                &operation_measurement);
         }
         if (rep >= p.n_warmup)
             stop(&timer, 3);

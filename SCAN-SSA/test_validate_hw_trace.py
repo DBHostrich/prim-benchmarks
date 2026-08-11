@@ -19,6 +19,7 @@ from validate_hw_trace import (
     DPU_FIELDS,
     EVENT_FIELDS,
     expected_layout,
+    expected_reuse_counts,
     expected_sequence,
     expected_transfer,
     validate,
@@ -86,6 +87,9 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                 expected = expected_transfer(
                     subop, nr_dpus, rounded, data_logical
                 )
+                source_count, target_count = expected_reuse_counts(
+                    subop, iteration_number
+                )
                 size = int(expected["size"])
                 logical = list(expected["logical"])
                 row.update(
@@ -124,13 +128,13 @@ class ValidateHardwareTraceTests(unittest.TestCase):
                         "previous_sdk_target_space":
                             previous["target_space"] or "NONE",
                         "source_buffer_reuse_class":
-                            source_buffer_reuse_class(iteration_number),
+                            source_buffer_reuse_class(source_count),
                         "target_region_reuse_class":
-                            target_region_reuse_class(iteration_number),
+                            target_region_reuse_class(target_count),
                         "source_buffer_use_count_before":
-                            str(iteration_number),
+                            str(source_count),
                         "target_region_access_count_before":
-                            str(iteration_number),
+                            str(target_count),
                         "phase_class": phase_class(op, warmup),
                         "diagnostic_copy_ordinal": "NONE",
                         "mram_push_ordinal_since_launch":
@@ -196,6 +200,33 @@ class ValidateHardwareTraceTests(unittest.TestCase):
         self.assertEqual(summary["event_rows"], 31)
         self.assertEqual(summary["transfer_rows"], 20)
         self.assertEqual(summary["dpu_detail_rows"], 1280)
+
+    def test_shared_argument_region_counts_both_writes(self) -> None:
+        self.assertEqual(expected_reuse_counts("input_arguments_scan", 0), (0, 0))
+        self.assertEqual(expected_reuse_counts("input_arguments_add", 0), (0, 1))
+        self.assertEqual(expected_reuse_counts("input_arguments_scan", 2), (2, 4))
+        self.assertEqual(expected_reuse_counts("input_arguments_add", 2), (2, 5))
+
+    def test_rejects_add_argument_first_access_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.create_trace(Path(directory))
+            with path.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            row = next(
+                item
+                for item in rows
+                if item["subop"] == "input_arguments_add"
+                and item["iteration"] == "0"
+            )
+            row["target_region_access_count_before"] = "0"
+            row["target_region_reuse_class"] = "FIRST_ACCESS"
+            row["transport_key"] = transport_key(row)
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "target region access count"):
+                validate(path)
 
     def test_rejects_faulty_rank_4(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

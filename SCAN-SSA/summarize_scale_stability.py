@@ -19,7 +19,11 @@ def summarize(path: Path) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for scale, scale_rows in sorted(by_scale.items()):
         status = Counter(row["status"] for row in scale_rows)
+        samples = Counter()
+        for row in scale_rows:
+            samples[row["status"]] += int(row["sample_count"])
         eligible = status["stable"] + status["unstable"]
+        eligible_samples = samples["stable"] + samples["unstable"]
         result.append(
             {
                 "allocated_dpus": scale,
@@ -30,10 +34,18 @@ def summarize(path: Path) -> list[dict[str, object]]:
                 "stable_groups": status["stable"],
                 "unstable_groups": status["unstable"],
                 "insufficient_groups": status["insufficient"],
+                "stable_samples": samples["stable"],
+                "unstable_samples": samples["unstable"],
+                "insufficient_samples": samples["insufficient"],
                 "stable_key_pct": (
                     "0.000"
                     if eligible == 0
                     else f"{100.0 * status['stable'] / eligible:.3f}"
+                ),
+                "stable_event_pct": (
+                    "0.000"
+                    if eligible_samples == 0
+                    else f"{100.0 * samples['stable'] / eligible_samples:.3f}"
                 ),
                 "max_spread_pct": f"{max(float(row['p90_p10_spread_pct']) for row in scale_rows):.3f}",
                 "max_cv_pct": f"{max(float(row['cv_pct']) for row in scale_rows):.3f}",
@@ -66,4 +78,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
