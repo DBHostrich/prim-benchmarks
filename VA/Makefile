@@ -6,11 +6,12 @@ BL ?= 10
 NR_DPUS ?= 1
 TYPE ?= INT32
 ENERGY ?= 0
+VA_VALIDATION_INPUT ?= 0
 
 define conf_filename
-	${BUILDDIR}/.NR_DPUS_$(1)_NR_TASKLETS_$(2)_BL_$(3)_TYPE_$(4).conf
+	${BUILDDIR}/.NR_DPUS_$(1)_NR_TASKLETS_$(2)_BL_$(3)_TYPE_$(4)_VA_VALIDATION_INPUT_$(5).conf
 endef
-CONF := $(call conf_filename,${NR_DPUS},${NR_TASKLETS},${BL},${TYPE})
+CONF := $(call conf_filename,${NR_DPUS},${NR_TASKLETS},${BL},${TYPE},${VA_VALIDATION_INPUT})
 
 HOST_TARGET := ${BUILDDIR}/host_code
 DPU_TARGET := ${BUILDDIR}/dpu_code
@@ -24,7 +25,7 @@ DPU_SOURCES := $(wildcard ${DPU_DIR}/*.c)
 __dirs := $(shell mkdir -p ${BUILDDIR})
 
 COMMON_FLAGS := -Wall -Wextra -g -I${COMMON_INCLUDES}
-HOST_FLAGS := ${COMMON_FLAGS} -std=c11 -O3 `dpu-pkg-config --cflags --libs dpu` -DNR_TASKLETS=${NR_TASKLETS} -DNR_DPUS=${NR_DPUS} -DBL=${BL} -D${TYPE} -DENERGY=${ENERGY}
+HOST_FLAGS := ${COMMON_FLAGS} -std=c11 -O3 `dpu-pkg-config --cflags --libs dpu` -DNR_TASKLETS=${NR_TASKLETS} -DNR_DPUS=${NR_DPUS} -DBL=${BL} -D${TYPE} -DENERGY=${ENERGY} -DVA_VALIDATION_INPUT=${VA_VALIDATION_INPUT}
 DPU_FLAGS := ${COMMON_FLAGS} -O2 -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -D${TYPE}
 
 all: ${HOST_TARGET} ${DPU_TARGET}

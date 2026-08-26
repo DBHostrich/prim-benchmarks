@@ -145,6 +145,10 @@ static dpu_error_t allocateBfsDpus(
 
     allocation->usesPinnedRanks = true;
     allocation->nrRankSets = expectedRanks;
+    if(expectedRanks == 1) {
+        *dpuSet = allocation->rankSets[0];
+        return DPU_OK;
+    }
     memset(dpuSet, 0, sizeof(*dpuSet));
     dpuSet->kind = DPU_SET_RANKS;
     dpuSet->list.nr_ranks = expectedRanks;

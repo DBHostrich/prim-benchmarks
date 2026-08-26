@@ -361,6 +361,7 @@ int main(int argc, char** argv) {
     PRINT_INFO(p.verbosity >= 1, "    DPU Time: %f ms", dpuTime*1e3);
 
     // Copy back result
+    PIM_CPU_PHASE_BEGIN("result_collect");
     PRINT_INFO(p.verbosity >= 1, "Copying back the result");
     startTimer(&timer);
     dpuIdx = 0;
@@ -368,10 +369,12 @@ int main(int argc, char** argv) {
         unsigned int dpuNumRows = dpuParams[dpuIdx].dpuNumRows;
         if(dpuNumRows > 0) {
             uint32_t dpuStartRowIdx = dpuIdx*numRowsPerDPU;
+            PIM_CPU_PHASE_PAUSE("dpu_copy_from");
             copyFromDPUTraced(&hostTrace, dpuIdx, "output_vector", dpu,
                               dpuParams[dpuIdx].dpuOutVector_m,
                               (uint8_t*)(outVector + dpuStartRowIdx),
                               dpuNumRows*sizeof(float));
+            PIM_CPU_PHASE_RESUME("dpu_copy_from");
         }
         ++dpuIdx;
     }
@@ -379,8 +382,10 @@ int main(int argc, char** argv) {
     retrieveTime += getElapsedTime(timer);
     PRINT_INFO(p.verbosity >= 1, "    DPU-CPU Time: %f ms", retrieveTime*1e3);
     if(p.verbosity == 0) PRINT("CPU-DPU Time(ms): %f    DPU Kernel Time (ms): %f    DPU-CPU Time (ms): %f", loadTime*1e3, dpuTime*1e3, retrieveTime*1e3);
+    PIM_CPU_PHASE_END();
 
     // Calculating result on CPU
+    PIM_CPU_PHASE_BEGIN("reference_verify");
     PRINT_INFO(p.verbosity >= 1, "Calculating result on CPU");
     float* outVectorReference = malloc(numRows*sizeof(float));
     for(uint32_t rowIdx = 0; rowIdx < numRows; ++rowIdx) {
@@ -402,6 +407,7 @@ int main(int argc, char** argv) {
             PRINT_ERROR("Mismatch at index %u (CPU result = %f, DPU result = %f)", rowIdx, outVectorReference[rowIdx], outVector[rowIdx]);
         }
     }
+    PIM_CPU_PHASE_END();
 
     // Display DPU Logs
     if(p.verbosity >= 2) {

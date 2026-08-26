@@ -1,0 +1,15 @@
+ ...EMV_RUNTIME_STALL_PROBE.md |   7 [32m+[m[31m-[m
+ ...MV_TRANSFER_ORDER_PROBE.md |  70 [32m++[m
+ ...ze_transfer_order_probe.py | 374 [32m+++++++[m
+ ...ate_heartbeat_threshold.py |  76 [32m++[m
+ GEMV/host/app.c               | 142 [32m++[m[31m-[m
+ GEMV/host/host_trace.c        |  11 [32m+[m[31m-[m
+ GEMV/host/host_trace.h        |   1 [32m+[m
+ ...interleaved_scale_trace.sh |   7 [32m+[m[31m-[m
+ ...run_runtime_stall_probe.sh |  10 [32m+[m[31m-[m
+ ...un_transfer_order_probe.sh | 322 [32m++++++[m
+ ...ze_transfer_order_probe.py | 119 [32m++[m
+ ...ate_heartbeat_threshold.py |  28 [32m+[m
+ .../test_validate_hw_trace.py |  23 [32m+[m[31m-[m
+ GEMV/validate_hw_trace.py     |  38 [32m+[m[31m-[m
+ 14 files changed, 1176 insertions(+), 52 deletions(-)

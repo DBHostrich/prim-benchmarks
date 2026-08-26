@@ -1,0 +1,670 @@
+[1mdiff --git a/SCAN-SSA/host/app.c b/SCAN-SSA/host/app.c[m
+[1mindex 2dfe32c..76099cb 100644[m
+[1m--- a/SCAN-SSA/host/app.c[m
+[1m+++ b/SCAN-SSA/host/app.c[m
+[36m@@ -1,3 +1,5 @@[m
+[32m+[m[32m#define _GNU_SOURCE[m
+[32m+[m
+ /**[m
+ * app.c[m
+ * SCAN-SSA Host Application Source File[m
+[36m@@ -12,10 +14,13 @@[m
+ #include <unistd.h>[m
+ #include <getopt.h>[m
+ #include <assert.h>[m
+[32m+[m[32m#include <inttypes.h>[m
+[32m+[m[32m#include <dpu_management.h>[m
+ [m
+ #include "../support/common.h"[m
+ #include "../support/timer.h"[m
+ #include "../support/params.h"[m
+[32m+[m[32m#include "host_trace.h"[m
+ [m
+ // Define the DPU Binary path as DPU_BINARY here[m
+ #ifndef DPU_BINARY[m
+[36m@@ -31,6 +36,137 @@[m [mstatic T* A;[m
+ static T* C;[m
+ static T* C2;[m
+ [m
+[32m+[m[32mstruct ScanDpuAllocation {[m
+[32m+[m	[32mbool uses_pinned_ranks;[m
+[32m+[m	[32muint32_t nr_rank_sets;[m
+[32m+[m	[32mstruct dpu_set_t *rank_sets;[m
+[32m+[m	[32mstruct dpu_rank_t **combined_ranks;[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mstatic void destroy_pinned_allocation_storage(struct ScanDpuAllocation *allocation) {[m
+[32m+[m	[32mfree(allocation->rank_sets);[m
+[32m+[m	[32mfree(allocation->combined_ranks);[m
+[32m+[m	[32mmemset(allocation, 0, sizeof(*allocation));[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic dpu_error_t allocate_scan_dpus([m
+[32m+[m	[32mstruct ScanDpuAllocation *allocation,[m
+[32m+[m	[32mstruct dpu_set_t *dpu_set[m
+[32m+[m[32m) {[m
+[32m+[m	[32mconst char *requested_paths = getenv("SCAN_DPU_RANK_PATHS");[m
+[32m+[m	[32mchar *paths_copy;[m
+[32m+[m	[32mchar *path;[m
+[32m+[m	[32mchar *path_save = NULL;[m
+[32m+[m	[32muint32_t expected_ranks;[m
+[32m+[m	[32muint32_t rank_index = 0;[m
+[32m+[m	[32mdpu_error_t status = DPU_OK;[m
+[32m+[m
+[32m+[m	[32mmemset(allocation, 0, sizeof(*allocation));[m
+[32m+[m	[32mif (requested_paths == NULL || requested_paths[0] == '\0') {[m
+[32m+[m		[32mreturn dpu_alloc(NR_DPUS, NULL, dpu_set);[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif (NR_DPUS % 64 != 0) {[m
+[32m+[m		[32mfprintf(stderr, "SCAN_DPU_RANK_PATHS requires complete 64-DPU ranks\n");[m
+[32m+[m		[32mreturn DPU_ERR_ALLOCATION;[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mexpected_ranks = NR_DPUS / 64;[m
+[32m+[m	[32mallocation->rank_sets = calloc(expected_ranks, sizeof(*allocation->rank_sets));[m
+[32m+[m	[32mallocation->combined_ranks = calloc([m
+[32m+[m		[32mexpected_ranks, sizeof(*allocation->combined_ranks)[m
+[32m+[m	[32m);[m
+[32m+[m	[32mpaths_copy = malloc(strlen(requested_paths) + 1);[m
+[32m+[m	[32mif (allocation->rank_sets == NULL || allocation->combined_ranks == NULL[m
+[32m+[m		[32m|| paths_copy == NULL) {[m
+[32m+[m		[32mfree(paths_copy);[m
+[32m+[m		[32mdestroy_pinned_allocation_storage(allocation);[m
+[32m+[m		[32mreturn DPU_ERR_SYSTEM;[m
+[32m+[m	[32m}[m
+[32m+[m	[32mstrcpy(paths_copy, requested_paths);[m
+[32m+[m
+[32m+[m	[32mfor (path = strtok_r(paths_copy, ",", &path_save);[m
+[32m+[m		[32m path != NULL;[m
+[32m+[m		[32m path = strtok_r(NULL, ",", &path_save)) {[m
+[32m+[m		[32mchar profile[512];[m
+[32m+[m		[32mstruct dpu_rank_t *rank;[m
+[32m+[m		[32mint profile_length;[m
+[32m+[m
+[32m+[m		[32mif (rank_index >= expected_ranks || path[0] == '\0') {[m
+[32m+[m			[32mstatus = DPU_ERR_INVALID_PROFILE;[m
+[32m+[m			[32mbreak;[m
+[32m+[m		[32m}[m
+[32m+[m		[32mprofile_length = snprintf([m
+[32m+[m			[32mprofile, sizeof(profile), "backend=hw,rankPath=%s", path[m
+[32m+[m		[32m);[m
+[32m+[m		[32mif (profile_length < 0 || (size_t)profile_length >= sizeof(profile)) {[m
+[32m+[m			[32mstatus = DPU_ERR_INVALID_PROFILE;[m
+[32m+[m			[32mbreak;[m
+[32m+[m		[32m}[m
+[32m+[m		[32mstatus = dpu_alloc_ranks(1, profile, &allocation->rank_sets[rank_index]);[m
+[32m+[m		[32mif (status != DPU_OK) {[m
+[32m+[m			[32mfprintf(stderr, "Could not allocate requested DPU rank %s: %s\n",[m
+[32m+[m				[32mpath, dpu_error_to_string(status));[m
+[32m+[m			[32mbreak;[m
+[32m+[m		[32m}[m
+[32m+[m		[32mrank = dpu_rank_from_set(allocation->rank_sets[rank_index]);[m
+[32m+[m		[32mif (rank == NULL) {[m
+[32m+[m			[32mstatus = DPU_ERR_INVALID_DPU_SET;[m
+[32m+[m			[32m++rank_index;[m
+[32m+[m			[32mbreak;[m
+[32m+[m		[32m}[m
+[32m+[m		[32mallocation->combined_ranks[rank_index] = rank;[m
+[32m+[m		[32m++rank_index;[m
+[32m+[m	[32m}[m
+[32m+[m	[32mfree(paths_copy);[m
+[32m+[m
+[32m+[m	[32mif (status == DPU_OK && rank_index != expected_ranks) {[m
+[32m+[m		[32mfprintf(stderr, "SCAN_DPU_RANK_PATHS contains %u ranks, expected %u\n",[m
+[32m+[m			[32mrank_index, expected_ranks);[m
+[32m+[m		[32mstatus = DPU_ERR_ALLOCATION;[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif (status != DPU_OK) {[m
+[32m+[m		[32mwhile (rank_index > 0) {[m
+[32m+[m			[32m--rank_index;[m
+[32m+[m			[32mdpu_free(allocation->rank_sets[rank_index]);[m
+[32m+[m		[32m}[m
+[32m+[m		[32mdestroy_pinned_allocation_storage(allocation);[m
+[32m+[m		[32mreturn status;[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mallocation->uses_pinned_ranks = true;[m
+[32m+[m	[32mallocation->nr_rank_sets = expected_ranks;[m
+[32m+[m	[32mif (expected_ranks == 1) {[m
+[32m+[m		[32m*dpu_set = allocation->rank_sets[0];[m
+[32m+[m		[32mreturn DPU_OK;[m
+[32m+[m	[32m}[m
+[32m+[m	[32mmemset(dpu_set, 0, sizeof(*dpu_set));[m
+[32m+[m	[32mdpu_set->kind = DPU_SET_RANKS;[m
+[32m+[m	[32mdpu_set->list.nr_ranks = expected_ranks;[m
+[32m+[m	[32mdpu_set->list.ranks = allocation->combined_ranks;[m
+[32m+[m	[32mreturn DPU_OK;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic dpu_error_t free_scan_dpus([m
+[32m+[m	[32mstruct ScanDpuAllocation *allocation,[m
+[32m+[m	[32mstruct dpu_set_t dpu_set[m
+[32m+[m[32m) {[m
+[32m+[m	[32mdpu_error_t status = DPU_OK;[m
+[32m+[m	[32muint32_t rank_index;[m
+[32m+[m
+[32m+[m	[32mif (!allocation->uses_pinned_ranks) {[m
+[32m+[m		[32mreturn dpu_free(dpu_set);[m
+[32m+[m	[32m}[m
+[32m+[m	[32mfor (rank_index = 0; rank_index < allocation->nr_rank_sets; ++rank_index) {[m
+[32m+[m		[32mdpu_error_t rank_status = dpu_free(allocation->rank_sets[rank_index]);[m
+[32m+[m		[32mif (rank_status != DPU_OK) {[m
+[32m+[m			[32mstatus = rank_status;[m
+[32m+[m		[32m}[m
+[32m+[m	[32m}[m
+[32m+[m	[32mdestroy_pinned_allocation_storage(allocation);[m
+[32m+[m	[32mreturn status;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m
+ // Create input arrays[m
+ static void read_input(T* A, unsigned int nr_elements, unsigned int nr_elements_round) {[m
+     srand(0);[m
+[36m@@ -53,91 +189,183 @@[m [mstatic void scan_host(T* C, T* A, unsigned int nr_elements) {[m
+ [m
+ // Main of the Host Application[m
+ int main(int argc, char **argv) {[m
+[31m-[m
+     struct Params p = input_params(argc, argv);[m
+[31m-[m
+     struct dpu_set_t dpu_set, dpu;[m
+[32m+[m[32m    struct ScanDpuAllocation dpu_allocation;[m
+     uint32_t nr_of_dpus;[m
+[31m-    [m
+[32m+[m[32m    bool trace_requested = scan_host_trace_requested();[m
+[32m+[m[32m    struct ScanHostTraceMeasurement alloc_measurement = {0};[m
+[32m+[m[32m    struct ScanHostTraceMeasurement load_measurement = {0};[m
+[32m+[m
+[32m+[m[32m    if (trace_requested)[m
+[32m+[m[32m        scan_host_trace_measurement_begin(&alloc_measurement);[m
+[32m+[m[32m    DPU_ASSERT(allocate_scan_dpus(&dpu_allocation, &dpu_set));[m
+[32m+[m[32m    if (trace_requested) {[m
+[32m+[m[32m        scan_host_trace_measurement_end(&alloc_measurement);[m
+[32m+[m[32m        scan_host_trace_measurement_begin(&load_measurement);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));[m
+[32m+[m[32m    if (trace_requested)[m
+[32m+[m[32m        scan_host_trace_measurement_end(&load_measurement);[m
+[32m+[m[32m    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_of_dpus));[m
+[32m+[m[32m    printf("Allocated %u DPU(s)\n", nr_of_dpus);[m
+[32m+[m
+ #if ENERGY[m
+     struct dpu_probe_t probe;[m
+     DPU_ASSERT(dpu_probe_init("energy_probe", &probe));[m
+ #endif[m
+ [m
+[31m-    // Allocate DPUs and load binary[m
+[31m-    DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));[m
+[31m-    DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));[m
+[31m-    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_of_dpus));[m
+[31m-    printf("Allocated %d DPU(s)\n", nr_of_dpus);[m
+[31m-[m
+[31m-    unsigned int i = 0;[m
+[31m-    T accum = 0;[m
+[32m+[m[32m    uint64_t input_size_64 = p.exp == 0[m
+[32m+[m[32m        ? (uint64_t)p.input_size * nr_of_dpus : p.input_size;[m
+[32m+[m[32m    if (input_size_64 == 0 || input_size_64 > UINT32_MAX) {[m
+[32m+[m[32m        fprintf(stderr, "SCAN input size is outside the supported uint32 range\n");[m
+[32m+[m[32m        DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m        return EXIT_FAILURE;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    const uint32_t input_size = (uint32_t)input_size_64;[m
+[32m+[m[32m    const uint32_t input_size_dpu_raw = divceil(input_size, nr_of_dpus);[m
+[32m+[m[32m    const uint32_t input_size_dpu_round =[m
+[32m+[m[32m        input_size_dpu_raw % (NR_TASKLETS * REGS) == 0[m
+[32m+[m[32m            ? input_size_dpu_raw[m
+[32m+[m[32m            : roundup(input_size_dpu_raw, (NR_TASKLETS * REGS));[m
+[32m+[m[32m    const size_t allocated_elements =[m
+[32m+[m[32m        (size_t)input_size_dpu_round * nr_of_dpus;[m
+[32m+[m[32m    if (allocated_elements > SIZE_MAX / sizeof(T)) {[m
+[32m+[m[32m        fprintf(stderr, "SCAN host buffer size overflows size_t\n");[m
+[32m+[m[32m        DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m        return EXIT_FAILURE;[m
+[32m+[m[32m    }[m
+ [m
+[31m-    const unsigned int input_size = p.exp == 0 ? p.input_size * nr_of_dpus : p.input_size; // Total input size (weak or strong scaling)[m
+[31m-    const unsigned int input_size_dpu_ = divceil(input_size, nr_of_dpus); // Input size per DPU (max.)[m
+[31m-    const unsigned int input_size_dpu_round = [m
+[31m-        (input_size_dpu_ % (NR_TASKLETS * REGS) != 0) ? roundup(input_size_dpu_, (NR_TASKLETS * REGS)) : input_size_dpu_; // Input size per DPU (max.), 8-byte aligned[m
+[32m+[m[32m    A = malloc(allocated_elements * sizeof(T));[m
+[32m+[m[32m    C = malloc(allocated_elements * sizeof(T));[m
+[32m+[m[32m    C2 = malloc(allocated_elements * sizeof(T));[m
+[32m+[m[32m    uint64_t *data_logical_bytes =[m
+[32m+[m[32m        malloc((size_t)nr_of_dpus * sizeof(*data_logical_bytes));[m
+[32m+[m[32m    if (A == NULL || C == NULL || C2 == NULL || data_logical_bytes == NULL) {[m
+[32m+[m[32m        fprintf(stderr, "Could not allocate SCAN host buffers\n");[m
+[32m+[m[32m        free(A);[m
+[32m+[m[32m        free(C);[m
+[32m+[m[32m        free(C2);[m
+[32m+[m[32m        free(data_logical_bytes);[m
+[32m+[m[32m        DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m        return EXIT_FAILURE;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    for (uint32_t dpu_id = 0; dpu_id < nr_of_dpus; ++dpu_id) {[m
+[32m+[m[32m        uint64_t first = (uint64_t)dpu_id * input_size_dpu_round;[m
+[32m+[m[32m        uint64_t remaining = first < input_size ? input_size - first : 0;[m
+[32m+[m[32m        uint64_t logical_elements =[m
+[32m+[m[32m            remaining < input_size_dpu_round[m
+[32m+[m[32m                ? remaining : input_size_dpu_round;[m
+[32m+[m[32m        data_logical_bytes[dpu_id] = logical_elements * sizeof(T);[m
+[32m+[m[32m    }[m
+ [m
+[31m-    // Input/output allocation[m
+[31m-    A = malloc(input_size_dpu_round * nr_of_dpus * sizeof(T));[m
+[31m-    C = malloc(input_size_dpu_round * nr_of_dpus * sizeof(T));[m
+[31m-    C2 = malloc(input_size_dpu_round * nr_of_dpus * sizeof(T));[m
+     T *bufferA = A;[m
+     T *bufferC = C2;[m
+[32m+[m[32m    read_input(A, input_size, (unsigned int)allocated_elements);[m
+[32m+[m
+[32m+[m[32m    struct ScanHostTrace host_trace;[m
+[32m+[m[32m    const char *scaling_mode = p.exp == 0 ? "WEAK" : "STRONG";[m
+[32m+[m[32m    if (!scan_host_trace_init([m
+[32m+[m[32m            &host_trace, dpu_set, nr_of_dpus, NR_TASKLETS, input_size,[m
+[32m+[m[32m            input_size_dpu_raw, input_size_dpu_round, scaling_mode)) {[m
+[32m+[m[32m        free(A);[m
+[32m+[m[32m        free(C);[m
+[32m+[m[32m        free(C2);[m
+[32m+[m[32m        free(data_logical_bytes);[m
+[32m+[m[32m        DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m        return EXIT_FAILURE;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m        scan_host_trace_record_event([m
+[32m+[m[32m            &host_trace, "dpu_alloc", "", -1, -1, &alloc_measurement);[m
+[32m+[m[32m        scan_host_trace_record_event([m
+[32m+[m[32m            &host_trace, "dpu_load", "", -1, -1, &load_measurement);[m
+[32m+[m[32m    }[m
+ [m
+[31m-    // Create an input file with arbitrary data[m
+[31m-    read_input(A, input_size, input_size_dpu_round * nr_of_dpus);[m
+[31m-[m
+[31m-    // Timer declaration[m
+     Timer timer;[m
+[31m-[m
+     printf("NR_TASKLETS\t%d\tBL\t%d\n", NR_TASKLETS, BL);[m
+ [m
+[31m-    // Loop over main kernel[m
+[31m-    for(int rep = 0; rep < p.n_warmup + p.n_reps; rep++) {[m
+[32m+[m[32m    for (int rep = 0; rep < p.n_warmup + p.n_reps; ++rep) {[m
+[32m+[m[32m        uint32_t i = 0;[m
+[32m+[m[32m        T accum = 0;[m
+[32m+[m[32m        int32_t warmup = rep < p.n_warmup ? 1 : 0;[m
+[32m+[m[32m        struct ScanHostTraceMeasurement operation_measurement = {0};[m
+ [m
+[31m-        // Compute output on CPU (performance comparison and verification purposes)[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             start(&timer, 0, rep - p.n_warmup);[m
+         scan_host(C, A, input_size);[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             stop(&timer, 0);[m
+ [m
+         printf("Load input data\n");[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             start(&timer, 1, rep - p.n_warmup);[m
+[31m-        // Input arguments[m
+[31m-        const unsigned int input_size_dpu = input_size_dpu_round;[m
+[31m-        unsigned int kernel = 0;[m
+[31m-        dpu_arguments_t input_arguments = {input_size_dpu * sizeof(T), kernel, 0};[m
+[31m-        // Copy input arrays[m
+[31m-        i = 0;[m
+[32m+[m
+[32m+[m[32m        const uint32_t input_size_dpu = input_size_dpu_round;[m
+[32m+[m[32m        uint32_t kernel = 0;[m
+[32m+[m[32m        dpu_arguments_t input_arguments = {[m
+[32m+[m[32m            input_size_dpu * sizeof(T), kernel, 0[m
+[32m+[m[32m        };[m
+         DPU_FOREACH(dpu_set, dpu, i) {[m
+             DPU_ASSERT(dpu_prepare_xfer(dpu, &input_arguments));[m
+         }[m
+[31m-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0, sizeof(input_arguments), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+[32m+[m[32m        DPU_ASSERT(dpu_push_xfer([m
+[32m+[m[32m            dpu_set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0,[m
+[32m+[m[32m            sizeof(input_arguments), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_transfer([m
+[32m+[m[32m                &host_trace, "input_arguments_scan", "TO_DPU", rep, warmup,[m
+[32m+[m[32m                "WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,[m
+[32m+[m[32m                sizeof(input_arguments), sizeof(input_arguments),[m
+[32m+[m[32m                rep, rep, "NONE", 0, 0, &operation_measurement);[m
+[32m+[m[32m        }[m
+[32m+[m
+[32m+[m[32m        i = 0;[m
+         DPU_FOREACH(dpu_set, dpu, i) {[m
+[31m-            DPU_ASSERT(dpu_prepare_xfer(dpu, bufferA + input_size_dpu * i));[m
+[32m+[m[32m            DPU_ASSERT(dpu_prepare_xfer([m
+[32m+[m[32m                dpu, bufferA + (size_t)input_size_dpu * i));[m
+         }[m
+[31m-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0, input_size_dpu * sizeof(T), DPU_XFER_DEFAULT));[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+[32m+[m[32m        DPU_ASSERT(dpu_push_xfer([m
+[32m+[m[32m            dpu_set, DPU_XFER_TO_DPU, DPU_MRAM_HEAP_POINTER_NAME, 0,[m
+[32m+[m[32m            (size_t)input_size_dpu * sizeof(T), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_transfer([m
+[32m+[m[32m                &host_trace, "input_data", "TO_DPU", rep, warmup,[m
+[32m+[m[32m                "MRAM", "DPU_MRAM_HEAP_POINTER_NAME", 0,[m
+[32m+[m[32m                data_logical_bytes, 0,[m
+[32m+[m[32m                (uint64_t)input_size_dpu * sizeof(T),[m
+[32m+[m[32m                rep, rep, "NONE", 1, 0, &operation_measurement);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             stop(&timer, 1);[m
+ [m
+[31m-        printf("Run program on DPU(s) \n");[m
+[31m-        // Run DPU kernel[m
+[31m-        if(rep >= p.n_warmup) {[m
+[32m+[m[32m        printf("Run program on DPU(s)\n");[m
+[32m+[m[32m        if (rep >= p.n_warmup) {[m
+             start(&timer, 2, rep - p.n_warmup);[m
+[31m-            #if ENERGY[m
+[32m+[m[32m#if ENERGY[m
+             DPU_ASSERT(dpu_probe_start(&probe));[m
+[31m-            #endif[m
+[32m+[m[32m#endif[m
+         }[m
+[31m- [m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+         DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));[m
+[31m-        if(rep >= p.n_warmup) {[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_event([m
+[32m+[m[32m                &host_trace, "dpu_launch", "scan_sync", rep, warmup,[m
+[32m+[m[32m                &operation_measurement);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (rep >= p.n_warmup) {[m
+             stop(&timer, 2);[m
+[31m-            #if ENERGY[m
+[32m+[m[32m#if ENERGY[m
+             DPU_ASSERT(dpu_probe_stop(&probe));[m
+[31m-            #endif[m
+[32m+[m[32m#endif[m
+         }[m
+ [m
+ #if PRINT[m
+[36m@@ -152,102 +380,150 @@[m [mint main(int argc, char **argv) {[m
+         }[m
+ #endif[m
+ [m
+[31m-        printf("Retrieve results\n");[m
+[31m-        dpu_results_t results[nr_of_dpus];[m
+[31m-        T* results_scan = malloc(nr_of_dpus * sizeof(T));[m
+[31m-        i = 0;[m
+[31m-        accum = 0;[m
+[31m-[m
+[31m-        if(rep >= p.n_warmup)[m
+[31m-            start(&timer, 3, rep - p.n_warmup);[m
+[31m-        // PARALLEL RETRIEVE TRANSFER[m
+[31m-        dpu_results_t* results_retrieve[nr_of_dpus];[m
+[32m+[m[32m        printf("Retrieve partial results\n");[m
+[32m+[m[32m        dpu_results_t *results =[m
+[32m+[m[32m            malloc((size_t)nr_of_dpus * sizeof(*results));[m
+[32m+[m[32m        T *results_scan = malloc((size_t)nr_of_dpus * sizeof(*results_scan));[m
+[32m+[m[32m        dpu_results_t **results_retrieve =[m
+[32m+[m[32m            calloc(nr_of_dpus, sizeof(*results_retrieve));[m
+[32m+[m[32m        if (results == NULL || results_scan == NULL || results_retrieve == NULL) {[m
+[32m+[m[32m            fprintf(stderr, "Could not allocate SCAN partial-result buffers\n");[m
+[32m+[m[32m            free(results);[m
+[32m+[m[32m            free(results_scan);[m
+[32m+[m[32m            free(results_retrieve);[m
+[32m+[m[32m            scan_host_trace_destroy(&host_trace);[m
+[32m+[m[32m            free(A);[m
+[32m+[m[32m            free(C);[m
+[32m+[m[32m            free(C2);[m
+[32m+[m[32m            free(data_logical_bytes);[m
+[32m+[m[32m            DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m            return EXIT_FAILURE;[m
+[32m+[m[32m        }[m
+ [m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             start(&timer, 3, rep - p.n_warmup);[m
+[31m-[m
+[32m+[m[32m        i = 0;[m
+         DPU_FOREACH(dpu_set, dpu, i) {[m
+[31m-            results_retrieve[i] = (dpu_results_t*)malloc(NR_TASKLETS * sizeof(dpu_results_t));[m
+[32m+[m[32m            results_retrieve[i] =[m
+[32m+[m[32m                malloc(NR_TASKLETS * sizeof(dpu_results_t));[m
+[32m+[m[32m            if (results_retrieve[i] == NULL) {[m
+[32m+[m[32m                fprintf(stderr, "Could not allocate a SCAN DPU result buffer\n");[m
+[32m+[m[32m                exit(EXIT_FAILURE);[m
+[32m+[m[32m            }[m
+             DPU_ASSERT(dpu_prepare_xfer(dpu, results_retrieve[i]));[m
+         }[m
+[31m-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, "DPU_RESULTS", 0, NR_TASKLETS * sizeof(dpu_results_t), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+[32m+[m[32m        DPU_ASSERT(dpu_push_xfer([m
+[32m+[m[32m            dpu_set, DPU_XFER_FROM_DPU, "DPU_RESULTS", 0,[m
+[32m+[m[32m            NR_TASKLETS * sizeof(dpu_results_t), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_transfer([m
+[32m+[m[32m                &host_trace, "partial_results", "FROM_DPU", rep, warmup,[m
+[32m+[m[32m                "WRAM", "DPU_RESULTS", 0, NULL,[m
+[32m+[m[32m                NR_TASKLETS * sizeof(dpu_results_t),[m
+[32m+[m[32m                NR_TASKLETS * sizeof(dpu_results_t),[m
+[32m+[m[32m                rep, rep, "NONE", 0, 0, &operation_measurement);[m
+[32m+[m[32m        }[m
+ [m
+[31m-        DPU_FOREACH(dpu_set, dpu, i) {[m
+[31m-            // Retrieve tasklet timings[m
+[31m-            for (unsigned int each_tasklet = 0; each_tasklet < NR_TASKLETS; each_tasklet++) {[m
+[31m-                if(each_tasklet == NR_TASKLETS - 1)[m
+[31m-                    results[i].t_count = results_retrieve[i][each_tasklet].t_count;[m
+[31m-            }[m
+[32m+[m[32m        for (i = 0; i < nr_of_dpus; ++i) {[m
+[32m+[m[32m            results[i].t_count =[m
+[32m+[m[32m                results_retrieve[i][NR_TASKLETS - 1].t_count;[m
+             free(results_retrieve[i]);[m
+[31m-            // Sequential scan[m
+             T temp = results[i].t_count;[m
+             results_scan[i] = accum;[m
+             accum += temp;[m
+[31m-#if PRINT[m
+[31m-            printf("i=%d -- %lu,  %lu, %lu\n", i, results_scan[i], accum, temp);[m
+[31m-#endif[m
+         }[m
+ [m
+[31m-        // Arguments for add kernel (2nd kernel)[m
+         kernel = 1;[m
+[31m-        dpu_arguments_t input_arguments_2[NR_DPUS];[m
+[31m-        for(i=0; i<nr_of_dpus; i++) {[m
+[31m-            input_arguments_2[i].size=input_size_dpu * sizeof(T); [m
+[31m-            input_arguments_2[i].kernel=kernel;[m
+[31m-            input_arguments_2[i].t_count=results_scan[i];[m
+[32m+[m[32m        dpu_arguments_t *input_arguments_2 =[m
+[32m+[m[32m            malloc((size_t)nr_of_dpus * sizeof(*input_arguments_2));[m
+[32m+[m[32m        if (input_arguments_2 == NULL) {[m
+[32m+[m[32m            fprintf(stderr, "Could not allocate SCAN add arguments\n");[m
+[32m+[m[32m            exit(EXIT_FAILURE);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        for (i = 0; i < nr_of_dpus; ++i) {[m
+[32m+[m[32m            input_arguments_2[i].size = input_size_dpu * sizeof(T);[m
+[32m+[m[32m            input_arguments_2[i].kernel = kernel;[m
+[32m+[m[32m            input_arguments_2[i].t_count = results_scan[i];[m
+         }[m
+[32m+[m[32m        i = 0;[m
+         DPU_FOREACH(dpu_set, dpu, i) {[m
+             DPU_ASSERT(dpu_prepare_xfer(dpu, &input_arguments_2[i]));[m
+         }[m
+[31m-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0, sizeof(input_arguments_2[0]), DPU_XFER_DEFAULT));[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+[32m+[m[32m        DPU_ASSERT(dpu_push_xfer([m
+[32m+[m[32m            dpu_set, DPU_XFER_TO_DPU, "DPU_INPUT_ARGUMENTS", 0,[m
+[32m+[m[32m            sizeof(input_arguments_2[0]), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_transfer([m
+[32m+[m[32m                &host_trace, "input_arguments_add", "TO_DPU", rep, warmup,[m
+[32m+[m[32m                "WRAM", "DPU_INPUT_ARGUMENTS", 0, NULL,[m
+[32m+[m[32m                sizeof(input_arguments_2[0]), sizeof(input_arguments_2[0]),[m
+[32m+[m[32m                rep, rep, "NONE", 0, 0, &operation_measurement);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             stop(&timer, 3);[m
+ [m
+[31m-        printf("Run program on DPU(s) \n");[m
+[31m-        // Run DPU kernel[m
+[31m-        if(rep >= p.n_warmup) {[m
+[32m+[m[32m        printf("Run add program on DPU(s)\n");[m
+[32m+[m[32m        if (rep >= p.n_warmup) {[m
+             start(&timer, 4, rep - p.n_warmup);[m
+[31m-            #if ENERGY[m
+[32m+[m[32m#if ENERGY[m
+             DPU_ASSERT(dpu_probe_start(&probe));[m
+[31m-            #endif[m
+[32m+[m[32m#endif[m
+         }[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+         DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));[m
+[31m-        if(rep >= p.n_warmup) {[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_event([m
+[32m+[m[32m                &host_trace, "dpu_launch", "add_sync", rep, warmup,[m
+[32m+[m[32m                &operation_measurement);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (rep >= p.n_warmup) {[m
+             stop(&timer, 4);[m
+[31m-            #if ENERGY[m
+[32m+[m[32m#if ENERGY[m
+             DPU_ASSERT(dpu_probe_stop(&probe));[m
+[31m-            #endif[m
+[31m-        }[m
+[31m-[m
+[31m-#if PRINT[m
+[31m-        {[m
+[31m-            unsigned int each_dpu = 0;[m
+[31m-            printf("Display DPU Logs\n");[m
+[31m-            DPU_FOREACH (dpu_set, dpu) {[m
+[31m-                printf("DPU#%d:\n", each_dpu);[m
+[31m-                DPU_ASSERT(dpulog_read_for_dpu(dpu.dpu, stdout));[m
+[31m-                each_dpu++;[m
+[31m-            }[m
+[31m-        }[m
+ #endif[m
+[32m+[m[32m        }[m
+ [m
+         printf("Retrieve results\n");[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             start(&timer, 5, rep - p.n_warmup);[m
+         i = 0;[m
+[31m-        // PARALLEL RETRIEVE TRANSFER[m
+         DPU_FOREACH(dpu_set, dpu, i) {[m
+[31m-            DPU_ASSERT(dpu_prepare_xfer(dpu, bufferC + input_size_dpu * i));[m
+[32m+[m[32m            DPU_ASSERT(dpu_prepare_xfer([m
+[32m+[m[32m                dpu, bufferC + (size_t)input_size_dpu * i));[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m            scan_host_trace_measurement_begin(&operation_measurement);[m
+[32m+[m[32m        DPU_ASSERT(dpu_push_xfer([m
+[32m+[m[32m            dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME,[m
+[32m+[m[32m            (size_t)input_size_dpu * sizeof(T),[m
+[32m+[m[32m            (size_t)input_size_dpu * sizeof(T), DPU_XFER_DEFAULT));[m
+[32m+[m[32m        if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m            scan_host_trace_measurement_end(&operation_measurement);[m
+[32m+[m[32m            scan_host_trace_record_transfer([m
+[32m+[m[32m                &host_trace, "output_data", "FROM_DPU", rep, warmup,[m
+[32m+[m[32m                "MRAM", "DPU_MRAM_HEAP_POINTER_NAME",[m
+[32m+[m[32m                (uint64_t)input_size_dpu * sizeof(T),[m
+[32m+[m[32m                data_logical_bytes, 0,[m
+[32m+[m[32m                (uint64_t)input_size_dpu * sizeof(T),[m
+[32m+[m[32m                rep, rep, "NONE", 1, 0, &operation_measurement);[m
+         }[m
+[31m-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, DPU_MRAM_HEAP_POINTER_NAME, input_size_dpu * sizeof(T), input_size_dpu * sizeof(T), DPU_XFER_DEFAULT));[m
+[31m-        if(rep >= p.n_warmup)[m
+[32m+[m[32m        if (rep >= p.n_warmup)[m
+             stop(&timer, 5);[m
+ [m
+[31m-        // Free memory[m
+[32m+[m[32m        free(results);[m
+         free(results_scan);[m
+[32m+[m[32m        free(results_retrieve);[m
+[32m+[m[32m        free(input_arguments_2);[m
+     }[m
+ [m
+[31m-    // Print timing results[m
+     printf("CPU ");[m
+     print(&timer, 0, p.n_reps);[m
+     printf("CPU-DPU ");[m
+[36m@@ -261,34 +537,50 @@[m [mint main(int argc, char **argv) {[m
+     printf("DPU-CPU ");[m
+     print(&timer, 5, p.n_reps);[m
+ [m
+[31m-    #if ENERGY[m
+[32m+[m[32m#if ENERGY[m
+     double energy;[m
+     DPU_ASSERT(dpu_probe_get(&probe, DPU_ENERGY, DPU_AVERAGE, &energy));[m
+     printf("DPU Energy (J): %f\t", energy);[m
+[31m-    #endif	[m
+[31m-[m
+[32m+[m[32m#endif[m
+ [m
+[31m-    // Check output[m
+     bool status = true;[m
+[31m-    for (i = 0; i < input_size; i++) {[m
+[31m-        if(C[i] != bufferC[i]){ [m
+[32m+[m[32m    for (uint32_t i = 0; i < input_size; ++i) {[m
+[32m+[m[32m        if (C[i] != bufferC[i]) {[m
+             status = false;[m
+ #if PRINT[m
+[31m-            printf("%d: %lu -- %lu\n", i, C[i], bufferC[i]);[m
+[32m+[m[32m            printf("%u: %" PRId64 " -- %" PRId64 "\n",[m
+[32m+[m[32m                i, (int64_t)C[i], (int64_t)bufferC[i]);[m
+ #endif[m
+         }[m
+     }[m
+[31m-    if (status) {[m
+[32m+[m[32m    if (status)[m
+         printf("[" ANSI_COLOR_GREEN "OK" ANSI_COLOR_RESET "] Outputs are equal\n");[m
+[31m-    } else {[m
+[32m+[m[32m    else[m
+         printf("[" ANSI_COLOR_RED "ERROR" ANSI_COLOR_RESET "] Outputs differ!\n");[m
+[31m-    }[m
+ [m
+[31m-    // Deallocation[m
+     free(A);[m
+     free(C);[m
+     free(C2);[m
+[31m-    DPU_ASSERT(dpu_free(dpu_set));[m
+[31m-	[m
+[31m-    return status ? 0 : -1;[m
+[32m+[m[32m    free(data_logical_bytes);[m
+[32m+[m
+[32m+[m[32m    struct ScanHostTraceMeasurement free_measurement = {0};[m
+[32m+[m[32m    if (scan_host_trace_enabled(&host_trace))[m
+[32m+[m[32m        scan_host_trace_measurement_begin(&free_measurement);[m
+[32m+[m[32m    DPU_ASSERT(free_scan_dpus(&dpu_allocation, dpu_set));[m
+[32m+[m[32m    if (scan_host_trace_enabled(&host_trace)) {[m
+[32m+[m[32m        scan_host_trace_measurement_end(&free_measurement);[m
+[32m+[m[32m        scan_host_trace_record_event([m
+[32m+[m[32m            &host_trace, "dpu_free", "", -1, -1, &free_measurement);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (!scan_host_trace_write(&host_trace)) {[m
+[32m+[m[32m        scan_host_trace_destroy(&host_trace);[m
+[32m+[m[32m        return EXIT_FAILURE;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    scan_host_trace_destroy(&host_trace);[m
+[32m+[m
+[32m+[m[32m#if ENERGY[m
+[32m+[m[32m    DPU_ASSERT(dpu_probe_deinit(&probe));[m
+[32m+[m[32m#endif[m
+[32m+[m
+[32m+[m[32m    return status ? EXIT_SUCCESS : EXIT_FAILURE;[m
+ }[m

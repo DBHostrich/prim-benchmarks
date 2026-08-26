@@ -1,0 +1,14 @@
+ ...EMV_RUNTIME_STALL_PROBE.md |  72 [32m++[m
+ .../analyze_runtime_stalls.py | 406 [32m+++++++[m
+ GEMV/host/app.c               |  64 [32m+[m[31m-[m
+ GEMV/host/host_trace.c        | 159 [32m++[m[31m-[m
+ GEMV/host/host_trace.h        |  35 [32m+[m[31m-[m
+ ...interleaved_scale_trace.sh |   8 [32m+[m[31m-[m
+ ...run_runtime_stall_probe.sh | 351 [32m++++++[m
+ .../select_host_probe_cpus.py |  77 [32m++[m
+ ..._analyze_runtime_stalls.py | 107 [32m++[m
+ ..._select_host_probe_cpus.py |  35 [32m+[m
+ .../test_validate_hw_trace.py |  10 [32m+[m
+ GEMV/tools/stall_probe.c      | 194 [32m+++[m
+ GEMV/validate_hw_trace.py     |  49 [32m+[m
+ 13 files changed, 1506 insertions(+), 61 deletions(-)
