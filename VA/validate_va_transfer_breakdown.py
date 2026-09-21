@@ -454,7 +454,7 @@ def validate_provenance(root: Path) -> dict[str, object]:
         "prim_git_commit.txt", "prim_git_status.txt", "source.sha256", "binaries.sha256",
         "sdk_source_baseline_check.txt", "sdk_source.sha256", "sdk_patch_check.txt",
         "sdk_build.log", "instrumented_library.sha256", "dynamic_library_resolution.txt",
-        "imc_status.txt",
+        "system_backend_libraries.txt", "system_runtime_assets.txt", "imc_status.txt",
     )
     files: dict[str, dict[str, object]] = {}
     for name in required:
@@ -467,6 +467,14 @@ def validate_provenance(root: Path) -> dict[str, object]:
     dynamic = (root / "dynamic_library_resolution.txt").read_text()
     if str(root.resolve()) not in dynamic or "libdpu.so" not in dynamic:
         fail("dynamic library evidence does not resolve libdpu inside RESULT_ROOT")
+    if "libdpuhw.so" not in dynamic:
+        fail("dynamic library evidence lacks the hardware backend")
+    backend_evidence = (root / "system_backend_libraries.txt").read_text()
+    if "libdpuhw.so=" not in backend_evidence or "libdpuhw.so.2025.1=" not in backend_evidence:
+        fail("system hardware backend evidence differs")
+    runtime_evidence = (root / "system_runtime_assets.txt").read_text()
+    if "share/upmem=" not in runtime_evidence:
+        fail("system runtime asset evidence differs")
     baseline_check = (root / "sdk_source_baseline_check.txt").read_text()
     if "OK" not in baseline_check:
         fail("SDK source baseline hash check lacks OK records")

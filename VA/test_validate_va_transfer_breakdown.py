@@ -254,6 +254,33 @@ class ValidateVaTransferBreakdownTest(unittest.TestCase):
                     writer.writerows(rows)
                 self.assertEqual(len(validator.load_csv([path], header, schema)), len(rows))
 
+    def test_provenance_requires_instrumented_runtime_and_hardware_backend(self):
+        required = (
+            "uname.txt", "lscpu.txt", "numa.txt", "numactl_show.txt", "config.txt",
+            "prim_git_commit.txt", "prim_git_status.txt", "source.sha256", "binaries.sha256",
+            "sdk_source_baseline_check.txt", "sdk_source.sha256", "sdk_patch_check.txt",
+            "sdk_build.log", "instrumented_library.sha256", "dynamic_library_resolution.txt",
+            "system_backend_libraries.txt", "system_runtime_assets.txt", "imc_status.txt",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in required:
+                (root / name).write_text("evidence\n")
+            (root / "sdk_source_baseline_check.txt").write_text("api/CMakeLists.txt: OK\n")
+            (root / "sdk_patch_check.txt").write_text("PATCH_APPLIED=PASS\n")
+            (root / "dynamic_library_resolution.txt").write_text(
+                f"libdpu.so => {root}/shadow_lib/libdpu.so.2025.1\nlibdpuhw.so\n"
+            )
+            (root / "system_backend_libraries.txt").write_text(
+                "libdpuhw.so=/usr/lib/libdpuhw.so.2025.1\n"
+                "libdpuhw.so.2025.1=/usr/lib/libdpuhw.so.2025.1\n"
+            )
+            (root / "system_runtime_assets.txt").write_text(
+                "share/upmem=/usr/share/upmem\n"
+            )
+            result = validator.validate_provenance(root)
+        self.assertEqual(result["status"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

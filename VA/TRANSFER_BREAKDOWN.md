@@ -19,6 +19,11 @@ clean 2025.1.0 runtime source. The script verifies the pinned hashes, copies the
 source below the result directory, applies the versioned patch, and builds a
 shadow `libdpu.so.2025.1`. System `libdpuhw` and the kernel driver retain their
 installed files.
+The default profile is `backend=hw`, and the script requires that backend for
+formal hardware acceptance. The shadow directory links the installed hardware
+backend while replacing `libdpu.so.2025.1` with the instrumented build. It also
+links the installed predefined programs at the relative path expected by
+`libdpu`.
 
 Run this command on the UPMEM hardware host from the repository root:
 

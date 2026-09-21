@@ -25,11 +25,15 @@ N_OVERHEAD_PROCESSES="${N_OVERHEAD_PROCESSES:-10}"
 INPUT_ELEMENTS="${INPUT_ELEMENTS:-2621440}"
 TASKLETS="${TASKLETS:-16}"
 BLOCK_SIZE_LOG2="${BLOCK_SIZE_LOG2:-10}"
-DPU_PROFILE="${VA_DPU_PROFILE:-}"
+DPU_PROFILE="${VA_DPU_PROFILE:-backend=hw}"
 BUILD_JOBS="${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 SDK_VERSION="2025.1.0"
 SDK_HASH_MANIFEST="$SCRIPT_DIR/sdk/upmem-2025.1.0-source.sha256"
 SDK_PATCH="$SCRIPT_DIR/sdk/upmem-2025.1.0-transfer-trace.patch"
+
+stage() {
+    printf '[VA] %s\n' "$1"
+}
 
 if [[ "$N_WARMUP_PROCESSES" != "5" || "$N_REPS_PROCESSES" != "30" ||
       "$INPUT_ELEMENTS" != "2621440" || "$TASKLETS" != "16" ||
@@ -41,6 +45,13 @@ if (( N_OVERHEAD_PROCESSES < 2 )); then
     echo "N_OVERHEAD_PROCESSES must be at least 2" >&2
     exit 1
 fi
+case ",$DPU_PROFILE," in
+    *,backend=hw,*) ;;
+    *)
+        echo "VA_DPU_PROFILE must select backend=hw for hardware acceptance: $DPU_PROFILE" >&2
+        exit 1
+        ;;
+esac
 for command_name in cmake patch perf numactl sha256sum readelf ldd; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "$command_name is required" >&2
@@ -60,6 +71,7 @@ SDK_COPY="$RESULT_ROOT/sdk_source"
 SDK_BUILD="$RESULT_ROOT/sdk_build"
 SHADOW_LIB="$RESULT_ROOT/shadow_lib"
 mkdir -p "$SDK_COPY" "$SDK_BUILD" "$SHADOW_LIB"
+stage "verify SDK source and capture host provenance"
 
 uname -a > "$RESULT_ROOT/uname.txt"
 lscpu > "$RESULT_ROOT/lscpu.txt"
@@ -96,6 +108,7 @@ cp -a "$SDK_SOURCE_ROOT/." "$SDK_COPY/"
     find . -type f -print0 | sort -z | xargs -0 sha256sum
 ) > "$RESULT_ROOT/sdk_source.sha256"
 
+stage "build instrumented libdpu"
 {
     cmake -S "$SDK_COPY" -B "$SDK_BUILD" \
         -DUPMEM_VERSION="$SDK_VERSION" \
@@ -114,22 +127,64 @@ if [[ -z "$SYSTEM_LIBDPU" || ! -f "$SYSTEM_LIBDPU" ]]; then
     exit 1
 fi
 SYSTEM_LIB_DIR="$(dirname "$SYSTEM_LIBDPU")"
+SYSTEM_LIBDPUHW="$(ldconfig -p | awk '$1 == "libdpuhw.so.2025.1" { print $NF; exit }')"
+if [[ -z "$SYSTEM_LIBDPUHW" || ! -f "$SYSTEM_LIBDPUHW" ]]; then
+    echo "system libdpuhw.so.2025.1 is absent" >&2
+    exit 1
+fi
+SYSTEM_UPMEM_SHARE="$(dpkg-query -L upmem | awk '
+    !found && /\/share\/upmem\/include\/misc(\/|$)/ {
+        sub(/\/include\/misc.*/, "")
+        print
+        found = 1
+    }
+')"
+if [[ -z "$SYSTEM_UPMEM_SHARE" || ! -d "$SYSTEM_UPMEM_SHARE/include/misc" ]]; then
+    echo "system UPMEM runtime assets are absent" >&2
+    exit 1
+fi
+mapfile -t SYSTEM_PREDEFINED_PROGRAMS < <(
+    find "$SYSTEM_UPMEM_SHARE/include/misc" -maxdepth 1 \
+        \( -type f -o -type l \) -print | sort
+)
+if (( ${#SYSTEM_PREDEFINED_PROGRAMS[@]} == 0 )); then
+    echo "system UPMEM predefined programs are absent" >&2
+    exit 1
+fi
 cp -L "$INSTRUMENTED_LIB" "$SHADOW_LIB/libdpu.so.2025.1"
 ln -s libdpu.so.2025.1 "$SHADOW_LIB/libdpu.so"
-while IFS= read -r system_library; do
-    library_name="$(basename "$system_library")"
+while read -r library_name system_library; do
     case "$library_name" in
         libdpu.so|libdpu.so.2025.1) continue ;;
     esac
     [[ -e "$SHADOW_LIB/$library_name" ]] || ln -s "$system_library" "$SHADOW_LIB/$library_name"
-done < <(find "$SYSTEM_LIB_DIR" -maxdepth 1 \( -type f -o -type l \) -name 'libdpu*.so*' | sort)
+done < <(ldconfig -p | awk '$1 ~ /^libdpu.*\.so/ { print $1, $NF }' | sort -u)
+[[ -e "$SHADOW_LIB/libdpuhw.so" ]] || ln -s "$SYSTEM_LIBDPUHW" "$SHADOW_LIB/libdpuhw.so"
+[[ -e "$SHADOW_LIB/libdpuhw.so.2025.1" ]] || ln -s "$SYSTEM_LIBDPUHW" "$SHADOW_LIB/libdpuhw.so.2025.1"
+if [[ ! -e "$SHADOW_LIB/libdpuhw.so" || ! -e "$SHADOW_LIB/libdpuhw.so.2025.1" ]]; then
+    echo "shadow library lacks the system hardware backend" >&2
+    exit 1
+fi
+mkdir -p "$RESULT_ROOT/share"
+ln -s "$SYSTEM_UPMEM_SHARE" "$RESULT_ROOT/share/upmem"
 sha256sum "$SHADOW_LIB/libdpu.so.2025.1" > "$RESULT_ROOT/instrumented_library.sha256"
+{
+    printf 'libdpuhw.so=%s\n' "$(readlink -f "$SHADOW_LIB/libdpuhw.so")"
+    printf 'libdpuhw.so.2025.1=%s\n' "$(readlink -f "$SHADOW_LIB/libdpuhw.so.2025.1")"
+    sha256sum "$SYSTEM_LIBDPUHW"
+} > "$RESULT_ROOT/system_backend_libraries.txt"
+{
+    printf 'share/upmem=%s\n' "$(readlink -f "$RESULT_ROOT/share/upmem")"
+    sha256sum "${SYSTEM_PREDEFINED_PROGRAMS[@]}"
+} > "$RESULT_ROOT/system_runtime_assets.txt"
 
 cd "$SCRIPT_DIR"
-make clean
-make NR_DPUS=1 NR_TASKLETS="$TASKLETS" BL="$BLOCK_SIZE_LOG2" \
-    TYPE=INT32 ENERGY=0 VA_VALIDATION_INPUT=1 all \
-    > "$RESULT_ROOT/app_build.log" 2>&1
+stage "build VA host and DPU binaries"
+{
+    make clean
+    make NR_DPUS=1 NR_TASKLETS="$TASKLETS" BL="$BLOCK_SIZE_LOG2" \
+        TYPE=INT32 ENERGY=0 VA_VALIDATION_INPUT=1 all
+} > "$RESULT_ROOT/app_build.log" 2>&1
 sha256sum bin/host_code bin/dpu_code > "$RESULT_ROOT/binaries.sha256"
 sha256sum Makefile host/app.c dpu/task.c support/common.h support/params.h \
     validate_va_baseline_trace.py validate_va_transfer_breakdown.py \
@@ -172,8 +227,12 @@ printf '%s\n' \
     readelf -d bin/host_code
     printf '\n[ldd instrumented]\n'
     LD_LIBRARY_PATH="$SHADOW_LIB:$SYSTEM_LIB_DIR" ldd bin/host_code
+    printf '\n[ldd system hardware backend]\n'
+    LD_LIBRARY_PATH="$SHADOW_LIB:$SYSTEM_LIB_DIR" ldd "$SHADOW_LIB/libdpuhw.so"
     printf '\n[shadow directory]\n'
     find "$SHADOW_LIB" -maxdepth 1 -printf '%p -> %l\n' | sort
+    printf '\n[runtime assets]\n'
+    find "$RESULT_ROOT/share" -maxdepth 1 -printf '%p -> %l\n' | sort
 } > "$RESULT_ROOT/dynamic_library_resolution.txt" 2>&1
 
 require_correct_result() {
@@ -192,6 +251,7 @@ run_va() {
     local perf_trace="$7"
     local log_path="$8"
     local library_path
+    local run_rc=0
     local -a command_line
 
     if [[ "$library_mode" == "instrumented" ]]; then
@@ -205,6 +265,7 @@ run_va() {
     )
     (
         export LD_LIBRARY_PATH="$library_path"
+        export UPMEM_RUNTIME_LIBRARY_PATH="$SHADOW_LIB"
         export VA_ALLOCATION_MODE="$allocation_mode"
         export VA_DPU_PROFILE="$DPU_PROFILE"
         export VA_TRACE_RUN_ID="$run_id"
@@ -231,11 +292,21 @@ run_va() {
             perf stat -x, -o "$perf_trace" -e task-clock,cycles,instructions -- \
                 "${command_line[@]}"
         fi
-    ) > "$log_path" 2>&1
-    require_correct_result "$log_path"
+    ) > "$log_path" 2>&1 || run_rc=$?
+    if (( run_rc != 0 )); then
+        printf 'VA run failed: run_id=%s rc=%s log=%s\n' "$run_id" "$run_rc" "$log_path" >&2
+        tail -n 80 "$log_path" >&2
+        return "$run_rc"
+    fi
+    if ! require_correct_result "$log_path"; then
+        printf 'VA result check failed: run_id=%s log=%s\n' "$run_id" "$log_path" >&2
+        tail -n 80 "$log_path" >&2
+        return 1
+    fi
 }
 
 mkdir -p "$RESULT_ROOT/smoke"
+stage "run single-DPU and full-rank smoke checks"
 run_va instrumented single smoke_single \
     "$RESULT_ROOT/smoke/single_app.csv" "$RESULT_ROOT/smoke/single_baseline.csv" \
     "$RESULT_ROOT/smoke/single_sdk.csv" - "$RESULT_ROOT/smoke/single.log"
@@ -254,6 +325,7 @@ python3 "$SCRIPT_DIR/validate_va_baseline_trace.py" \
     > "$RESULT_ROOT/smoke/validation.log" 2>&1
 
 mkdir -p "$RESULT_ROOT/overhead/stock" "$RESULT_ROOT/overhead/instrumented"
+stage "collect stock and instrumented overhead samples"
 for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
     rep_id="$(printf '%02d' "$rep")"
     run_va stock rank "overhead_stock_$rep_id" \
@@ -266,6 +338,7 @@ for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
 done
 
 mkdir -p "$RESULT_ROOT/warmup"
+stage "run warmup processes"
 for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
     rep_id="$(printf '%02d' "$rep")"
     run_va instrumented rank "warmup_$rep_id" - - - - \
@@ -273,6 +346,7 @@ for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
 done
 
 mkdir -p "$RESULT_ROOT/formal"
+stage "collect formal full-rank samples"
 for rep in $(seq 1 "$N_REPS_PROCESSES"); do
     rep_id="$(printf '%02d' "$rep")"
     run_va instrumented rank "formal_$rep_id" \
@@ -284,10 +358,12 @@ for rep in $(seq 1 "$N_REPS_PROCESSES"); do
 done
 
 mkdir -p "$RESULT_ROOT/imc"
+stage "collect IMC status"
 if perf list 2>/dev/null | grep -q 'uncore_imc.*cas_count_read'; then
     set +e
     (
         export LD_LIBRARY_PATH="$SHADOW_LIB:$SYSTEM_LIB_DIR"
+        export UPMEM_RUNTIME_LIBRARY_PATH="$SHADOW_LIB"
         export VA_ALLOCATION_MODE=rank
         export VA_DPU_PROFILE="$DPU_PROFILE"
         perf stat -a -x, -o "$RESULT_ROOT/imc/perf.csv" \
@@ -318,6 +394,7 @@ mapfile -t stock_app < <(find "$RESULT_ROOT/overhead/stock" -type f -name 'app_*
 mapfile -t instrumented_app < <(find "$RESULT_ROOT/overhead/instrumented" -type f -name 'app_*.csv' | sort)
 
 set +e
+stage "validate traces and create archive"
 python3 "$SCRIPT_DIR/validate_va_transfer_breakdown.py" \
     --app-trace "${formal_app[@]}" \
     --sdk-trace "${formal_sdk[@]}" \
