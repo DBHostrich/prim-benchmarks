@@ -80,8 +80,26 @@ The sweep adds these interfaces:
 VA_TRANSFER_COLLECTION_MODE
 VA_SWEEP_INPUT_ELEMENTS
 VA_SWEEP_OVERHEAD_ELEMENTS
+VA_SWEEP_STRICT_OVERHEAD
 VA_TRANSFER_ORDER
 ```
+
+The default `VA_SWEEP_STRICT_OVERHEAD=0` records threshold excesses as
+`timing_status=FAIL` while preserving `collection_status=PASS` and a successful
+collection exit status. Set `VA_SWEEP_STRICT_OVERHEAD=1` when an overhead
+threshold should produce a nonzero validation exit status. Manifest v2 records
+both validator hashes so that a later revalidation remains attributable.
+
+Revalidate an existing collection after updating the repository:
+
+```bash
+bash VA/revalidate_hw_transfer_size_sweep.sh \
+  /tmp/va_transfer_size_sweep_<timestamp>
+```
+
+The command preserves the original summary and writes `summary_revalidated_v2`,
+`validation_revalidated_v2.log`, revalidation provenance, and a
+`.revalidated_v2.tar.gz` archive.
 
 The output directory contains `collection_plan.csv` plus these summary files:
 

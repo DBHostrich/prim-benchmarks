@@ -1,5 +1,6 @@
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -92,6 +93,22 @@ class ValidateVaTransferSweepTest(unittest.TestCase):
         }}
         with self.assertRaises(base.ValidationError):
             sweep.validate_baseline_orders(rows, plan)
+
+    def test_strict_overhead_is_opt_in(self):
+        arguments = [
+            "validate_va_transfer_sweep.py",
+            "--result-root", "/tmp/result",
+            "--input-elements", "8192",
+            "--overhead-input-elements", "8192",
+            "--output-dir", "/tmp/output",
+        ]
+        with mock.patch.object(sys, "argv", arguments):
+            self.assertFalse(sweep.parse_args().strict_overhead)
+        with mock.patch.object(sys, "argv", arguments + ["--strict-overhead"]):
+            self.assertTrue(sweep.parse_args().strict_overhead)
+        self.assertFalse(sweep.overhead_requires_failure(False, False))
+        self.assertTrue(sweep.overhead_requires_failure(False, True))
+        self.assertFalse(sweep.overhead_requires_failure(True, True))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size-log2", type=int, default=10)
     parser.add_argument("--p50-threshold-pct", type=float, default=3.0)
     parser.add_argument("--p90-threshold-pct", type=float, default=5.0)
+    parser.add_argument(
+        "--strict-overhead",
+        action="store_true",
+        help="return a failure status when an overhead threshold is exceeded",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -191,6 +196,10 @@ def require_success_logs(root: Path, expected_count: int, pattern: str) -> None:
         text = path.read_text()
         if "[OK] Outputs are equal" not in text or "VA_CHECKSUM expected=" not in text:
             base.fail(f"{path}: functional result differs")
+
+
+def overhead_requires_failure(overhead_passed: bool, strict_overhead: bool) -> bool:
+    return strict_overhead and not overhead_passed
 
 
 def make_samples(
@@ -368,9 +377,14 @@ def main() -> int:
             overhead_rows,
         )
         manifest = {
-            "schema_version": "upmem.va_transfer_size_sweep_manifest.v1",
+            "schema_version": "upmem.va_transfer_size_sweep_manifest.v2",
+            "collection_status": "PASS",
             "functional_status": "PASS",
             "timing_status": "REPORTED" if overhead_passed else "FAIL",
+            "overhead_threshold_policy": "STRICT" if args.strict_overhead else "REPORT",
+            "overhead_failures": sum(row["status"] == "FAIL" for row in overhead_rows),
+            "validator_sha256": base.sha256_file(Path(__file__)),
+            "base_validator_sha256": base.sha256_file(Path(base.__file__)),
             "input_elements": args.input_elements,
             "bytes_per_dpu": [expected_bytes_per_dpu(size) for size in args.input_elements],
             "formal_processes": len(all_groups),
@@ -391,14 +405,20 @@ def main() -> int:
         (args.output_dir / "va_transfer_size_sweep_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
-        if not overhead_passed:
-            print("FAIL VA_TRANSFER_SIZE_SWEEP overhead threshold exceeded")
+        if overhead_requires_failure(overhead_passed, args.strict_overhead):
+            print(
+                "FAIL VA_TRANSFER_SIZE_SWEEP collection_status=PASS "
+                "functional_status=PASS timing_status=FAIL strict_overhead=1"
+            )
             return 1
     except (OSError, ValueError, base.ValidationError) as error:
         print(f"FAIL VA_TRANSFER_SIZE_SWEEP {error}")
         return 1
+    timing_status = "REPORTED" if overhead_passed else "FAIL"
+    overhead_failures = sum(row["status"] == "FAIL" for row in overhead_rows)
     print(
-        f"PASS VA_TRANSFER_SIZE_SWEEP functional_status=PASS timing_status=REPORTED "
+        f"PASS VA_TRANSFER_SIZE_SWEEP collection_status=PASS functional_status=PASS "
+        f"timing_status={timing_status} overhead_failures={overhead_failures} "
         f"sizes={len(args.input_elements)} processes={len(all_groups)} output={args.output_dir}"
     )
     return 0

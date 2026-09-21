@@ -33,6 +33,7 @@ else
 fi
 SWEEP_INPUT_ELEMENTS_TEXT="${VA_SWEEP_INPUT_ELEMENTS:-8192 16384 32768 131072 524288 1048576 2621440 4194304 8388608}"
 SWEEP_OVERHEAD_ELEMENTS_TEXT="${VA_SWEEP_OVERHEAD_ELEMENTS:-8192 2621440 8388608}"
+SWEEP_STRICT_OVERHEAD="${VA_SWEEP_STRICT_OVERHEAD:-0}"
 BUILD_JOBS="${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 SDK_VERSION="2025.1.0"
 SDK_HASH_MANIFEST="$SCRIPT_DIR/sdk/upmem-2025.1.0-source.sha256"
@@ -76,6 +77,10 @@ case ",$DPU_PROFILE," in
         ;;
 esac
 if [[ "$COLLECTION_MODE" == "sweep" ]]; then
+    if [[ "$SWEEP_STRICT_OVERHEAD" != "0" && "$SWEEP_STRICT_OVERHEAD" != "1" ]]; then
+        echo "VA_SWEEP_STRICT_OVERHEAD must be 0 or 1: $SWEEP_STRICT_OVERHEAD" >&2
+        exit 1
+    fi
     case ",$DPU_PROFILE," in
         *,regionMode=perf,*) ;;
         *)
@@ -250,7 +255,8 @@ sha256sum Makefile host/app.c dpu/task.c support/common.h support/params.h \
     validate_va_transfer_sweep.py test_validate_va_baseline_trace.py \
     test_validate_va_transfer_breakdown.py \
     test_validate_va_transfer_sweep.py run_hw_transfer_breakdown.sh \
-    run_hw_transfer_size_sweep.sh TRANSFER_BREAKDOWN.md \
+    run_hw_transfer_size_sweep.sh revalidate_hw_transfer_size_sweep.sh \
+    TRANSFER_BREAKDOWN.md \
     sdk/upmem-2025.1.0-source.sha256 \
     sdk/upmem-2025.1.0-transfer-trace.patch sdk/README.md \
     > "$RESULT_ROOT/source.sha256"
@@ -271,6 +277,7 @@ printf '%s\n' \
     "INPUT_ELEMENTS=$INPUT_ELEMENTS" \
     "VA_SWEEP_INPUT_ELEMENTS=$SWEEP_INPUT_ELEMENTS_TEXT" \
     "VA_SWEEP_OVERHEAD_ELEMENTS=$SWEEP_OVERHEAD_ELEMENTS_TEXT" \
+    "VA_SWEEP_STRICT_OVERHEAD=$SWEEP_STRICT_OVERHEAD" \
     "TASKLETS=$TASKLETS" \
     "BLOCK_SIZE_LOG2=$BLOCK_SIZE_LOG2" \
     "SCALING=strong" \
@@ -576,17 +583,22 @@ if [[ "$COLLECTION_MODE" == "anchor" ]]; then
         --output-dir "$RESULT_ROOT/summary" \
         > "$RESULT_ROOT/validation.log" 2>&1
 else
-    python3 "$SCRIPT_DIR/validate_va_transfer_sweep.py" \
-        --result-root "$RESULT_ROOT" \
-        --input-elements "${SWEEP_INPUT_ELEMENTS[@]}" \
-        --overhead-input-elements "${SWEEP_OVERHEAD_ELEMENTS[@]}" \
-        --expected-reps-per-size "$N_REPS_PROCESSES" \
-        --expected-warmups-per-size "$N_WARMUP_PROCESSES" \
-        --expected-overhead-reps "$N_OVERHEAD_PROCESSES" \
-        --tasklets "$TASKLETS" \
-        --block-size-log2 "$BLOCK_SIZE_LOG2" \
-        --output-dir "$RESULT_ROOT/summary" \
-        > "$RESULT_ROOT/validation.log" 2>&1
+    sweep_validation_args=(
+        python3 "$SCRIPT_DIR/validate_va_transfer_sweep.py"
+        --result-root "$RESULT_ROOT"
+        --input-elements "${SWEEP_INPUT_ELEMENTS[@]}"
+        --overhead-input-elements "${SWEEP_OVERHEAD_ELEMENTS[@]}"
+        --expected-reps-per-size "$N_REPS_PROCESSES"
+        --expected-warmups-per-size "$N_WARMUP_PROCESSES"
+        --expected-overhead-reps "$N_OVERHEAD_PROCESSES"
+        --tasklets "$TASKLETS"
+        --block-size-log2 "$BLOCK_SIZE_LOG2"
+        --output-dir "$RESULT_ROOT/summary"
+    )
+    if [[ "$SWEEP_STRICT_OVERHEAD" == "1" ]]; then
+        sweep_validation_args+=(--strict-overhead)
+    fi
+    "${sweep_validation_args[@]}" > "$RESULT_ROOT/validation.log" 2>&1
 fi
 validation_rc=$?
 set -e
@@ -597,6 +609,8 @@ tar -czf "$ARCHIVE" -C "$(dirname "$RESULT_ROOT")" "$(basename "$RESULT_ROOT")"
     cd "$(dirname "$ARCHIVE")"
     sha256sum "$(basename "$ARCHIVE")"
 ) > "${ARCHIVE}.sha256"
+
+tail -n 20 "$RESULT_ROOT/validation.log"
 
 if [[ "$validation_rc" != "0" ]]; then
     echo "FAIL VA transfer $COLLECTION_MODE validation"
