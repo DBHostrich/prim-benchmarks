@@ -211,6 +211,7 @@ static void
 write_trace(
     const char *trace_path,
     const char *configuration,
+    const char *transfer_order,
     uint32_t actual_dpus,
     uint32_t actual_ranks,
     unsigned int input_elements,
@@ -232,6 +233,9 @@ write_trace(
     uint64_t d2h_bytes_per_dpu = payload_bytes;
     uint64_t repeat_base = strtoull(env_or("VA_TRACE_REPEAT_ID", "1"), NULL, 10);
     const char *run_id = env_or("VA_TRACE_RUN_ID", configuration);
+    const char *h2d_sequence = strcmp(transfer_order, "BA") == 0
+        ? "prepare_args>push_args>prepare_B>push_B>prepare_A>push_A"
+        : "prepare_args>push_args>prepare_A>push_A>prepare_B>push_B";
 
     stream = fopen(trace_path, "w");
     if (stream == NULL) {
@@ -257,8 +261,7 @@ write_trace(
             "vector_addition_host", result_ok, expected_checksum, actual_checksum);
         write_trace_row(stream, run_id, repeat_id, configuration, actual_dpus,
             actual_ranks, input_elements, "H2D", h2d_ns[rep], h2d_bytes_per_dpu,
-            h2d_bytes_per_dpu * actual_dpus,
-            "prepare_args>push_args>prepare_A>push_A>prepare_B>push_B",
+            h2d_bytes_per_dpu * actual_dpus, h2d_sequence,
             result_ok, expected_checksum, actual_checksum);
         write_trace_row(stream, run_id, repeat_id, configuration, actual_dpus,
             actual_ranks, input_elements, "KERNEL", kernel_ns[rep], 0, 0,
@@ -425,6 +428,38 @@ vector_addition_host(T *output, T *input_a, T *input_b, unsigned int nr_elements
         output[i] = input_a[i] + input_b[i];
 }
 
+static void
+prepare_and_push_mram(
+    struct dpu_set_t dpu_set,
+    T *buffer,
+    unsigned int per_dpu_elements,
+    unsigned int mram_offset,
+    enum transfer_component_id prepare_component,
+    enum transfer_component_id push_component,
+    struct transfer_component_timing *sample_timings,
+    struct timing_snapshot *boundary)
+{
+    struct dpu_set_t dpu;
+    uint32_t i = 0;
+
+    if (sample_timings != NULL)
+        sample_timings[prepare_component].start = *boundary;
+    DPU_FOREACH(dpu_set, dpu, i)
+        DPU_ASSERT(dpu_prepare_xfer(dpu, buffer + per_dpu_elements * i));
+    if (sample_timings != NULL) {
+        *boundary = take_timing_snapshot();
+        sample_timings[prepare_component].end = *boundary;
+        sample_timings[push_component].start = *boundary;
+    }
+    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
+        DPU_MRAM_HEAP_POINTER_NAME, mram_offset,
+        per_dpu_elements * sizeof(T), DPU_XFER_DEFAULT));
+    if (sample_timings != NULL) {
+        *boundary = take_timing_snapshot();
+        sample_timings[push_component].end = *boundary;
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -435,12 +470,17 @@ main(int argc, char **argv)
     const char *requested_mode = getenv("VA_ALLOCATION_MODE");
     const char *configuration = requested_mode == NULL ? "configured" : requested_mode;
     const char *profile = getenv("VA_DPU_PROFILE");
+    const char *transfer_order = env_or("VA_TRANSFER_ORDER", "AB");
     const char *trace_path = getenv("VA_TRACE_CSV");
     const char *transfer_trace_path = getenv("VA_TRANSFER_BREAKDOWN_CSV");
     bool transfer_trace_enabled =
         transfer_trace_path != NULL && transfer_trace_path[0] != '\0';
     uint64_t setup_start_ns = raw_time_ns();
 
+    if (strcmp(transfer_order, "AB") != 0 && strcmp(transfer_order, "BA") != 0) {
+        fprintf(stderr, "VA_TRANSFER_ORDER must be AB or BA\n");
+        return EXIT_FAILURE;
+    }
     if (profile != NULL && profile[0] == '\0')
         profile = NULL;
     if (strcmp(configuration, "single") == 0) {
@@ -503,6 +543,7 @@ main(int argc, char **argv)
     printf("Allocated %u DPU(s) across %u rank(s)\n", nr_of_dpus, nr_of_ranks);
     printf("NR_TASKLETS\t%d\tBL\t%d\tINPUT_ELEMENTS\t%u\n",
         NR_TASKLETS, BL, input_size);
+    printf("VA_TRANSFER_ORDER\t%s\n", transfer_order);
 
     for (uint32_t i = 0; i < nr_of_dpus - 1; ++i) {
         input_arguments[i].size = input_size_dpu_8bytes * sizeof(T);
@@ -546,39 +587,23 @@ main(int argc, char **argv)
         if (sample_timings != NULL) {
             boundary = take_timing_snapshot();
             sample_timings[COMPONENT_PUSH_ARGS].end = boundary;
-            sample_timings[COMPONENT_PREPARE_A].start = boundary;
         }
 
-        DPU_FOREACH(dpu_set, dpu, i)
-            DPU_ASSERT(dpu_prepare_xfer(dpu, bufferA + input_size_dpu_8bytes * i));
-        if (sample_timings != NULL) {
-            boundary = take_timing_snapshot();
-            sample_timings[COMPONENT_PREPARE_A].end = boundary;
-            sample_timings[COMPONENT_PUSH_A].start = boundary;
+        if (strcmp(transfer_order, "AB") == 0) {
+            prepare_and_push_mram(dpu_set, bufferA, input_size_dpu_8bytes, 0,
+                COMPONENT_PREPARE_A, COMPONENT_PUSH_A, sample_timings, &boundary);
+            prepare_and_push_mram(dpu_set, bufferB, input_size_dpu_8bytes,
+                input_size_dpu_8bytes * sizeof(T), COMPONENT_PREPARE_B,
+                COMPONENT_PUSH_B, sample_timings, &boundary);
+        } else {
+            prepare_and_push_mram(dpu_set, bufferB, input_size_dpu_8bytes,
+                input_size_dpu_8bytes * sizeof(T), COMPONENT_PREPARE_B,
+                COMPONENT_PUSH_B, sample_timings, &boundary);
+            prepare_and_push_mram(dpu_set, bufferA, input_size_dpu_8bytes, 0,
+                COMPONENT_PREPARE_A, COMPONENT_PUSH_A, sample_timings, &boundary);
         }
-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-            DPU_MRAM_HEAP_POINTER_NAME, 0, input_size_dpu_8bytes * sizeof(T),
-            DPU_XFER_DEFAULT));
-        if (sample_timings != NULL) {
-            boundary = take_timing_snapshot();
-            sample_timings[COMPONENT_PUSH_A].end = boundary;
-            sample_timings[COMPONENT_PREPARE_B].start = boundary;
-        }
-
-        DPU_FOREACH(dpu_set, dpu, i)
-            DPU_ASSERT(dpu_prepare_xfer(dpu, bufferB + input_size_dpu_8bytes * i));
-        if (sample_timings != NULL) {
-            boundary = take_timing_snapshot();
-            sample_timings[COMPONENT_PREPARE_B].end = boundary;
-            sample_timings[COMPONENT_PUSH_B].start = boundary;
-        }
-        DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-            DPU_MRAM_HEAP_POINTER_NAME, input_size_dpu_8bytes * sizeof(T),
-            input_size_dpu_8bytes * sizeof(T), DPU_XFER_DEFAULT));
         if (measured) {
             if (sample_timings != NULL) {
-                boundary = take_timing_snapshot();
-                sample_timings[COMPONENT_PUSH_B].end = boundary;
                 h2d_ns[sample] = boundary.wall_ns - phase_start;
             } else {
                 h2d_ns[sample] = raw_time_ns() - phase_start;
@@ -656,7 +681,7 @@ main(int argc, char **argv)
     printf(status ? "[OK] Outputs are equal\n" : "[ERROR] Outputs differ!\n");
 
     if (trace_path != NULL && trace_path[0] != '\0') {
-        write_trace(trace_path, configuration, nr_of_dpus, nr_of_ranks,
+        write_trace(trace_path, configuration, transfer_order, nr_of_dpus, nr_of_ranks,
             input_size, input_size_dpu_8bytes, p.n_reps, cpu_ns, h2d_ns,
             kernel_ns, d2h_ns, setup_ns, verify_ns, status,
             expected_checksum, actual_checksum);

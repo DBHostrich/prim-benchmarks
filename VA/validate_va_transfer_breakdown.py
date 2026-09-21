@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -155,6 +156,22 @@ def validate_clock_interval(row: dict[str, str], prefix: str) -> None:
         fail(f"{row['_source_path']}: invalid {prefix} interval")
 
 
+def detect_transfer_order(indexed: dict[str, dict[str, str]]) -> str:
+    ordered = tuple(sorted(
+        H2D_COMPONENTS,
+        key=lambda component: as_int(indexed[component], "wall_start_ns"),
+    ))
+    if ordered == H2D_COMPONENTS:
+        return "AB"
+    ba_components = (
+        "PREPARE_ARGS", "PUSH_ARGS", "PREPARE_B", "PUSH_B", "PREPARE_A", "PUSH_A",
+    )
+    if ordered == ba_components:
+        return "BA"
+    fail(f"H2D component order differs: {ordered}")
+    raise AssertionError
+
+
 def validate_app_rows(
     rows: list[dict[str, str]],
     input_elements: int,
@@ -222,7 +239,12 @@ def validate_app_rows(
         if set(indexed) != set(COMPONENTS):
             fail(f"{key}: component set differs")
         totals: dict[str, int] = {}
-        for phase, components in (("H2D", H2D_COMPONENTS), ("D2H", D2H_COMPONENTS)):
+        h2d_components = tuple(sorted(
+            H2D_COMPONENTS,
+            key=lambda component: as_int(indexed[component], "wall_start_ns"),
+        ))
+        detect_transfer_order(indexed)
+        for phase, components in (("H2D", h2d_components), ("D2H", D2H_COMPONENTS)):
             for left, right in zip(components, components[1:]):
                 for prefix in ("wall", "thread_cpu", "process_cpu"):
                     if as_int(indexed[left], f"{prefix}_end_ns") != as_int(indexed[right], f"{prefix}_start_ns"):
@@ -316,10 +338,12 @@ def validate_sdk_rows(
         fail(f"SDK run IDs differ from application run IDs")
 
     derived: list[dict[str, object]] = []
-    expected_pushes = (
-        ("PUSH_ARGS", "H2D", "WRAM"), ("PUSH_A", "H2D", "MRAM"),
-        ("PUSH_B", "H2D", "MRAM"), ("PUSH_C", "D2H", "MRAM"),
-    )
+    expected_pushes = {
+        "PUSH_ARGS": ("H2D", "WRAM"),
+        "PUSH_A": ("H2D", "MRAM"),
+        "PUSH_B": ("H2D", "MRAM"),
+        "PUSH_C": ("D2H", "MRAM"),
+    }
     for run_id, run_rows in by_run.items():
         pushes = sorted(
             (row for row in run_rows if row["event_kind"] == "PUSH_CALL"),
@@ -328,20 +352,37 @@ def validate_sdk_rows(
         if len(pushes) != len(expected_pushes):
             fail(f"{run_id}: expected four PUSH_CALL rows, found {len(pushes)}")
         backends = [row for row in run_rows if row["event_kind"] == "BACKEND_TRANSFER"]
+        if len(backends) != 3:
+            fail(f"{run_id}: expected three BACKEND_TRANSFER rows, found {len(backends)}")
         matched_backend_ids: set[int] = set()
         app_index = app_by_run[run_id]
-        for push, (component, direction, memory_type) in zip(pushes, expected_pushes):
+        pushes_by_component: dict[str, dict[str, str]] = {}
+        for push in pushes:
+            candidates = []
+            for component, (direction, memory_type) in expected_pushes.items():
+                if component in pushes_by_component:
+                    continue
+                app_row = app_index[component]
+                if push["direction"] != direction or push["memory_type"] != memory_type:
+                    continue
+                if any(as_int(push, field) != as_int(app_row, field)
+                       for field in ("bytes_per_dpu", "aggregate_bytes")):
+                    continue
+                if (
+                    as_int(app_row, "wall_start_ns") <= as_int(push, "wall_start_ns")
+                    and as_int(push, "wall_end_ns") <= as_int(app_row, "wall_end_ns")
+                ):
+                    candidates.append(component)
+            if len(candidates) != 1:
+                fail(f"{run_id}: SDK PUSH_CALL maps to {len(candidates)} application components")
+            pushes_by_component[candidates[0]] = push
+        if set(pushes_by_component) != set(expected_pushes):
+            fail(f"{run_id}: SDK PUSH_CALL component set differs")
+
+        for component in ("PUSH_ARGS", "PUSH_A", "PUSH_B", "PUSH_C"):
+            push = pushes_by_component[component]
+            direction, memory_type = expected_pushes[component]
             app_row = app_index[component]
-            if push["direction"] != direction or push["memory_type"] != memory_type:
-                fail(f"{run_id}: SDK metadata differs for {component}")
-            for field in ("bytes_per_dpu", "aggregate_bytes"):
-                if as_int(push, field) != as_int(app_row, field):
-                    fail(f"{run_id}: SDK {field} differs for {component}")
-            if not (
-                as_int(app_row, "wall_start_ns") <= as_int(push, "wall_start_ns")
-                and as_int(push, "wall_end_ns") <= as_int(app_row, "wall_end_ns")
-            ):
-                fail(f"{run_id}: SDK PUSH_CALL escapes application {component}")
             if memory_type == "WRAM":
                 continue
             candidates = [
@@ -373,6 +414,8 @@ def validate_sdk_rows(
                 "c_tail_wall_ns": tail,
                 "backend_process_cpu_ns": as_int(backend, "process_cpu_duration_ns"),
             })
+        if len(matched_backend_ids) != len(backends):
+            fail(f"{run_id}: unmatched BACKEND_TRANSFER rows remain")
     return derived
 
 
@@ -465,8 +508,19 @@ def validate_provenance(root: Path) -> dict[str, object]:
             fail(f"provenance file is empty: {path}")
         files[name] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
     dynamic = (root / "dynamic_library_resolution.txt").read_text()
-    if str(root.resolve()) not in dynamic or "libdpu.so" not in dynamic:
-        fail("dynamic library evidence does not resolve libdpu inside RESULT_ROOT")
+    library_match = re.search(
+        r"libdpu\.so\.2025\.1\s*=>\s*(\S+/shadow_lib/libdpu\.so\.2025\.1)",
+        dynamic,
+    )
+    expected_suffix = f"/{root.name}/shadow_lib/libdpu.so.2025.1"
+    if library_match is None or not library_match.group(1).endswith(expected_suffix):
+        fail("dynamic library evidence does not resolve libdpu inside the collected result")
+    local_library = root / "shadow_lib" / "libdpu.so.2025.1"
+    if not local_library.is_file():
+        fail(f"instrumented library is absent: {local_library}")
+    recorded_hash = (root / "instrumented_library.sha256").read_text().split()[0]
+    if recorded_hash != sha256_file(local_library):
+        fail("instrumented library hash differs")
     if "libdpuhw.so" not in dynamic:
         fail("dynamic library evidence lacks the hardware backend")
     backend_evidence = (root / "system_backend_libraries.txt").read_text()

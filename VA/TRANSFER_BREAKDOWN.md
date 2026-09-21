@@ -44,16 +44,66 @@ The summary manifest reports `functional_status` and `timing_status`
 separately. `timing_status=REPORTED` requires p50 shifts within 3 percent and
 p90 shifts within 5 percent for H2D and D2H.
 
+## Coupled backend size sweep
+
+The SDK hardware backend interleaves CPU loads, AVX512 transforms, accesses to
+the memory-mapped PIM region, and fences inside the same worker loops. The size
+sweep therefore treats `BACKEND_TRANSFER` as one coupled execution interval.
+Process CPU time quantifies worker activity without converting it into an
+additional wall-clock term.
+
+Run the sweep on the hardware host:
+
+```bash
+RESULT_ROOT="/tmp/va_transfer_size_sweep_$(date +%Y%m%d_%H%M%S)" \
+SDK_SOURCE_ROOT="/home/yiwei/bdang/mux-switch-oltpim/src/oltpim/oltpim-engine/upmem-sdk-runtime" \
+NUMA_NODE=0 \
+bash VA/run_hw_transfer_size_sweep.sh
+```
+
+The default sweep fixes `backend=hw,regionMode=perf` and uses these aggregate
+input element counts:
+
+```text
+8192 16384 32768 131072 524288 1048576 2621440 4194304 8388608
+```
+
+They map to 512 B through 512 KiB per DPU on a 64-DPU rank and cover the SDK
+worker thresholds. Each size has five warmup processes and thirty formal
+processes. Formal samples alternate `AB` and `BA`, yielding fifteen samples per
+order. Stock versus instrumented overhead is checked at the smallest, anchor,
+and largest sizes.
+
+The sweep adds these interfaces:
+
+```text
+VA_TRANSFER_COLLECTION_MODE
+VA_SWEEP_INPUT_ELEMENTS
+VA_SWEEP_OVERHEAD_ELEMENTS
+VA_TRANSFER_ORDER
+```
+
+The output directory contains `collection_plan.csv` plus these summary files:
+
+```text
+summary/coupled_backend_samples.csv
+summary/coupled_backend_summary.csv
+summary/overhead_comparison.csv
+summary/va_transfer_size_sweep_manifest.json
+```
+
 Copy the result from the local workstation after the hardware run:
 
 ```bash
 mkdir -p /home/bdang/copy_result/2026_9_21
+RESULT_NAME="va_transfer_size_sweep_<timestamp>"
 rsync -avhP \
-  yiwei@feta.cs.northwestern.edu:/tmp/va_transfer_breakdown_<timestamp>/ \
-  /home/bdang/copy_result/2026_9_21/va_transfer_breakdown_<timestamp>/
+  "yiwei@feta.cs.northwestern.edu:/tmp/${RESULT_NAME}/" \
+  "/home/bdang/copy_result/2026_9_21/${RESULT_NAME}/"
 rsync -avhP \
-  yiwei@feta.cs.northwestern.edu:/tmp/va_transfer_breakdown_<timestamp>.tar.gz* \
+  "yiwei@feta.cs.northwestern.edu:/tmp/${RESULT_NAME}.tar.gz" \
+  "yiwei@feta.cs.northwestern.edu:/tmp/${RESULT_NAME}.tar.gz.sha256" \
   /home/bdang/copy_result/2026_9_21/
 cd /home/bdang/copy_result/2026_9_21
-sha256sum -c va_transfer_breakdown_<timestamp>.tar.gz.sha256
+sha256sum -c "${RESULT_NAME}.tar.gz.sha256"
 ```

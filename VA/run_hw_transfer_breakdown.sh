@@ -19,13 +19,20 @@ if [[ -e "$RESULT_ROOT" ]]; then
 fi
 
 NUMA_NODE="${NUMA_NODE:-0}"
+COLLECTION_MODE="${VA_TRANSFER_COLLECTION_MODE:-anchor}"
 N_WARMUP_PROCESSES="${N_WARMUP_PROCESSES:-5}"
 N_REPS_PROCESSES="${N_REPS_PROCESSES:-30}"
 N_OVERHEAD_PROCESSES="${N_OVERHEAD_PROCESSES:-10}"
 INPUT_ELEMENTS="${INPUT_ELEMENTS:-2621440}"
 TASKLETS="${TASKLETS:-16}"
 BLOCK_SIZE_LOG2="${BLOCK_SIZE_LOG2:-10}"
-DPU_PROFILE="${VA_DPU_PROFILE:-backend=hw}"
+if [[ "$COLLECTION_MODE" == "sweep" ]]; then
+    DPU_PROFILE="${VA_DPU_PROFILE:-backend=hw,regionMode=perf}"
+else
+    DPU_PROFILE="${VA_DPU_PROFILE:-backend=hw}"
+fi
+SWEEP_INPUT_ELEMENTS_TEXT="${VA_SWEEP_INPUT_ELEMENTS:-8192 16384 32768 131072 524288 1048576 2621440 4194304 8388608}"
+SWEEP_OVERHEAD_ELEMENTS_TEXT="${VA_SWEEP_OVERHEAD_ELEMENTS:-8192 2621440 8388608}"
 BUILD_JOBS="${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 SDK_VERSION="2025.1.0"
 SDK_HASH_MANIFEST="$SCRIPT_DIR/sdk/upmem-2025.1.0-source.sha256"
@@ -35,12 +42,28 @@ stage() {
     printf '[VA] %s\n' "$1"
 }
 
-if [[ "$N_WARMUP_PROCESSES" != "5" || "$N_REPS_PROCESSES" != "30" ||
-      "$INPUT_ELEMENTS" != "2621440" || "$TASKLETS" != "16" ||
-      "$BLOCK_SIZE_LOG2" != "10" ]]; then
-    echo "Formal VA collection requires 5 warmup processes, 30 samples, 2621440 elements, 16 tasklets, and BL=10" >&2
-    exit 1
-fi
+case "$COLLECTION_MODE" in
+    anchor)
+        if [[ "$N_WARMUP_PROCESSES" != "5" || "$N_REPS_PROCESSES" != "30" ||
+              "$INPUT_ELEMENTS" != "2621440" || "$TASKLETS" != "16" ||
+              "$BLOCK_SIZE_LOG2" != "10" ]]; then
+            echo "Formal VA collection requires 5 warmup processes, 30 samples, 2621440 elements, 16 tasklets, and BL=10" >&2
+            exit 1
+        fi
+        ;;
+    sweep)
+        if [[ "$N_WARMUP_PROCESSES" != "5" || "$N_REPS_PROCESSES" != "30" ||
+              "$N_OVERHEAD_PROCESSES" != "10" || "$TASKLETS" != "16" ||
+              "$BLOCK_SIZE_LOG2" != "10" ]]; then
+            echo "Formal VA sweep requires 5 warmups, 30 samples, 10 overhead samples, 16 tasklets, and BL=10" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "VA_TRANSFER_COLLECTION_MODE must be anchor or sweep: $COLLECTION_MODE" >&2
+        exit 1
+        ;;
+esac
 if (( N_OVERHEAD_PROCESSES < 2 )); then
     echo "N_OVERHEAD_PROCESSES must be at least 2" >&2
     exit 1
@@ -52,7 +75,43 @@ case ",$DPU_PROFILE," in
         exit 1
         ;;
 esac
-for command_name in cmake patch perf numactl sha256sum readelf ldd; do
+if [[ "$COLLECTION_MODE" == "sweep" ]]; then
+    case ",$DPU_PROFILE," in
+        *,regionMode=perf,*) ;;
+        *)
+            echo "VA_DPU_PROFILE must select regionMode=perf for the size sweep: $DPU_PROFILE" >&2
+            exit 1
+            ;;
+    esac
+fi
+read -r -a SWEEP_INPUT_ELEMENTS <<< "$SWEEP_INPUT_ELEMENTS_TEXT"
+read -r -a SWEEP_OVERHEAD_ELEMENTS <<< "$SWEEP_OVERHEAD_ELEMENTS_TEXT"
+if [[ "$COLLECTION_MODE" == "sweep" ]]; then
+    declare -A sweep_seen=()
+    for input_elements in "${SWEEP_INPUT_ELEMENTS[@]}"; do
+        if [[ ! "$input_elements" =~ ^[0-9]+$ ]] || (( input_elements <= 0 )) ||
+           (( input_elements % 64 != 0 )) || (( (input_elements / 64) % 2 != 0 )); then
+            echo "invalid sweep input size: $input_elements" >&2
+            exit 1
+        fi
+        if [[ -n "${sweep_seen[$input_elements]+present}" ]]; then
+            echo "duplicate sweep input size: $input_elements" >&2
+            exit 1
+        fi
+        sweep_seen[$input_elements]=1
+    done
+    for input_elements in "${SWEEP_OVERHEAD_ELEMENTS[@]}"; do
+        if [[ -z "${sweep_seen[$input_elements]+present}" ]]; then
+            echo "overhead input size is outside the sweep: $input_elements" >&2
+            exit 1
+        fi
+    done
+    if [[ -z "${sweep_seen[$INPUT_ELEMENTS]+present}" ]]; then
+        echo "anchor INPUT_ELEMENTS must be part of the sweep: $INPUT_ELEMENTS" >&2
+        exit 1
+    fi
+fi
+for command_name in cmake patch perf numactl sha256sum readelf ldd python3 tar; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "$command_name is required" >&2
         exit 1
@@ -188,8 +247,10 @@ stage "build VA host and DPU binaries"
 sha256sum bin/host_code bin/dpu_code > "$RESULT_ROOT/binaries.sha256"
 sha256sum Makefile host/app.c dpu/task.c support/common.h support/params.h \
     validate_va_baseline_trace.py validate_va_transfer_breakdown.py \
+    validate_va_transfer_sweep.py test_validate_va_baseline_trace.py \
     test_validate_va_transfer_breakdown.py \
-    run_hw_transfer_breakdown.sh TRANSFER_BREAKDOWN.md \
+    test_validate_va_transfer_sweep.py run_hw_transfer_breakdown.sh \
+    run_hw_transfer_size_sweep.sh TRANSFER_BREAKDOWN.md \
     sdk/upmem-2025.1.0-source.sha256 \
     sdk/upmem-2025.1.0-transfer-trace.patch sdk/README.md \
     > "$RESULT_ROOT/source.sha256"
@@ -206,7 +267,10 @@ VA_SDK_VERSION="$SDK_VERSION"
 VA_HOST_NUMA_NODE="$NUMA_NODE"
 
 printf '%s\n' \
+    "VA_TRANSFER_COLLECTION_MODE=$COLLECTION_MODE" \
     "INPUT_ELEMENTS=$INPUT_ELEMENTS" \
+    "VA_SWEEP_INPUT_ELEMENTS=$SWEEP_INPUT_ELEMENTS_TEXT" \
+    "VA_SWEEP_OVERHEAD_ELEMENTS=$SWEEP_OVERHEAD_ELEMENTS_TEXT" \
     "TASKLETS=$TASKLETS" \
     "BLOCK_SIZE_LOG2=$BLOCK_SIZE_LOG2" \
     "SCALING=strong" \
@@ -244,12 +308,14 @@ require_correct_result() {
 run_va() {
     local library_mode="$1"
     local allocation_mode="$2"
-    local run_id="$3"
-    local app_trace="$4"
-    local baseline_trace="$5"
-    local sdk_trace="$6"
-    local perf_trace="$7"
-    local log_path="$8"
+    local input_elements="$3"
+    local transfer_order="$4"
+    local run_id="$5"
+    local app_trace="$6"
+    local baseline_trace="$7"
+    local sdk_trace="$8"
+    local perf_trace="$9"
+    local log_path="${10}"
     local library_path
     local run_rc=0
     local -a command_line
@@ -261,13 +327,14 @@ run_va() {
     fi
     command_line=(
         numactl --cpunodebind="$NUMA_NODE" --membind="$NUMA_NODE"
-        ./bin/host_code -w 0 -e 1 -i "$INPUT_ELEMENTS" -x 1
+        ./bin/host_code -w 0 -e 1 -i "$input_elements" -x 1
     )
     (
         export LD_LIBRARY_PATH="$library_path"
         export UPMEM_RUNTIME_LIBRARY_PATH="$SHADOW_LIB"
         export VA_ALLOCATION_MODE="$allocation_mode"
         export VA_DPU_PROFILE="$DPU_PROFILE"
+        export VA_TRANSFER_ORDER="$transfer_order"
         export VA_TRACE_RUN_ID="$run_id"
         export VA_TRACE_REPEAT_ID=1
         if [[ "$app_trace" == "-" ]]; then
@@ -307,10 +374,10 @@ run_va() {
 
 mkdir -p "$RESULT_ROOT/smoke"
 stage "run single-DPU and full-rank smoke checks"
-run_va instrumented single smoke_single \
+run_va instrumented single "$INPUT_ELEMENTS" AB smoke_single \
     "$RESULT_ROOT/smoke/single_app.csv" "$RESULT_ROOT/smoke/single_baseline.csv" \
     "$RESULT_ROOT/smoke/single_sdk.csv" - "$RESULT_ROOT/smoke/single.log"
-run_va instrumented rank smoke_rank \
+run_va instrumented rank "$INPUT_ELEMENTS" AB smoke_rank \
     "$RESULT_ROOT/smoke/rank_app.csv" "$RESULT_ROOT/smoke/rank_baseline.csv" \
     "$RESULT_ROOT/smoke/rank_sdk.csv" - "$RESULT_ROOT/smoke/rank.log"
 python3 "$SCRIPT_DIR/validate_va_baseline_trace.py" \
@@ -324,38 +391,136 @@ python3 "$SCRIPT_DIR/validate_va_baseline_trace.py" \
     "$RESULT_ROOT/smoke/single_baseline.csv" "$RESULT_ROOT/smoke/rank_baseline.csv" \
     > "$RESULT_ROOT/smoke/validation.log" 2>&1
 
-mkdir -p "$RESULT_ROOT/overhead/stock" "$RESULT_ROOT/overhead/instrumented"
-stage "collect stock and instrumented overhead samples"
-for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
-    rep_id="$(printf '%02d' "$rep")"
-    run_va stock rank "overhead_stock_$rep_id" \
-        "$RESULT_ROOT/overhead/stock/app_$rep_id.csv" - - - \
-        "$RESULT_ROOT/overhead/stock/run_$rep_id.log"
-    run_va instrumented rank "overhead_instrumented_$rep_id" \
-        "$RESULT_ROOT/overhead/instrumented/app_$rep_id.csv" - \
-        "$RESULT_ROOT/overhead/instrumented/sdk_$rep_id.csv" - \
-        "$RESULT_ROOT/overhead/instrumented/run_$rep_id.log"
-done
+order_for_rep() {
+    if (( $1 % 2 == 1 )); then
+        printf 'AB\n'
+    else
+        printf 'BA\n'
+    fi
+}
 
-mkdir -p "$RESULT_ROOT/warmup"
-stage "run warmup processes"
-for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
-    rep_id="$(printf '%02d' "$rep")"
-    run_va instrumented rank "warmup_$rep_id" - - - - \
-        "$RESULT_ROOT/warmup/run_$rep_id.log"
-done
+if [[ "$COLLECTION_MODE" == "anchor" ]]; then
+    mkdir -p "$RESULT_ROOT/overhead/stock" "$RESULT_ROOT/overhead/instrumented"
+    stage "collect stock and instrumented overhead samples"
+    for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
+        rep_id="$(printf '%02d' "$rep")"
+        run_va stock rank "$INPUT_ELEMENTS" AB "overhead_stock_$rep_id" \
+            "$RESULT_ROOT/overhead/stock/app_$rep_id.csv" - - - \
+            "$RESULT_ROOT/overhead/stock/run_$rep_id.log"
+        run_va instrumented rank "$INPUT_ELEMENTS" AB "overhead_instrumented_$rep_id" \
+            "$RESULT_ROOT/overhead/instrumented/app_$rep_id.csv" - \
+            "$RESULT_ROOT/overhead/instrumented/sdk_$rep_id.csv" - \
+            "$RESULT_ROOT/overhead/instrumented/run_$rep_id.log"
+    done
 
-mkdir -p "$RESULT_ROOT/formal"
-stage "collect formal full-rank samples"
-for rep in $(seq 1 "$N_REPS_PROCESSES"); do
-    rep_id="$(printf '%02d' "$rep")"
-    run_va instrumented rank "formal_$rep_id" \
-        "$RESULT_ROOT/formal/app_$rep_id.csv" \
-        "$RESULT_ROOT/formal/baseline_$rep_id.csv" \
-        "$RESULT_ROOT/formal/sdk_$rep_id.csv" \
-        "$RESULT_ROOT/formal/perf_$rep_id.csv" \
-        "$RESULT_ROOT/formal/run_$rep_id.log"
-done
+    mkdir -p "$RESULT_ROOT/warmup"
+    stage "run warmup processes"
+    for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
+        rep_id="$(printf '%02d' "$rep")"
+        run_va instrumented rank "$INPUT_ELEMENTS" AB "warmup_$rep_id" - - - - \
+            "$RESULT_ROOT/warmup/run_$rep_id.log"
+    done
+
+    mkdir -p "$RESULT_ROOT/formal"
+    stage "collect formal full-rank samples"
+    for rep in $(seq 1 "$N_REPS_PROCESSES"); do
+        rep_id="$(printf '%02d' "$rep")"
+        run_va instrumented rank "$INPUT_ELEMENTS" AB "formal_$rep_id" \
+            "$RESULT_ROOT/formal/app_$rep_id.csv" \
+            "$RESULT_ROOT/formal/baseline_$rep_id.csv" \
+            "$RESULT_ROOT/formal/sdk_$rep_id.csv" \
+            "$RESULT_ROOT/formal/perf_$rep_id.csv" \
+            "$RESULT_ROOT/formal/run_$rep_id.log"
+    done
+else
+    printf '%s\n' \
+        'kind,input_elements,bytes_per_dpu,transfer_order,replicate,library_mode,run_id' \
+        > "$RESULT_ROOT/collection_plan.csv"
+    for input_elements in "${SWEEP_INPUT_ELEMENTS[@]}"; do
+        bytes_per_dpu=$((input_elements / 64 * 4))
+        for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
+            rep_id="$(printf '%02d' "$rep")"
+            order="$(order_for_rep "$rep")"
+            printf 'warmup,%s,%s,%s,%s,instrumented,warmup_n%s_%s_%s\n' \
+                "$input_elements" "$bytes_per_dpu" "$order" "$rep" \
+                "$input_elements" "${order,,}" "$rep_id" \
+                >> "$RESULT_ROOT/collection_plan.csv"
+        done
+        for rep in $(seq 1 "$N_REPS_PROCESSES"); do
+            rep_id="$(printf '%02d' "$rep")"
+            order="$(order_for_rep "$rep")"
+            printf 'formal,%s,%s,%s,%s,instrumented,formal_n%s_%s_%s\n' \
+                "$input_elements" "$bytes_per_dpu" "$order" "$rep" \
+                "$input_elements" "${order,,}" "$rep_id" \
+                >> "$RESULT_ROOT/collection_plan.csv"
+        done
+    done
+    for input_elements in "${SWEEP_OVERHEAD_ELEMENTS[@]}"; do
+        bytes_per_dpu=$((input_elements / 64 * 4))
+        for library_mode in stock instrumented; do
+            for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
+                rep_id="$(printf '%02d' "$rep")"
+                order="$(order_for_rep "$rep")"
+                printf 'overhead,%s,%s,%s,%s,%s,overhead_%s_n%s_%s_%s\n' \
+                    "$input_elements" "$bytes_per_dpu" "$order" "$rep" \
+                    "$library_mode" "$library_mode" "$input_elements" \
+                    "${order,,}" "$rep_id" >> "$RESULT_ROOT/collection_plan.csv"
+            done
+        done
+    done
+
+    stage "collect stock and instrumented overhead sweep samples"
+    for input_elements in "${SWEEP_OVERHEAD_ELEMENTS[@]}"; do
+        mkdir -p "$RESULT_ROOT/overhead/n$input_elements/stock" \
+            "$RESULT_ROOT/overhead/n$input_elements/instrumented"
+        for rep in $(seq 1 "$N_OVERHEAD_PROCESSES"); do
+            rep_id="$(printf '%02d' "$rep")"
+            order="$(order_for_rep "$rep")"
+            order_slug="${order,,}"
+            run_id="overhead_stock_n${input_elements}_${order_slug}_${rep_id}"
+            run_va stock rank "$input_elements" "$order" "$run_id" \
+                "$RESULT_ROOT/overhead/n$input_elements/stock/app_${order_slug}_$rep_id.csv" \
+                - - - \
+                "$RESULT_ROOT/overhead/n$input_elements/stock/run_${order_slug}_$rep_id.log"
+            run_id="overhead_instrumented_n${input_elements}_${order_slug}_${rep_id}"
+            run_va instrumented rank "$input_elements" "$order" "$run_id" \
+                "$RESULT_ROOT/overhead/n$input_elements/instrumented/app_${order_slug}_$rep_id.csv" \
+                - "$RESULT_ROOT/overhead/n$input_elements/instrumented/sdk_${order_slug}_$rep_id.csv" - \
+                "$RESULT_ROOT/overhead/n$input_elements/instrumented/run_${order_slug}_$rep_id.log"
+        done
+    done
+
+    stage "run size-sweep warmup processes"
+    for input_elements in "${SWEEP_INPUT_ELEMENTS[@]}"; do
+        for rep in $(seq 1 "$N_WARMUP_PROCESSES"); do
+            rep_id="$(printf '%02d' "$rep")"
+            order="$(order_for_rep "$rep")"
+            order_slug="${order,,}"
+            run_dir="$RESULT_ROOT/warmup/n$input_elements/$order_slug"
+            mkdir -p "$run_dir"
+            run_va instrumented rank "$input_elements" "$order" \
+                "warmup_n${input_elements}_${order_slug}_${rep_id}" - - - - \
+                "$run_dir/run_$rep_id.log"
+        done
+    done
+
+    stage "collect formal full-rank size sweep"
+    for input_elements in "${SWEEP_INPUT_ELEMENTS[@]}"; do
+        stage "collect formal input_elements=$input_elements"
+        for rep in $(seq 1 "$N_REPS_PROCESSES"); do
+            rep_id="$(printf '%02d' "$rep")"
+            order="$(order_for_rep "$rep")"
+            order_slug="${order,,}"
+            run_dir="$RESULT_ROOT/formal/n$input_elements/$order_slug"
+            run_id="formal_n${input_elements}_${order_slug}_${rep_id}"
+            mkdir -p "$run_dir"
+            run_va instrumented rank "$input_elements" "$order" "$run_id" \
+                "$run_dir/app_$rep_id.csv" "$run_dir/baseline_$rep_id.csv" \
+                "$run_dir/sdk_$rep_id.csv" "$run_dir/perf_$rep_id.csv" \
+                "$run_dir/run_$rep_id.log"
+        done
+    done
+fi
 
 mkdir -p "$RESULT_ROOT/imc"
 stage "collect IMC status"
@@ -366,6 +531,7 @@ if perf list 2>/dev/null | grep -q 'uncore_imc.*cas_count_read'; then
         export UPMEM_RUNTIME_LIBRARY_PATH="$SHADOW_LIB"
         export VA_ALLOCATION_MODE=rank
         export VA_DPU_PROFILE="$DPU_PROFILE"
+        export VA_TRANSFER_ORDER=AB
         perf stat -a -x, -o "$RESULT_ROOT/imc/perf.csv" \
             -e 'uncore_imc_*/cas_count_read/' -e 'uncore_imc_*/cas_count_write/' -- \
             numactl --cpunodebind="$NUMA_NODE" --membind="$NUMA_NODE" \
@@ -386,29 +552,42 @@ else
     printf 'EVENT_UNAVAILABLE\n' > "$RESULT_ROOT/imc_status.txt"
 fi
 
-mapfile -t formal_app < <(find "$RESULT_ROOT/formal" -type f -name 'app_*.csv' | sort)
-mapfile -t formal_sdk < <(find "$RESULT_ROOT/formal" -type f -name 'sdk_*.csv' | sort)
-mapfile -t formal_baseline < <(find "$RESULT_ROOT/formal" -type f -name 'baseline_*.csv' | sort)
-mapfile -t formal_perf < <(find "$RESULT_ROOT/formal" -type f -name 'perf_*.csv' | sort)
-mapfile -t stock_app < <(find "$RESULT_ROOT/overhead/stock" -type f -name 'app_*.csv' | sort)
-mapfile -t instrumented_app < <(find "$RESULT_ROOT/overhead/instrumented" -type f -name 'app_*.csv' | sort)
-
 set +e
 stage "validate traces and create archive"
-python3 "$SCRIPT_DIR/validate_va_transfer_breakdown.py" \
-    --app-trace "${formal_app[@]}" \
-    --sdk-trace "${formal_sdk[@]}" \
-    --baseline-trace "${formal_baseline[@]}" \
-    --stock-app-trace "${stock_app[@]}" \
-    --instrumented-app-trace "${instrumented_app[@]}" \
-    --perf "${formal_perf[@]}" \
-    --expected-reps "$N_REPS_PROCESSES" \
-    --input-elements "$INPUT_ELEMENTS" \
-    --tasklets "$TASKLETS" \
-    --block-size-log2 "$BLOCK_SIZE_LOG2" \
-    --provenance-root "$RESULT_ROOT" \
-    --output-dir "$RESULT_ROOT/summary" \
-    > "$RESULT_ROOT/validation.log" 2>&1
+if [[ "$COLLECTION_MODE" == "anchor" ]]; then
+    mapfile -t formal_app < <(find "$RESULT_ROOT/formal" -type f -name 'app_*.csv' | sort)
+    mapfile -t formal_sdk < <(find "$RESULT_ROOT/formal" -type f -name 'sdk_*.csv' | sort)
+    mapfile -t formal_baseline < <(find "$RESULT_ROOT/formal" -type f -name 'baseline_*.csv' | sort)
+    mapfile -t formal_perf < <(find "$RESULT_ROOT/formal" -type f -name 'perf_*.csv' | sort)
+    mapfile -t stock_app < <(find "$RESULT_ROOT/overhead/stock" -type f -name 'app_*.csv' | sort)
+    mapfile -t instrumented_app < <(find "$RESULT_ROOT/overhead/instrumented" -type f -name 'app_*.csv' | sort)
+    python3 "$SCRIPT_DIR/validate_va_transfer_breakdown.py" \
+        --app-trace "${formal_app[@]}" \
+        --sdk-trace "${formal_sdk[@]}" \
+        --baseline-trace "${formal_baseline[@]}" \
+        --stock-app-trace "${stock_app[@]}" \
+        --instrumented-app-trace "${instrumented_app[@]}" \
+        --perf "${formal_perf[@]}" \
+        --expected-reps "$N_REPS_PROCESSES" \
+        --input-elements "$INPUT_ELEMENTS" \
+        --tasklets "$TASKLETS" \
+        --block-size-log2 "$BLOCK_SIZE_LOG2" \
+        --provenance-root "$RESULT_ROOT" \
+        --output-dir "$RESULT_ROOT/summary" \
+        > "$RESULT_ROOT/validation.log" 2>&1
+else
+    python3 "$SCRIPT_DIR/validate_va_transfer_sweep.py" \
+        --result-root "$RESULT_ROOT" \
+        --input-elements "${SWEEP_INPUT_ELEMENTS[@]}" \
+        --overhead-input-elements "${SWEEP_OVERHEAD_ELEMENTS[@]}" \
+        --expected-reps-per-size "$N_REPS_PROCESSES" \
+        --expected-warmups-per-size "$N_WARMUP_PROCESSES" \
+        --expected-overhead-reps "$N_OVERHEAD_PROCESSES" \
+        --tasklets "$TASKLETS" \
+        --block-size-log2 "$BLOCK_SIZE_LOG2" \
+        --output-dir "$RESULT_ROOT/summary" \
+        > "$RESULT_ROOT/validation.log" 2>&1
+fi
 validation_rc=$?
 set -e
 
@@ -420,11 +599,11 @@ tar -czf "$ARCHIVE" -C "$(dirname "$RESULT_ROOT")" "$(basename "$RESULT_ROOT")"
 ) > "${ARCHIVE}.sha256"
 
 if [[ "$validation_rc" != "0" ]]; then
-    echo "FAIL VA transfer breakdown validation"
+    echo "FAIL VA transfer $COLLECTION_MODE validation"
     echo "Result: $RESULT_ROOT"
     echo "Archive: $ARCHIVE"
     exit "$validation_rc"
 fi
-echo "PASS VA transfer breakdown collection"
+echo "PASS VA transfer $COLLECTION_MODE collection"
 echo "Result: $RESULT_ROOT"
 echo "Archive: $ARCHIVE"

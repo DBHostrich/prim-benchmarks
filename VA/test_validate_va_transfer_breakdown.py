@@ -183,6 +183,22 @@ class ValidateVaTransferBreakdownTest(unittest.TestCase):
                 96,
             )
 
+    def test_accepts_ba_order_and_matches_sdk_by_interval(self):
+        app_rows = self.make_app_rows()
+        indexed = {row["component"]: row for row in app_rows}
+        clock_fields = (
+            "wall_start_ns", "wall_end_ns", "thread_cpu_start_ns", "thread_cpu_end_ns",
+            "process_cpu_start_ns", "process_cpu_end_ns",
+        )
+        for left, right in (("PREPARE_A", "PREPARE_B"), ("PUSH_A", "PUSH_B")):
+            for field in clock_fields:
+                indexed[left][field], indexed[right][field] = indexed[right][field], indexed[left][field]
+        groups, _totals = validator.validate_app_rows(app_rows, 2_621_440, 16, 10, 1)
+        run_key = next(iter(groups))
+        self.assertEqual(validator.detect_transfer_order(groups[run_key]), "BA")
+        derived = validator.validate_sdk_rows(self.make_sdk_rows(app_rows), groups)
+        self.assertEqual({row["component"] for row in derived}, {"PUSH_A", "PUSH_B", "PUSH_C"})
+
     def test_baseline_phase_sum_and_bytes(self):
         app_rows = self.make_app_rows()
         groups, totals = validator.validate_app_rows(app_rows, 2_621_440, 16, 10, 1)
@@ -268,8 +284,15 @@ class ValidateVaTransferBreakdownTest(unittest.TestCase):
                 (root / name).write_text("evidence\n")
             (root / "sdk_source_baseline_check.txt").write_text("api/CMakeLists.txt: OK\n")
             (root / "sdk_patch_check.txt").write_text("PATCH_APPLIED=PASS\n")
+            (root / "shadow_lib").mkdir()
+            instrumented = root / "shadow_lib" / "libdpu.so.2025.1"
+            instrumented.write_bytes(b"instrumented libdpu fixture\n")
+            (root / "instrumented_library.sha256").write_text(
+                f"{validator.sha256_file(instrumented)}  /tmp/{root.name}/shadow_lib/libdpu.so.2025.1\n"
+            )
             (root / "dynamic_library_resolution.txt").write_text(
-                f"libdpu.so => {root}/shadow_lib/libdpu.so.2025.1\nlibdpuhw.so\n"
+                f"libdpu.so.2025.1 => /tmp/{root.name}/shadow_lib/libdpu.so.2025.1\n"
+                "libdpuhw.so\n"
             )
             (root / "system_backend_libraries.txt").write_text(
                 "libdpuhw.so=/usr/lib/libdpuhw.so.2025.1\n"
