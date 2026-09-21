@@ -1,0 +1,564 @@
+diff --git a/api/CMakeLists.txt b/api/CMakeLists.txt
+index 1bef047..4a3def5 100644
+--- a/api/CMakeLists.txt
++++ b/api/CMakeLists.txt
+@@ -60,6 +60,7 @@ set(SOURCES
+         src/dpu_memory.c
+         src/dpu_rank_handler_allocator.c
+         src/dpu_runner.c
++        src/dpu_transfer_trace.c
+ 
+         src/runtime_info.c
+ 
+diff --git a/api/src/api/dpu_memory.c b/api/src/api/dpu_memory.c
+index e7ba8b8..e8d31a0 100644
+--- a/api/src/api/dpu_memory.c
++++ b/api/src/api/dpu_memory.c
+@@ -16,6 +16,7 @@
+ #include <dpu_internals.h>
+ #include <dpu_attributes.h>
+ #include <dpu_thread_job.h>
++#include <dpu_transfer_trace.h>
+ #include <pthread.h>
+ 
+ #define IRAM_MASK (0x80000000u)
+@@ -733,21 +734,36 @@ dpu_push_xfer(struct dpu_set_t dpu_set,
+     size_t length,
+     dpu_xfer_flags_t flags)
+ {
+-    LOG_FN(DEBUG, "%s, %s, %d, %zd, 0x%x", dpu_transfer_to_string(xfer), symbol_name, symbol_offset, length, flags);
+-
++    struct upmem_transfer_trace_snapshot trace_start = upmem_transfer_trace_snapshot();
++    struct upmem_transfer_trace_snapshot trace_end;
++    enum upmem_transfer_trace_memory trace_memory = UPMEM_TRACE_MEMORY_UNKNOWN;
+     dpu_error_t status;
+     struct dpu_program_t *program;
+     struct dpu_symbol_t symbol;
+ 
++    LOG_FN(DEBUG, "%s, %s, %d, %zd, 0x%x", dpu_transfer_to_string(xfer), symbol_name, symbol_offset, length, flags);
++
+     if ((status = dpu_get_common_program(&dpu_set, &program)) != DPU_OK) {
+-        return status;
++        goto trace_and_return;
+     }
+ 
+     if ((status = dpu_get_symbol(program, symbol_name, &symbol)) != DPU_OK) {
+-        return status;
++        goto trace_and_return;
+     }
+ 
+-    return dpu_push_xfer_symbol(dpu_set, xfer, symbol, symbol_offset, length, flags);
++    if ((symbol.address & IRAM_MASK) == IRAM_MASK)
++        trace_memory = UPMEM_TRACE_MEMORY_IRAM;
++    else if ((symbol.address & MRAM_MASK) == MRAM_MASK)
++        trace_memory = UPMEM_TRACE_MEMORY_MRAM;
++    else
++        trace_memory = UPMEM_TRACE_MEMORY_WRAM;
++    status = dpu_push_xfer_symbol(dpu_set, xfer, symbol, symbol_offset, length, flags);
++
++trace_and_return:
++    trace_end = upmem_transfer_trace_snapshot();
++    upmem_transfer_trace_push_call(trace_start, trace_end, dpu_set, xfer,
++        trace_memory, length, flags, status);
++    return status;
+ }
+ 
+ __API_SYMBOL__ dpu_error_t
+diff --git a/api/src/dpu_memory.c b/api/src/dpu_memory.c
+index c8dd138..04c0731 100644
+--- a/api/src/dpu_memory.c
++++ b/api/src/dpu_memory.c
+@@ -18,6 +18,7 @@
+ #include <dpu_config.h>
+ #include <dpu_debug.h>
+ #include <dpu_runner.h>
++#include <dpu_transfer_trace.h>
+ 
+ #include <dpu_rank.h>
+ #include <dpu_internals.h>
+@@ -504,7 +505,12 @@ dpu_copy_to_mrams(struct dpu_rank_t *rank, struct dpu_transfer_matrix *transfer_
+     if (rank->description->configuration.mram_access_by_dpu_only) {
+         status = copy_to_mrams_using_dpu_program(rank, transfer_matrix);
+     } else {
++        struct upmem_transfer_trace_snapshot trace_start = upmem_transfer_trace_snapshot();
++        struct upmem_transfer_trace_snapshot trace_end;
+         status = RANK_FEATURE(rank, copy_to_mrams)(rank, transfer_matrix);
++        trace_end = upmem_transfer_trace_snapshot();
++        upmem_transfer_trace_backend(trace_start, trace_end, rank,
++            UPMEM_TRACE_DIRECTION_H2D, transfer_matrix, status);
+     }
+ 
+     dpu_unlock_rank(rank);
+@@ -538,7 +544,12 @@ dpu_copy_from_mrams(struct dpu_rank_t *rank, struct dpu_transfer_matrix *transfe
+     if (rank->description->configuration.mram_access_by_dpu_only) {
+         status = copy_from_mrams_using_dpu_program(rank, transfer_matrix);
+     } else {
++        struct upmem_transfer_trace_snapshot trace_start = upmem_transfer_trace_snapshot();
++        struct upmem_transfer_trace_snapshot trace_end;
+         status = RANK_FEATURE(rank, copy_from_mrams)(rank, transfer_matrix);
++        trace_end = upmem_transfer_trace_snapshot();
++        upmem_transfer_trace_backend(trace_start, trace_end, rank,
++            UPMEM_TRACE_DIRECTION_D2H, transfer_matrix, status);
+     }
+ 
+     dpu_unlock_rank(rank);
+diff --git a/api/src/dpu_transfer_trace.c b/api/src/dpu_transfer_trace.c
+new file mode 100644
+index 0000000..e522359
+--- /dev/null
++++ b/api/src/dpu_transfer_trace.c
+@@ -0,0 +1,379 @@
++/* Copyright 2020 UPMEM. All rights reserved.
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#define _GNU_SOURCE
++
++#include <dpu_transfer_trace.h>
++
++#include <dpu_rank.h>
++#include <dpu_target_macros.h>
++#include <dpu_transfer_matrix.h>
++
++#include <errno.h>
++#include <inttypes.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++
++#define UPMEM_TRANSFER_TRACE_CAPACITY 4096u
++
++#define STRINGIFY_INNER(value) #value
++#define STRINGIFY(value) STRINGIFY_INNER(value)
++
++enum trace_event_kind {
++    TRACE_EVENT_PUSH_CALL,
++    TRACE_EVENT_BACKEND_TRANSFER,
++};
++
++struct trace_record {
++    atomic_bool committed;
++    uint64_t sequence;
++    pid_t pid;
++    pid_t tid;
++    enum trace_event_kind kind;
++    enum upmem_transfer_trace_direction direction;
++    enum upmem_transfer_trace_memory memory;
++    uint64_t bytes_per_dpu;
++    uint64_t aggregate_bytes;
++    int64_t rank_id;
++    uint32_t rank_count;
++    uint32_t dpu_count;
++    uint32_t xfer_flags;
++    dpu_error_t status;
++    struct upmem_transfer_trace_snapshot start;
++    struct upmem_transfer_trace_snapshot end;
++};
++
++static pthread_once_t trace_once = PTHREAD_ONCE_INIT;
++static struct trace_record *trace_records;
++static char *trace_path;
++static const char *trace_run_id;
++static atomic_uint_fast64_t trace_reserved;
++static atomic_uint_fast64_t trace_overflow;
++
++static void flush_trace(void);
++
++static void
++initialize_trace(void)
++{
++    const char *path = getenv("UPMEM_TRANSFER_TRACE_CSV");
++
++    if (path == NULL || path[0] == '\0')
++        return;
++    trace_path = strdup(path);
++    trace_records = calloc(UPMEM_TRANSFER_TRACE_CAPACITY, sizeof(*trace_records));
++    trace_run_id = getenv("UPMEM_TRANSFER_TRACE_RUN_ID");
++    if (trace_run_id == NULL || trace_run_id[0] == '\0')
++        trace_run_id = "unknown";
++    if (trace_path == NULL || trace_records == NULL) {
++        free(trace_path);
++        free(trace_records);
++        trace_path = NULL;
++        trace_records = NULL;
++        fprintf(stderr, "UPMEM transfer trace allocation failed\n");
++        return;
++    }
++    if (atexit(flush_trace) != 0) {
++        fprintf(stderr, "UPMEM transfer trace atexit registration failed\n");
++        free(trace_path);
++        free(trace_records);
++        trace_path = NULL;
++        trace_records = NULL;
++    }
++}
++
++bool
++upmem_transfer_trace_enabled(void)
++{
++    pthread_once(&trace_once, initialize_trace);
++    return trace_records != NULL;
++}
++
++static uint64_t
++read_clock(clockid_t clock_id, uint32_t error_flag, uint32_t *diagnostic_flags)
++{
++    struct timespec value;
++
++    if (clock_gettime(clock_id, &value) != 0) {
++        *diagnostic_flags |= error_flag;
++        return 0;
++    }
++    return (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
++}
++
++struct upmem_transfer_trace_snapshot
++upmem_transfer_trace_snapshot(void)
++{
++    struct upmem_transfer_trace_snapshot snapshot = { 0 };
++    struct rusage usage;
++
++    if (!upmem_transfer_trace_enabled())
++        return snapshot;
++
++    snapshot.thread_cpu_ns = read_clock(CLOCK_THREAD_CPUTIME_ID, 1u << 0, &snapshot.diagnostic_flags);
++    snapshot.process_cpu_ns = read_clock(CLOCK_PROCESS_CPUTIME_ID, 1u << 1, &snapshot.diagnostic_flags);
++    if (getrusage(RUSAGE_THREAD, &usage) == 0) {
++        snapshot.thread_nvcsw = usage.ru_nvcsw;
++        snapshot.thread_nivcsw = usage.ru_nivcsw;
++    } else {
++        snapshot.diagnostic_flags |= 1u << 2;
++    }
++    if (getrusage(RUSAGE_SELF, &usage) == 0) {
++        snapshot.process_nvcsw = usage.ru_nvcsw;
++        snapshot.process_nivcsw = usage.ru_nivcsw;
++    } else {
++        snapshot.diagnostic_flags |= 1u << 3;
++    }
++    snapshot.cpu_id = sched_getcpu();
++    if (snapshot.cpu_id < 0)
++        snapshot.diagnostic_flags |= 1u << 4;
++    snapshot.wall_ns = read_clock(CLOCK_MONOTONIC_RAW, 1u << 5, &snapshot.diagnostic_flags);
++    return snapshot;
++}
++
++static struct trace_record *
++reserve_record(void)
++{
++    uint64_t sequence;
++
++    if (!upmem_transfer_trace_enabled())
++        return NULL;
++    sequence = atomic_fetch_add_explicit(&trace_reserved, 1, memory_order_relaxed);
++    if (sequence >= UPMEM_TRANSFER_TRACE_CAPACITY) {
++        atomic_fetch_add_explicit(&trace_overflow, 1, memory_order_relaxed);
++        return NULL;
++    }
++    trace_records[sequence].sequence = sequence;
++    return &trace_records[sequence];
++}
++
++static enum upmem_transfer_trace_direction
++direction_from_xfer(dpu_xfer_t xfer)
++{
++    if (xfer == DPU_XFER_TO_DPU)
++        return UPMEM_TRACE_DIRECTION_H2D;
++    if (xfer == DPU_XFER_FROM_DPU)
++        return UPMEM_TRACE_DIRECTION_D2H;
++    return UPMEM_TRACE_DIRECTION_UNKNOWN;
++}
++
++static void
++describe_set(struct dpu_set_t set, int64_t *rank_id, uint32_t *rank_count, uint32_t *dpu_count)
++{
++    *rank_id = -1;
++    *rank_count = 0;
++    *dpu_count = 0;
++    if (set.kind == DPU_SET_RANKS) {
++        *rank_count = set.list.nr_ranks;
++        for (uint32_t index = 0; index < set.list.nr_ranks; ++index)
++            *dpu_count += set.list.ranks[index]->nr_dpus_enabled;
++        if (set.list.nr_ranks == 1)
++            *rank_id = set.list.ranks[0]->rank_id & DPU_TARGET_MASK;
++    } else if (set.kind == DPU_SET_DPU && set.dpu != NULL) {
++        *rank_count = 1;
++        *dpu_count = 1;
++        *rank_id = set.dpu->rank->rank_id & DPU_TARGET_MASK;
++    }
++}
++
++static void
++commit_record(struct trace_record *record)
++{
++    record->pid = getpid();
++    record->tid = (pid_t)syscall(SYS_gettid);
++    atomic_store_explicit(&record->committed, true, memory_order_release);
++}
++
++void
++upmem_transfer_trace_push_call(struct upmem_transfer_trace_snapshot start,
++    struct upmem_transfer_trace_snapshot end,
++    struct dpu_set_t dpu_set,
++    dpu_xfer_t xfer,
++    enum upmem_transfer_trace_memory memory,
++    size_t length,
++    dpu_xfer_flags_t flags,
++    dpu_error_t status)
++{
++    struct trace_record *record = reserve_record();
++
++    if (record == NULL)
++        return;
++    record->kind = TRACE_EVENT_PUSH_CALL;
++    record->direction = direction_from_xfer(xfer);
++    record->memory = memory;
++    record->bytes_per_dpu = length;
++    describe_set(dpu_set, &record->rank_id, &record->rank_count, &record->dpu_count);
++    record->aggregate_bytes = (uint64_t)length * record->dpu_count;
++    record->xfer_flags = flags;
++    record->status = status;
++    record->start = start;
++    record->end = end;
++    commit_record(record);
++}
++
++void
++upmem_transfer_trace_backend(struct upmem_transfer_trace_snapshot start,
++    struct upmem_transfer_trace_snapshot end,
++    struct dpu_rank_t *rank,
++    enum upmem_transfer_trace_direction direction,
++    const struct dpu_transfer_matrix *transfer_matrix,
++    dpu_error_t status)
++{
++    struct trace_record *record = reserve_record();
++
++    if (record == NULL)
++        return;
++    record->kind = TRACE_EVENT_BACKEND_TRANSFER;
++    record->direction = direction;
++    record->memory = UPMEM_TRACE_MEMORY_MRAM;
++    record->bytes_per_dpu = transfer_matrix->size;
++    record->rank_id = rank->rank_id & DPU_TARGET_MASK;
++    record->rank_count = 1;
++    record->dpu_count = rank->nr_dpus_enabled;
++    record->aggregate_bytes = (uint64_t)transfer_matrix->size * record->dpu_count;
++    record->xfer_flags = 0;
++    record->status = status;
++    record->start = start;
++    record->end = end;
++    commit_record(record);
++}
++
++static const char *
++event_name(enum trace_event_kind kind)
++{
++    return kind == TRACE_EVENT_PUSH_CALL ? "PUSH_CALL" : "BACKEND_TRANSFER";
++}
++
++static const char *
++direction_name(enum upmem_transfer_trace_direction direction)
++{
++    if (direction == UPMEM_TRACE_DIRECTION_H2D)
++        return "H2D";
++    if (direction == UPMEM_TRACE_DIRECTION_D2H)
++        return "D2H";
++    return "UNKNOWN";
++}
++
++static const char *
++memory_name(enum upmem_transfer_trace_memory memory)
++{
++    if (memory == UPMEM_TRACE_MEMORY_IRAM)
++        return "IRAM";
++    if (memory == UPMEM_TRACE_MEMORY_WRAM)
++        return "WRAM";
++    if (memory == UPMEM_TRACE_MEMORY_MRAM)
++        return "MRAM";
++    return "UNKNOWN";
++}
++
++static uint64_t
++delta_u64(uint64_t end, uint64_t start)
++{
++    return end >= start ? end - start : 0;
++}
++
++static long
++delta_long(long end, long start)
++{
++    return end >= start ? end - start : 0;
++}
++
++static void
++write_csv_field(FILE *stream, const char *value)
++{
++    fputc('"', stream);
++    for (const char *cursor = value; *cursor != '\0'; ++cursor) {
++        if (*cursor == '"')
++            fputc('"', stream);
++        fputc(*cursor, stream);
++    }
++    fputc('"', stream);
++}
++
++static void
++flush_trace(void)
++{
++    FILE *stream;
++    uint64_t count;
++    uint64_t overflow;
++
++    if (trace_path == NULL || trace_records == NULL)
++        return;
++    stream = fopen(trace_path, "w");
++    if (stream == NULL) {
++        fprintf(stderr, "cannot open UPMEM transfer trace %s: %s\n", trace_path, strerror(errno));
++        return;
++    }
++    fprintf(stream,
++        "schema_version,run_id,sequence,pid,tid,event_kind,direction,memory_type,"
++        "bytes_per_dpu,aggregate_bytes,rank_id,rank_count,dpu_count,wall_start_ns,"
++        "wall_end_ns,wall_duration_ns,thread_cpu_start_ns,thread_cpu_end_ns,"
++        "thread_cpu_duration_ns,process_cpu_start_ns,process_cpu_end_ns,"
++        "process_cpu_duration_ns,cpu_start,cpu_end,thread_nvcsw_delta,"
++        "thread_nivcsw_delta,process_nvcsw_delta,process_nivcsw_delta,xfer_flags,"
++        "return_status,diagnostic_flags,overflow_count,runtime_version,trace_clock\n");
++    count = atomic_load_explicit(&trace_reserved, memory_order_acquire);
++    if (count > UPMEM_TRANSFER_TRACE_CAPACITY)
++        count = UPMEM_TRANSFER_TRACE_CAPACITY;
++    overflow = atomic_load_explicit(&trace_overflow, memory_order_relaxed);
++    for (uint64_t index = 0; index < count; ++index) {
++        struct trace_record *record = &trace_records[index];
++        uint32_t diagnostics;
++
++        if (!atomic_load_explicit(&record->committed, memory_order_acquire))
++            continue;
++        diagnostics = record->start.diagnostic_flags | record->end.diagnostic_flags;
++        fprintf(stream, "upmem.sdk_transfer_trace.v1,");
++        write_csv_field(stream, trace_run_id);
++        fprintf(stream,
++            ",%" PRIu64 ",%d,%d,%s,%s,%s,%" PRIu64 ",%" PRIu64
++            ",%" PRId64 ",%u,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64
++            ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
++            ",%" PRIu64 ",%d,%d,%ld,%ld,%ld,%ld,%u,%d,%u,%" PRIu64 ",",
++            record->sequence,
++            record->pid,
++            record->tid,
++            event_name(record->kind),
++            direction_name(record->direction),
++            memory_name(record->memory),
++            record->bytes_per_dpu,
++            record->aggregate_bytes,
++            record->rank_id,
++            record->rank_count,
++            record->dpu_count,
++            record->start.wall_ns,
++            record->end.wall_ns,
++            delta_u64(record->end.wall_ns, record->start.wall_ns),
++            record->start.thread_cpu_ns,
++            record->end.thread_cpu_ns,
++            delta_u64(record->end.thread_cpu_ns, record->start.thread_cpu_ns),
++            record->start.process_cpu_ns,
++            record->end.process_cpu_ns,
++            delta_u64(record->end.process_cpu_ns, record->start.process_cpu_ns),
++            record->start.cpu_id,
++            record->end.cpu_id,
++            delta_long(record->end.thread_nvcsw, record->start.thread_nvcsw),
++            delta_long(record->end.thread_nivcsw, record->start.thread_nivcsw),
++            delta_long(record->end.process_nvcsw, record->start.process_nvcsw),
++            delta_long(record->end.process_nivcsw, record->start.process_nivcsw),
++            record->xfer_flags,
++            record->status,
++            diagnostics,
++            overflow);
++        write_csv_field(stream, STRINGIFY(DPU_TOOLS_VERSION));
++        fputc(',', stream);
++        write_csv_field(stream, "CLOCK_MONOTONIC_RAW");
++        fputc('\n', stream);
++    }
++    if (fclose(stream) != 0)
++        fprintf(stderr, "cannot close UPMEM transfer trace %s: %s\n", trace_path, strerror(errno));
++}
+diff --git a/api/src/include/dpu_transfer_trace.h b/api/src/include/dpu_transfer_trace.h
+new file mode 100644
+index 0000000..3d43d0c
+--- /dev/null
++++ b/api/src/include/dpu_transfer_trace.h
+@@ -0,0 +1,68 @@
++/* Copyright 2020 UPMEM. All rights reserved.
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#ifndef DPU_TRANSFER_TRACE_H
++#define DPU_TRANSFER_TRACE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <dpu.h>
++#include <dpu_error.h>
++
++struct dpu_rank_t;
++struct dpu_transfer_matrix;
++
++enum upmem_transfer_trace_memory {
++    UPMEM_TRACE_MEMORY_UNKNOWN,
++    UPMEM_TRACE_MEMORY_IRAM,
++    UPMEM_TRACE_MEMORY_WRAM,
++    UPMEM_TRACE_MEMORY_MRAM,
++};
++
++enum upmem_transfer_trace_direction {
++    UPMEM_TRACE_DIRECTION_UNKNOWN,
++    UPMEM_TRACE_DIRECTION_H2D,
++    UPMEM_TRACE_DIRECTION_D2H,
++};
++
++struct upmem_transfer_trace_snapshot {
++    uint64_t wall_ns;
++    uint64_t thread_cpu_ns;
++    uint64_t process_cpu_ns;
++    int cpu_id;
++    long thread_nvcsw;
++    long thread_nivcsw;
++    long process_nvcsw;
++    long process_nivcsw;
++    uint32_t diagnostic_flags;
++};
++
++bool
++upmem_transfer_trace_enabled(void);
++
++struct upmem_transfer_trace_snapshot
++upmem_transfer_trace_snapshot(void);
++
++void
++upmem_transfer_trace_push_call(struct upmem_transfer_trace_snapshot start,
++    struct upmem_transfer_trace_snapshot end,
++    struct dpu_set_t dpu_set,
++    dpu_xfer_t xfer,
++    enum upmem_transfer_trace_memory memory,
++    size_t length,
++    dpu_xfer_flags_t flags,
++    dpu_error_t status);
++
++void
++upmem_transfer_trace_backend(struct upmem_transfer_trace_snapshot start,
++    struct upmem_transfer_trace_snapshot end,
++    struct dpu_rank_t *rank,
++    enum upmem_transfer_trace_direction direction,
++    const struct dpu_transfer_matrix *transfer_matrix,
++    dpu_error_t status);
++
++#endif
+
